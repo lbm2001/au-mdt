@@ -67,11 +67,10 @@ def _(DRIVING, np, params):
 
 
 @app.cell
-def _(params):
+def _(np, params):
     def mean_price(t: int) -> float:
         """Time-dependent mean electricity price λ̄_t (€/MWh); t is minute of day [0, 1440)."""
         h = t / 60
-        return 100.0
         if h < 6:
             return 70.0
         elif h < 9:
@@ -86,8 +85,8 @@ def _(params):
     def sample_price(t: int, rng) -> float:
         """Sample λ_t from truncated N(λ̄_t, σ²), clipped below at 0."""
         raw = rng.normal(mean_price(t), params.sigma_lambda)
-        return 100.0
-        #return float(np.maximum(0.0, raw))
+        return float(np.maximum(0.0, raw))
+
     return (mean_price,)
 
 
@@ -162,7 +161,7 @@ def _(DRIVING, params):
 
 @app.cell
 def _(consumption_fn, mean_price, params, transition_probs):
-    from backward_induction import backward_induction
+    from utils.backward_induction import backward_induction
 
     V, pi, action_set, e_grid = backward_induction(
         params,

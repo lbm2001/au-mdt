@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -38,6 +38,11 @@ class BaselineParams:
     p_dp_lunch: float = 0.20     # 12:15 – 14:15
     p_dp_evening: float = 0.15   # 16:30 – 18:30
     p_dp_default: float = 0.25   # all other times
+
+    # ── Custom transition windows (override hardcoded schedule) ──────────────
+    # Each entry: {"start_h": float, "end_h": float, "p_PD": float, "p_DP": float}
+    # Last matching window wins. Evaluated after the built-in peaks.
+    custom_windows: list = field(default_factory=list)
 
     # ── Fixed conversion factor (not user-configurable) ───────────────────────
     omega: float = 1 / 60  # minutes → hours (h/min)

@@ -41,6 +41,11 @@ def transition_probs(t: int, params: BaselineParams) -> tuple[float, float]:
     else:
         p_dp = params.p_dp_default
 
+    for w in params.custom_windows:
+        if w["start_h"] <= h < w["end_h"]:
+            p_pd = w["p_PD"]
+            p_dp = w["p_DP"]
+
     return p_pd, p_dp
 
 

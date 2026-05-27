@@ -5,11 +5,18 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
-from models.baseline import BaselineParams, mean_price, transition_probs, consumption
+from models.baseline import (
+    BaselineParams, mean_price, transition_probs, consumption, price_bin_probs,
+    backward_induction_policy, maximal_charging_policy, price_oriented_policy,
+    night_charging_policy, minimum_soc_policy, always_minimum_policy,
+    random_policy, plan_perfect_foresight, perfect_foresight_policy,
+)
+from models.baseline.rollout import (generate_rollout_scenario, rollout_metrics,
+                                     simulate_policy_rollout)
 from utils.backward_induction import backward_induction
 
 st.set_page_config(page_title="EV Charging MDP", layout="wide")
@@ -19,14 +26,14 @@ _DEFAULTS = dict(
     u_max=11.0, u_min=1.4, e_max=40.0, e_min=0.0,
     eta_c=0.95, phi=1000.0, beta=0.999,
     v=50.0, mu=0.20,
-    price_night=70.0, price_morning=150.0, price_midday=110.0,
-    price_evening=170.0, price_late=100.0, sigma_lambda=20.0,
+    price_night=0.30, price_morning=0.48, price_midday=0.39,
+    price_evening=0.55, price_late=0.34, sigma_lambda=0.05,
     p_pd_morning=0.08, p_pd_lunch=0.03, p_pd_evening=0.07, p_pd_default=0.005,
     p_dp_morning=0.15, p_dp_lunch=0.20, p_dp_evening=0.15, p_dp_default=0.25,
-    N_e=200,  # must be a value present in the select_slider list
+    N_e=200,
 )
 
-# ── Sidebar: parameter controls ───────────────────────────────────────────────
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 
 if st.sidebar.button("Reset to defaults"):
     for key in _DEFAULTS:
@@ -48,13 +55,13 @@ st.sidebar.header("Vehicle")
 v = st.sidebar.slider("Driving speed v (km/h)", 10.0, 150.0, 50.0, 5.0, key="v")
 mu = st.sidebar.slider("Energy consumption μ (kWh/km)", 0.05, 0.50, 0.20, 0.01, key="mu")
 
-st.sidebar.header("Electricity Price (€/MWh)")
-price_night   = st.sidebar.slider("Night (00–06 h)",         0.0, 300.0, 70.0,  5.0, key="price_night")
-price_morning = st.sidebar.slider("Morning peak (06–09 h)",  0.0, 300.0, 150.0, 5.0, key="price_morning")
-price_midday  = st.sidebar.slider("Midday (09–16 h)",        0.0, 300.0, 110.0, 5.0, key="price_midday")
-price_evening = st.sidebar.slider("Evening peak (16–21 h)",  0.0, 300.0, 170.0, 5.0, key="price_evening")
-price_late    = st.sidebar.slider("Late night (21–24 h)",    0.0, 300.0, 100.0, 5.0, key="price_late")
-sigma_lambda  = st.sidebar.slider("Price std dev σ_λ (€/MWh)", 0.0, 100.0, 20.0, 1.0, key="sigma_lambda")
+st.sidebar.header("Electricity Price (€/kWh)")
+price_night   = st.sidebar.slider("Night (00–06 h)",         0.0, 1.0, 0.30, 0.01, key="price_night")
+price_morning = st.sidebar.slider("Morning peak (06–09 h)",  0.0, 1.0, 0.48, 0.01, key="price_morning")
+price_midday  = st.sidebar.slider("Midday (09–16 h)",        0.0, 1.0, 0.39, 0.01, key="price_midday")
+price_evening = st.sidebar.slider("Evening peak (16–21 h)",  0.0, 1.0, 0.55, 0.01, key="price_evening")
+price_late    = st.sidebar.slider("Late night (21–24 h)",    0.0, 1.0, 0.34, 0.01, key="price_late")
+sigma_lambda  = st.sidebar.slider("Price std dev σ_λ (€/kWh)", 0.0, 0.20, 0.05, 0.01, key="sigma_lambda")
 
 st.sidebar.header("Transition Probabilities (per minute)")
 st.sidebar.subheader("Parked → Driving")
@@ -71,30 +78,6 @@ p_dp_default = st.sidebar.slider("Default",                  0.0, 1.0, 0.25, 0.0
 st.sidebar.header("Solver")
 N_e = st.sidebar.select_slider("Battery grid points N_e", [25, 50, 100, 200, 500, 1000, 2000], value=200, key="N_e")
 
-st.sidebar.header("Custom Transition Windows")
-st.sidebar.caption("Override built-in peaks for any hour range. Last matching row wins.")
-_empty_windows = pd.DataFrame({
-    "start_h": pd.Series(dtype=float),
-    "end_h":   pd.Series(dtype=float),
-    "p_PD":    pd.Series(dtype=float),
-    "p_DP":    pd.Series(dtype=float),
-})
-custom_df = st.sidebar.data_editor(
-    st.session_state.get("custom_windows_df", _empty_windows),
-    num_rows="dynamic",
-    use_container_width=True,
-    column_config={
-        "start_h": st.column_config.NumberColumn("Start (h)", min_value=0.0, max_value=24.0, step=0.25, format="%.2f"),
-        "end_h":   st.column_config.NumberColumn("End (h)",   min_value=0.0, max_value=24.0, step=0.25, format="%.2f"),
-        "p_PD":    st.column_config.NumberColumn("p_PD",      min_value=0.0, max_value=1.0,  step=0.005, format="%.3f"),
-        "p_DP":    st.column_config.NumberColumn("p_DP",      min_value=0.0, max_value=1.0,  step=0.005, format="%.3f"),
-    },
-    key="custom_windows_editor",
-)
-st.session_state["custom_windows_df"] = custom_df
-custom_windows = custom_df.dropna().to_dict("records")
-
-
 # ── Assemble params and solve ─────────────────────────────────────────────────
 
 params = BaselineParams(
@@ -108,15 +91,14 @@ params = BaselineParams(
     p_pd_evening=p_pd_evening, p_pd_default=p_pd_default,
     p_dp_morning=p_dp_morning, p_dp_lunch=p_dp_lunch,
     p_dp_evening=p_dp_evening, p_dp_default=p_dp_default,
-    custom_windows=custom_windows,
 )
 
 with st.spinner("Running backward induction…"):
-    V, pi, actions, e_grid = backward_induction(
+    V, pi, actions, e_grid, lam_grid = backward_induction(
         params,
-        mean_price_fn=lambda t: mean_price(t, params),
         transition_probs_fn=lambda t: transition_probs(t, params),
         consumption_fn=lambda chi: consumption(chi, params),
+        price_bin_probs_fn=lambda t: price_bin_probs(t, params),
         T=1440,
         N_e=N_e,
     )
@@ -125,6 +107,7 @@ st.session_state["V"] = V
 st.session_state["pi"] = pi
 st.session_state["actions"] = actions
 st.session_state["e_grid"] = e_grid
+st.session_state["lam_grid"] = lam_grid
 st.session_state["params"] = params
 
 
@@ -133,16 +116,12 @@ st.session_state["params"] = params
 HOURS = np.arange(1440) / 60
 
 
-def policy_heatmap(chi: int, title: str, time_bin_minutes: int, battery_bin_kwh: float) -> plt.Figure:
-    # Convert action indices → charge rates (kW): shape (1440, N_e)
-    rates = actions[pi[:, chi, :]]
-
-    # Average over time windows (truncate to nearest full bin)
+def _binned_policy_rates(rates: np.ndarray, time_bin_minutes: int,
+                         battery_bin_kwh: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n_time_bins = 1440 // time_bin_minutes
     usable = n_time_bins * time_bin_minutes
     rates_time = rates[:usable].reshape(n_time_bins, time_bin_minutes, rates.shape[1]).mean(axis=1)
 
-    # Average over battery bins
     bin_edges = np.arange(params.e_min, params.e_max + battery_bin_kwh, battery_bin_kwh)
     n_bins = len(bin_edges) - 1
     rates_binned = np.zeros((n_time_bins, n_bins))
@@ -154,123 +133,295 @@ def policy_heatmap(chi: int, title: str, time_bin_minutes: int, battery_bin_kwh:
         if mask.any():
             rates_binned[:, i] = rates_time[:, mask].mean(axis=1)
 
-    time_edges = np.linspace(0, 24, n_time_bins + 1)
-    fig, ax = plt.subplots(figsize=(11, 4))
-    im = ax.pcolormesh(
-        time_edges, bin_edges, rates_binned.T,
-        cmap="RdYlBu_r", vmin=0, vmax=params.u_max,
+    time_centers = (np.arange(n_time_bins) + 0.5) * time_bin_minutes / 60
+    battery_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    return time_centers, battery_centers, rates_binned
+
+
+def _policy_heatmap_figure(rates: np.ndarray, title: str, time_bin_minutes: int,
+                           battery_bin_kwh: float) -> go.Figure:
+    time_centers, battery_centers, rates_binned = _binned_policy_rates(
+        rates, time_bin_minutes, battery_bin_kwh,
     )
-    plt.colorbar(im, ax=ax, label="Mean charge rate (kW)")
-    ax.set_title(title)
-    ax.set_xlabel("Hour of day")
-    ax.set_ylabel("Battery level (kWh)")
-    ax.set_xticks(range(0, 25, 3))
-    fig.tight_layout()
+    fig = go.Figure(data=go.Heatmap(
+        x=time_centers,
+        y=battery_centers,
+        z=rates_binned.T,
+        zmin=0,
+        zmax=params.u_max,
+        colorscale="RdYlBu_r",
+        colorbar=dict(title="kW"),
+        hovertemplate="Hour: %{x:.2f}<br>Battery: %{y:.2f} kWh<br>Charge: %{z:.2f} kW<extra></extra>",
+    ))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Hour of day",
+        yaxis_title="Battery level (kWh)",
+        height=430,
+        margin=dict(l=30, r=30, t=55, b=35),
+    )
+    fig.update_xaxes(range=[0, 24], dtick=3)
     return fig
 
 
-def price_figure() -> plt.Figure:
+def optimal_policy_rates(chi: int, lam_bin: int) -> np.ndarray:
+    return effective_policy_rates(chi, actions[pi[:, chi, :, lam_bin]])
+
+
+def benchmark_policy_rates(policy_fn, chi: int, **policy_kwargs) -> np.ndarray:
+    """Compute desired charge rates for a benchmark policy over (1440, N_e)."""
+    t_arr = np.arange(1440)
+    if policy_fn is maximal_charging_policy:
+        desired_rates = np.full((1440, len(e_grid)), params.u_max)
+    elif policy_fn is price_oriented_policy:
+        lam_path = np.array([mean_price(t, params) for t in t_arr])
+        low, high = policy_kwargs["low_threshold"], policy_kwargs["high_threshold"]
+        per_min = np.where(lam_path <= low, params.u_max,
+                           np.where(lam_path <= high, params.u_max / 2, 0.0))
+        desired_rates = np.repeat(per_min[:, np.newaxis], len(e_grid), axis=1)
+    elif policy_fn is night_charging_policy:
+        per_min = np.where(t_arr < 360, params.u_max, 0.0)
+        desired_rates = np.repeat(per_min[:, np.newaxis], len(e_grid), axis=1)
+    elif policy_fn is always_minimum_policy:
+        desired_rates = np.full((1440, len(e_grid)), params.u_min)
+    elif policy_fn is minimum_soc_policy:
+        threshold = policy_kwargs["soc_threshold"]
+        desired_rates = np.where(e_grid[np.newaxis, :] < threshold, params.u_max, 0.0)
+        desired_rates = np.broadcast_to(desired_rates, (1440, len(e_grid))).copy()
+    else:
+        desired_rates = np.zeros((1440, len(e_grid)))
+        for t in t_arr:
+            lam = mean_price(t, params)
+            for i, e in enumerate(e_grid):
+                desired_rates[t, i] = policy_fn(
+                    t=t, chi=chi, e=float(e), lam=lam, params=params, **policy_kwargs,
+                )
+    return effective_policy_rates(chi, desired_rates)
+
+
+def effective_policy_rates(chi: int, desired_rates: np.ndarray) -> np.ndarray:
+    rates = np.clip(desired_rates, 0.0, params.u_max).astype(float, copy=True)
+    if chi == 1:
+        rates[:, e_grid > params.e_min] = 0.0
+    return rates
+
+
+def policy_heatmap(chi: int, title: str, time_bin_minutes: int, battery_bin_kwh: float,
+                   lam_bin: int) -> go.Figure:
+    return _policy_heatmap_figure(
+        optimal_policy_rates(chi, lam_bin),
+        title,
+        time_bin_minutes,
+        battery_bin_kwh,
+    )
+
+
+def price_figure() -> go.Figure:
     minutes = np.arange(1440)
     prices  = np.array([mean_price(t, params) for t in minutes])
     sigma   = params.sigma_lambda
-
-    fig, ax = plt.subplots(figsize=(11, 3))
-    ax.fill_between(HOURS, prices - sigma, prices + sigma,
-                    step="post", alpha=0.2, color="steelblue", label=r"±σ_λ")
-    ax.step(HOURS, prices, where="post", color="steelblue", linewidth=2, label=r"λ̄_t")
-    ax.set_xlabel("Hour of day")
-    ax.set_ylabel("€ / MWh")
-    ax.set_title("Mean electricity price")
-    ax.set_xlim(0, 24)
-    ax.xaxis.set_major_locator(mticker.MultipleLocator(3))
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([HOURS, HOURS[::-1]]),
+        y=np.concatenate([prices - sigma, (prices + sigma)[::-1]]),
+        fill="toself",
+        fillcolor="rgba(70, 130, 180, 0.2)",
+        line=dict(color="rgba(70, 130, 180, 0)"),
+        name="±σ_λ",
+        hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=HOURS,
+        y=prices,
+        mode="lines",
+        line=dict(color="steelblue", width=2, shape="hv"),
+        name="λ̄_t",
+        hovertemplate="Hour: %{x:.2f}<br>Price: %{y:.3f} €/kWh<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Mean electricity price",
+        xaxis_title="Hour of day",
+        yaxis_title="€ / kWh",
+        height=320,
+        margin=dict(l=30, r=30, t=55, b=35),
+    )
+    fig.update_xaxes(range=[0, 24], dtick=3)
     return fig
 
 
-def transition_figure() -> plt.Figure:
+def transition_figure() -> go.Figure:
     probs = np.array([transition_probs(t, params) for t in range(1440)])
-    fig, axes = plt.subplots(2, 1, figsize=(11, 4), sharex=True)
-    axes[0].step(HOURS, probs[:, 0], where="post", color="tab:orange", linewidth=2)
-    axes[0].set_ylabel("Prob. / min")
-    axes[0].set_title("Parked → Driving")
-    axes[0].grid(True, alpha=0.3)
-    axes[1].step(HOURS, probs[:, 1], where="post", color="tab:green", linewidth=2)
-    axes[1].set_ylabel("Prob. / min")
-    axes[1].set_title("Driving → Parked")
-    axes[1].set_xlabel("Hour of day")
-    axes[1].set_xlim(0, 24)
-    axes[1].xaxis.set_major_locator(mticker.MultipleLocator(3))
-    axes[1].grid(True, alpha=0.3)
-    fig.tight_layout()
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        subplot_titles=("Parked → Driving", "Driving → Parked"),
+        vertical_spacing=0.13,
+    )
+    fig.add_trace(go.Scatter(x=HOURS, y=probs[:, 0], mode="lines",
+                             line=dict(color="orange", width=2, shape="hv"), name="p_PD"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=HOURS, y=probs[:, 1], mode="lines",
+                             line=dict(color="green", width=2, shape="hv"), name="p_DP"), row=2, col=1)
+    fig.update_layout(height=430, margin=dict(l=30, r=30, t=60, b=35))
+    fig.update_xaxes(range=[0, 24], dtick=3)
+    fig.update_yaxes(title_text="Prob. / min", row=1, col=1)
+    fig.update_yaxes(title_text="Prob. / min", row=2, col=1)
+    fig.update_xaxes(title_text="Hour of day", row=2, col=1)
     return fig
 
 
-def charge_vs_price_figure() -> plt.Figure:
-    prices          = np.array([mean_price(t, params) for t in range(1440)])
-    charge_rates    = actions[pi[:, 0, :]]
-    mean_per_minute = charge_rates.mean(axis=1)
-    mean_per_hour   = mean_per_minute.reshape(24, 60).mean(axis=1)
-
-    fig, ax1 = plt.subplots(figsize=(11, 4))
-    c_price = "steelblue"
-    ax1.fill_between(HOURS, prices - params.sigma_lambda, prices + params.sigma_lambda,
-                     step="post", alpha=0.2, color=c_price)
-    ax1.step(HOURS, prices, where="post", color=c_price, linewidth=2, label="λ̄_t")
-    ax1.set_xlabel("Hour of day")
-    ax1.set_ylabel("€ / MWh", color=c_price)
-    ax1.tick_params(axis="y", labelcolor=c_price)
-    ax1.set_xlim(0, 24)
-    ax1.xaxis.set_major_locator(mticker.MultipleLocator(3))
-    ax1.grid(True, alpha=0.2)
-
-    c_rate = "tab:red"
-    ax2 = ax1.twinx()
-    ax2.step(np.arange(24), mean_per_hour, where="post",
-             color=c_rate, linewidth=2, label="Mean charge rate")
-    ax2.set_ylabel("Mean charge rate (kW)", color=c_rate)
-    ax2.tick_params(axis="y", labelcolor=c_rate)
-    ax2.set_ylim(bottom=0)
-
-    h1, l1 = ax1.get_legend_handles_labels()
-    h2, l2 = ax2.get_legend_handles_labels()
-    ax1.legend(h1 + h2, l1 + l2, loc="upper left", framealpha=0.9)
-    ax1.set_title("Mean optimal charge rate vs. electricity price (parked, averaged over battery grid)")
-    fig.tight_layout()
+def charge_vs_price_figure(low_threshold: float, high_threshold: float,
+                           soc_threshold: float) -> go.Figure:
+    prices   = np.array([mean_price(t, params) for t in range(1440)])
+    lam_bin  = st.session_state.get("lam_bin_sel", params.K // 2)
+    policy_rates = {
+        "Backward induction":      optimal_policy_rates(0, lam_bin),
+        "Maximal charging":        benchmark_policy_rates(maximal_charging_policy, 0),
+        "Price-oriented":          benchmark_policy_rates(price_oriented_policy, 0,
+                                       low_threshold=low_threshold, high_threshold=high_threshold),
+        "Night charging":          benchmark_policy_rates(night_charging_policy, 0),
+        "Minimum SoC":             benchmark_policy_rates(minimum_soc_policy, 0,
+                                       soc_threshold=soc_threshold),
+        "Always minimum":          benchmark_policy_rates(always_minimum_policy, 0),
+    }
+    colors = {
+        "Backward induction": "steelblue",
+        "Maximal charging": "seagreen",
+        "Price-oriented": "crimson",
+        "Night charging": "purple",
+        "Minimum SoC": "darkorange",
+        "Always minimum": "gray",
+    }
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([HOURS, HOURS[::-1]]),
+        y=np.concatenate([prices - params.sigma_lambda, (prices + params.sigma_lambda)[::-1]]),
+        fill="toself", fillcolor="rgba(70, 130, 180, 0.2)",
+        line=dict(color="rgba(70, 130, 180, 0)"), name="±σ_λ", hoverinfo="skip",
+    ), secondary_y=False)
+    fig.add_trace(go.Scatter(x=HOURS, y=prices, mode="lines",
+                             line=dict(color="steelblue", width=2, shape="hv"), name="λ̄_t"),
+                  secondary_y=False)
+    for name, rates in policy_rates.items():
+        mean_per_hour = rates.mean(axis=1).reshape(24, 60).mean(axis=1)
+        fig.add_trace(go.Scatter(x=np.arange(24), y=mean_per_hour, mode="lines",
+                                 line=dict(color=colors[name], width=2, shape="hv"),
+                                 name=f"{name}"), secondary_y=True)
+    fig.update_layout(title="Mean charge rate vs. electricity price (parked, averaged over battery grid)",
+                      height=430, margin=dict(l=30, r=30, t=55, b=35))
+    fig.update_xaxes(title_text="Hour of day", range=[0, 24], dtick=3)
+    fig.update_yaxes(title_text="€ / kWh", secondary_y=False)
+    fig.update_yaxes(title_text="Mean charge rate (kW)", secondary_y=True, rangemode="tozero")
     return fig
 
 
 # ── Layout ────────────────────────────────────────────────────────────────────
 
-st.subheader("Optimal Policy")
-tab_parked, tab_driving = st.tabs(["Parked", "Driving"])
-with tab_parked:
-    st.pyplot(policy_heatmap(0, "",
-                             st.session_state.get("time_bin", 10),
-                             st.session_state.get("bat_bin", 1.0)))
-with tab_driving:
-    st.pyplot(policy_heatmap(1, "Optimal policy — Driving",
-                             st.session_state.get("time_bin", 10),
-                             st.session_state.get("bat_bin", 1.0)))
+default_low = float(params.price_night)
+default_high = float(params.price_evening)
+previous_defaults = st.session_state.get("benchmark_threshold_defaults")
+if "benchmark_low_threshold" not in st.session_state:
+    st.session_state["benchmark_low_threshold"] = default_low
+elif previous_defaults and float(st.session_state["benchmark_low_threshold"]) == previous_defaults[0]:
+    st.session_state["benchmark_low_threshold"] = default_low
+if "benchmark_high_threshold" not in st.session_state:
+    st.session_state["benchmark_high_threshold"] = default_high
+elif previous_defaults and float(st.session_state["benchmark_high_threshold"]) == previous_defaults[1]:
+    st.session_state["benchmark_high_threshold"] = default_high
+st.session_state["benchmark_threshold_defaults"] = (default_low, default_high)
+st.session_state["benchmark_low_threshold"] = min(
+    float(st.session_state["benchmark_low_threshold"]),
+    float(st.session_state["benchmark_high_threshold"]),
+)
 
-col_tb, col_bb = st.columns(2)
+# ── Optimal policy heatmap ────────────────────────────────────────────────────
+
+st.subheader("Optimal Policy")
+
+lam_bin_sel = st.session_state.get("lam_bin_sel", params.K // 2)
+lam_bin_label = f"λ̂ = {lam_grid[lam_bin_sel]:.3f} €/kWh (bin {lam_bin_sel})"
+
+st.plotly_chart(policy_heatmap(0, f"Optimal policy — Parked  |  {lam_bin_label}",
+                                st.session_state.get("time_bin", 10),
+                                st.session_state.get("bat_bin", 1.0),
+                                lam_bin_sel), use_container_width=True)
+
+col_tb, col_bb, col_lb, col_low, col_high, col_soc = st.columns(6)
 with col_tb:
     st.select_slider("Time bin (minutes)", [1, 2, 3, 5, 6, 10, 12, 15, 20, 30, 60], value=10, key="time_bin")
 with col_bb:
     st.slider("Battery bin (kWh)", 0.5, 10.0, 1.0, 0.5, key="bat_bin")
+with col_lb:
+    st.slider("Price bin λ̂", 0, params.K - 1, params.K // 2, 1, key="lam_bin_sel",
+              help=f"Bin centre: {lam_grid[lam_bin_sel]:.3f} €/kWh")
+with col_low:
+    low_threshold = st.slider("Low price threshold (€/kWh)", 0.0, 1.0,
+                              key="benchmark_low_threshold", step=0.01)
+if float(st.session_state["benchmark_high_threshold"]) < float(low_threshold):
+    st.session_state["benchmark_high_threshold"] = float(low_threshold)
+with col_high:
+    high_threshold = st.slider("High price threshold (€/kWh)", low_threshold, 1.0,
+                               key="benchmark_high_threshold", step=0.01)
+with col_soc:
+    soc_threshold = st.slider("Min SoC threshold (kWh)", float(params.e_min),
+                              float(params.e_max), float(params.e_max * 0.25), 0.5,
+                              key="soc_threshold")
+
+# ── Benchmark heatmaps ────────────────────────────────────────────────────────
+
+st.subheader("Benchmark Policy Heatmaps")
+bench_tabs = st.tabs([
+    "Maximal charging",
+    "Price-oriented",
+    "Night charging",
+    "Minimum SoC",
+    "Always minimum",
+])
+time_bin = st.session_state.get("time_bin", 10)
+bat_bin  = st.session_state.get("bat_bin", 1.0)
+
+with bench_tabs[0]:
+    st.plotly_chart(_policy_heatmap_figure(
+        benchmark_policy_rates(maximal_charging_policy, 0),
+        "Maximal charging — Parked", time_bin, bat_bin,
+    ), use_container_width=True)
+with bench_tabs[1]:
+    st.plotly_chart(_policy_heatmap_figure(
+        benchmark_policy_rates(price_oriented_policy, 0,
+                               low_threshold=float(low_threshold),
+                               high_threshold=float(high_threshold)),
+        "Price-oriented charging — Parked", time_bin, bat_bin,
+    ), use_container_width=True)
+with bench_tabs[2]:
+    st.plotly_chart(_policy_heatmap_figure(
+        benchmark_policy_rates(night_charging_policy, 0),
+        "Night charging — Parked", time_bin, bat_bin,
+    ), use_container_width=True)
+with bench_tabs[3]:
+    st.plotly_chart(_policy_heatmap_figure(
+        benchmark_policy_rates(minimum_soc_policy, 0, soc_threshold=float(soc_threshold)),
+        f"Minimum SoC — Parked  |  threshold = {soc_threshold:.1f} kWh", time_bin, bat_bin,
+    ), use_container_width=True)
+with bench_tabs[4]:
+    st.plotly_chart(_policy_heatmap_figure(
+        benchmark_policy_rates(always_minimum_policy, 0),
+        "Always minimum rate — Parked", time_bin, bat_bin,
+    ), use_container_width=True)
+
+# ── Charge rate vs price ──────────────────────────────────────────────────────
 
 st.subheader("Charge Rate vs. Price")
-st.pyplot(charge_vs_price_figure())
+st.plotly_chart(charge_vs_price_figure(float(low_threshold), float(high_threshold),
+                                       float(soc_threshold)), use_container_width=True)
+
+# ── Input schedules ───────────────────────────────────────────────────────────
 
 st.subheader("Input Schedules")
 col1, col2 = st.columns(2)
 with col1:
-    st.pyplot(price_figure())
+    st.plotly_chart(price_figure(), use_container_width=True)
 with col2:
-    st.pyplot(transition_figure())
+    st.plotly_chart(transition_figure(), use_container_width=True)
 
-# ── Simulation ────────────────────────────────────────────────────────────────
+# ── Single-day simulation ─────────────────────────────────────────────────────
 
 st.subheader("Policy Rollout Simulation")
 
@@ -287,111 +438,211 @@ with sim_col4:
     st.write("")
     rerun_sim = st.button("Re-run")
 
-# re-run button just changes seed by 1 to trigger a fresh draw
 if rerun_sim:
     st.session_state["sim_seed"] = int(seed) + 1
     seed = st.session_state["sim_seed"]
 else:
     seed = st.session_state.get("sim_seed", int(seed))
 
-rng    = np.random.default_rng(int(seed))
-chi    = 0 if chi0 == "Parked" else 1
-e      = float(e0)
-N_e_   = len(e_grid)
+chi0_int = 0 if chi0 == "Parked" else 1
+scenario = generate_rollout_scenario(params, int(seed))
 
-e_traj    = np.zeros(1440)
-chi_traj  = np.zeros(1440, dtype=int)
-u_traj    = np.zeros(1440)
-lam_traj  = np.zeros(1440)
-cost_traj = np.zeros(1440)
+u_plan = plan_perfect_foresight(scenario, float(e0), chi0_int, params)
 
-for t in range(1440):
-    e_traj[t]   = e
-    chi_traj[t] = chi
+single_day_rollouts = {
+    "Backward induction": simulate_policy_rollout(
+        backward_induction_policy, scenario, float(e0), chi0_int, params,
+        pi=pi, actions=actions, e_grid=e_grid),
+    "Maximal charging": simulate_policy_rollout(
+        maximal_charging_policy, scenario, float(e0), chi0_int, params),
+    "Price-oriented": simulate_policy_rollout(
+        price_oriented_policy, scenario, float(e0), chi0_int, params,
+        low_threshold=float(low_threshold), high_threshold=float(high_threshold)),
+    "Night charging": simulate_policy_rollout(
+        night_charging_policy, scenario, float(e0), chi0_int, params),
+    "Minimum SoC": simulate_policy_rollout(
+        minimum_soc_policy, scenario, float(e0), chi0_int, params,
+        soc_threshold=float(soc_threshold)),
+    "Always minimum": simulate_policy_rollout(
+        always_minimum_policy, scenario, float(e0), chi0_int, params),
+    "Random": simulate_policy_rollout(
+        random_policy, scenario, float(e0), chi0_int, params,
+        rng=np.random.default_rng(int(seed))),
+    "Perfect foresight": simulate_policy_rollout(
+        perfect_foresight_policy, scenario, float(e0), chi0_int, params,
+        u_plan=u_plan),
+}
 
-    # look up policy
-    e_idx = int(np.argmin(np.abs(e_grid - e)))
-    a_idx = pi[t, chi, e_idx]
-    u     = float(actions[a_idx])
-    u_a   = 0.0 if (chi == 1 and e > params.e_min) else u
-
-    # sample price
-    lam = float(np.maximum(0.0, rng.normal(mean_price(t, params), params.sigma_lambda)))
-    lam_traj[t] = lam
-    u_traj[t]   = u_a
-
-    # cost
-    cost = lam / 1000 * params.omega * u_a
-    if chi == 1 and e <= params.e_min:
-        cost += params.omega * params.phi
-    cost_traj[t] = cost
-
-    # next battery
-    cons = consumption(chi, params)
-    e    = float(np.clip(e + params.eta_c * params.omega * u_a - cons, params.e_min, params.e_max))
-
-    # next driving state
-    p_PD, p_DP = transition_probs(t, params)
-    if chi == 0:
-        chi = 1 if rng.random() < p_PD else 0
-    else:
-        chi = 0 if rng.random() < p_DP else 1
+POLICY_COLORS = {
+    "Backward induction": "steelblue",
+    "Maximal charging":   "seagreen",
+    "Price-oriented":     "crimson",
+    "Night charging":     "purple",
+    "Minimum SoC":        "darkorange",
+    "Always minimum":     "gray",
+    "Random":             "pink",
+    "Perfect foresight":  "black",
+}
 
 hours = np.arange(1440) / 60
+lam_traj = scenario["lam_path"]
+chi_traj_ref = single_day_rollouts["Backward induction"]["chi_traj"]
 
-def sim_figure() -> plt.Figure:
-    fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
-
-    # Battery level
-    axes[0].plot(hours, e_traj, color="steelblue", linewidth=1.2)
-    axes[0].set_ylabel("Battery (kWh)")
-    axes[0].set_ylim(params.e_min - 0.5, params.e_max + 0.5)
-    axes[0].axhline(params.e_min, color="red", linewidth=0.8, linestyle="--", label="e_min")
-    axes[0].legend(fontsize=8)
-    axes[0].grid(True, alpha=0.3)
-
-    # Driving state
-    axes[1].fill_between(hours, chi_traj, step="post", alpha=0.6, color="tab:orange", label="Driving")
-    axes[1].set_ylabel("State")
-    axes[1].set_yticks([0, 1])
-    axes[1].set_yticklabels(["Parked", "Driving"])
-    axes[1].grid(True, alpha=0.3)
-
-    # Charge rate
-    axes[2].step(hours, u_traj, where="post", color="tab:green", linewidth=1.2)
-    axes[2].set_ylabel("Charge rate (kW)")
-    axes[2].set_ylim(-0.2, params.u_max + 0.5)
-    axes[2].grid(True, alpha=0.3)
-
-    # Price and cumulative cost
-    ax_lam = axes[3]
-    ax_lam.step(hours, lam_traj, where="post", color="steelblue", linewidth=1, alpha=0.7, label="λ_t (sampled)")
-    ax_lam.step(hours, np.array([mean_price(t, params) for t in range(1440)]),
-                where="post", color="steelblue", linewidth=1.5, linestyle="--", label="λ̄_t (mean)")
-    ax_lam.set_ylabel("€ / MWh", color="steelblue")
-    ax_lam.tick_params(axis="y", labelcolor="steelblue")
-    ax_lam.legend(fontsize=8, loc="upper left")
-    ax_lam.grid(True, alpha=0.3)
-
-    ax_cost = ax_lam.twinx()
-    ax_cost.plot(hours, np.cumsum(cost_traj), color="tab:red", linewidth=1.5, label="Cumulative cost (€)")
-    ax_cost.set_ylabel("Cumulative cost (€)", color="tab:red")
-    ax_cost.tick_params(axis="y", labelcolor="tab:red")
-    ax_cost.legend(fontsize=8, loc="upper right")
-
-    axes[3].set_xlabel("Hour of day")
-    for ax in axes:
-        ax.set_xlim(0, 24)
-        ax.xaxis.set_major_locator(mticker.MultipleLocator(3))
-
-    total = cost_traj.sum()
-    penalty = (chi_traj == 1) & (e_traj <= params.e_min)
-    fig.suptitle(
-        f"Simulated day — total cost: {total:.3f} € "
-        f"(penalty minutes: {penalty.sum()})",
-        fontsize=11,
+def sim_figure() -> go.Figure:
+    fig = make_subplots(
+        rows=4, cols=1, shared_xaxes=True,
+        specs=[[{}], [{}], [{}], [{"secondary_y": True}]],
+        subplot_titles=("Battery level", "Mobility state", "Charge rate",
+                        "Price and cumulative cost"),
+        vertical_spacing=0.07,
     )
-    fig.tight_layout()
+    for name, rollout in single_day_rollouts.items():
+        color = POLICY_COLORS[name]
+        fig.add_trace(go.Scatter(x=hours, y=rollout["e_traj"], mode="lines",
+                                 line=dict(color=color, width=1.5), name=name,
+                                 legendgroup=name), row=1, col=1)
+        fig.add_trace(go.Scatter(x=hours, y=rollout["u_traj"], mode="lines",
+                                 line=dict(color=color, width=1.5, shape="hv"), name=name,
+                                 legendgroup=name, showlegend=False), row=3, col=1)
+        fig.add_trace(go.Scatter(x=hours, y=np.cumsum(rollout["cost_traj"]), mode="lines",
+                                 line=dict(color=color, width=1.5), name=name,
+                                 legendgroup=name, showlegend=False),
+                      row=4, col=1, secondary_y=True)
+    fig.add_trace(go.Scatter(x=hours, y=chi_traj_ref, mode="lines", fill="tozeroy",
+                             line=dict(color="orange", width=1.2, shape="hv"),
+                             name="Driving state",
+                             hovertemplate="Hour: %{x:.2f}<br>State: %{y}<extra></extra>"),
+                 row=2, col=1)
+    fig.add_trace(go.Scatter(x=hours, y=lam_traj, mode="lines",
+                             line=dict(color="lightgray", width=1.0, shape="hv"),
+                             name="λ_t sampled"), row=4, col=1, secondary_y=False)
+    fig.add_trace(go.Scatter(x=hours,
+                             y=np.array([mean_price(t, params) for t in range(1440)]),
+                             mode="lines",
+                             line=dict(color="black", width=1.4, dash="dash", shape="hv"),
+                             name="λ̄_t mean"), row=4, col=1, secondary_y=False)
+    fig.update_layout(height=1000, hovermode="x unified",
+                      margin=dict(l=30, r=30, t=80, b=35))
+    fig.update_xaxes(range=[0, 24], dtick=3)
+    fig.update_xaxes(title_text="Hour of day", row=4, col=1)
+    fig.update_yaxes(title_text="Battery (kWh)",
+                     range=[params.e_min - 0.5, params.e_max + 0.5], row=1, col=1)
+    fig.update_yaxes(title_text="State", tickvals=[0, 1],
+                     ticktext=["Parked", "Driving"], row=2, col=1)
+    fig.update_yaxes(title_text="Charge rate (kW)",
+                     range=[-0.2, params.u_max + 0.5], row=3, col=1)
+    fig.update_yaxes(title_text="€ / kWh", row=4, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="Cumulative cost (€)", row=4, col=1, secondary_y=True)
     return fig
 
-st.pyplot(sim_figure())
+st.plotly_chart(sim_figure(), use_container_width=True)
+
+st.subheader("Single-Day Policy Comparison")
+comparison_df = pd.DataFrame(
+    {name: rollout_metrics(rollout, params) for name, rollout in single_day_rollouts.items()}
+).T
+st.dataframe(
+    comparison_df.style.format({
+        "Total cost (€)": "{:.3f}",
+        "Energy charged (kWh)": "{:.3f}",
+        "Penalty minutes": "{:.0f}",
+        "Final battery (kWh)": "{:.3f}",
+        "Mean charge rate while parked (kW)": "{:.3f}",
+    }),
+    use_container_width=True,
+)
+
+# ── N-day simulation ──────────────────────────────────────────────────────────
+
+st.subheader("N-Day Policy Comparison")
+
+nd_col1, nd_col2, nd_col3, nd_col4 = st.columns(4)
+with nd_col1:
+    n_days = st.slider("Number of days N", 10, 500, 100, 10, key="n_days")
+with nd_col2:
+    nd_e0 = st.slider("Initial battery (kWh) ", float(params.e_min), float(params.e_max),
+                      float(params.e_max / 2), 0.5, key="nd_e0")
+with nd_col3:
+    nd_chi0 = st.radio("Initial state ", ["Parked", "Driving"], horizontal=True, key="nd_chi0")
+with nd_col4:
+    nd_seed = st.number_input("Seed", min_value=0, max_value=9999, value=42, step=1, key="nd_seed")
+
+nd_chi0_int = 0 if nd_chi0 == "Parked" else 1
+
+with st.spinner(f"Rolling out all policies over {n_days} days…"):
+    rng_nd = np.random.default_rng(int(nd_seed))
+    nd_scenarios = [generate_rollout_scenario(params, int(rng_nd.integers(0, 1_000_000)))
+                    for _ in range(n_days)]
+
+    nd_rollouts: dict[str, list] = {name: [] for name in POLICY_COLORS}
+    for sc in nd_scenarios:
+        u_plan_nd = plan_perfect_foresight(sc, float(nd_e0), nd_chi0_int, params)
+        rng_rand = np.random.default_rng(int(rng_nd.integers(0, 1_000_000)))
+        nd_rollouts["Backward induction"].append(simulate_policy_rollout(
+            backward_induction_policy, sc, float(nd_e0), nd_chi0_int, params,
+            pi=pi, actions=actions, e_grid=e_grid))
+        nd_rollouts["Maximal charging"].append(simulate_policy_rollout(
+            maximal_charging_policy, sc, float(nd_e0), nd_chi0_int, params))
+        nd_rollouts["Price-oriented"].append(simulate_policy_rollout(
+            price_oriented_policy, sc, float(nd_e0), nd_chi0_int, params,
+            low_threshold=float(low_threshold), high_threshold=float(high_threshold)))
+        nd_rollouts["Night charging"].append(simulate_policy_rollout(
+            night_charging_policy, sc, float(nd_e0), nd_chi0_int, params))
+        nd_rollouts["Minimum SoC"].append(simulate_policy_rollout(
+            minimum_soc_policy, sc, float(nd_e0), nd_chi0_int, params,
+            soc_threshold=float(soc_threshold)))
+        nd_rollouts["Always minimum"].append(simulate_policy_rollout(
+            always_minimum_policy, sc, float(nd_e0), nd_chi0_int, params))
+        nd_rollouts["Random"].append(simulate_policy_rollout(
+            random_policy, sc, float(nd_e0), nd_chi0_int, params, rng=rng_rand))
+        nd_rollouts["Perfect foresight"].append(simulate_policy_rollout(
+            perfect_foresight_policy, sc, float(nd_e0), nd_chi0_int, params, u_plan=u_plan_nd))
+
+# Build statistics table
+def _nd_stats(rollout_list: list) -> dict:
+    costs    = np.array([r["cost_traj"].sum() for r in rollout_list])
+    pen_mins = np.array([int(((r["chi_traj"] == 1) & (r["e_traj"] <= params.e_min)).sum())
+                         for r in rollout_list])
+    energy   = np.array([(r["u_traj"] * params.omega).sum() for r in rollout_list])
+    final_e  = np.array([r["final_e"] for r in rollout_list])
+    return {
+        "Mean cost (€)":        costs.mean(),
+        "Std cost (€)":         costs.std(),
+        "Median cost (€)":      float(np.median(costs)),
+        "Mean penalty min":     pen_mins.mean(),
+        "% days with penalty":  float((pen_mins > 0).mean() * 100),
+        "Mean energy charged (kWh)": energy.mean(),
+        "Mean final battery (kWh)": final_e.mean(),
+    }
+
+stats_df = pd.DataFrame({name: _nd_stats(rolls) for name, rolls in nd_rollouts.items()}).T
+st.dataframe(
+    stats_df.style.format({
+        "Mean cost (€)":             "{:.3f}",
+        "Std cost (€)":              "{:.3f}",
+        "Median cost (€)":           "{:.3f}",
+        "Mean penalty min":          "{:.1f}",
+        "% days with penalty":       "{:.1f}%",
+        "Mean energy charged (kWh)": "{:.2f}",
+        "Mean final battery (kWh)":  "{:.2f}",
+    }),
+    use_container_width=True,
+)
+
+# Cost distribution box plot
+def cost_box_figure() -> go.Figure:
+    fig = go.Figure()
+    for name, rolls in nd_rollouts.items():
+        costs = [r["cost_traj"].sum() for r in rolls]
+        fig.add_trace(go.Box(y=costs, name=name, marker_color=POLICY_COLORS[name],
+                             boxmean="sd", whiskerwidth=0))
+    fig.update_layout(
+        title=f"Daily cost distribution across {n_days} days",
+        yaxis_title="Total cost (€)",
+        height=500,
+        margin=dict(l=30, r=30, t=55, b=35),
+        showlegend=False,
+    )
+    return fig
+
+st.plotly_chart(cost_box_figure(), use_container_width=True)

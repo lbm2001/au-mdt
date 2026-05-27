@@ -18,13 +18,13 @@ class BaselineParams:
     v: float = 50.0        # average driving speed (km/h)
     mu: float = 0.2        # energy consumption (kWh/km)
 
-    # ── Electricity price (€/MWh) ─────────────────────────────────────────────
-    price_night: float = 70.0     # 00:00 – 06:00
-    price_morning: float = 150.0  # 06:00 – 09:00
-    price_midday: float = 110.0   # 09:00 – 16:00
-    price_evening: float = 170.0  # 16:00 – 21:00
-    price_late: float = 100.0     # 21:00 – 24:00
-    sigma_lambda: float = 20.0    # price standard deviation (€/MWh)
+    # ── Electricity price (€/kWh) ─────────────────────────────────────────────
+    price_night: float = 0.30     # 00:00 – 06:00
+    price_morning: float = 0.48   # 06:00 – 09:00
+    price_midday: float = 0.39    # 09:00 – 16:00
+    price_evening: float = 0.55   # 16:00 – 21:00
+    price_late: float = 0.34      # 21:00 – 24:00
+    sigma_lambda: float = 0.05    # price standard deviation (€/kWh)
 
     # ── Mobility transition probabilities (per minute) ────────────────────────
     # Parked → Driving
@@ -39,10 +39,10 @@ class BaselineParams:
     p_dp_evening: float = 0.15   # 16:30 – 18:30
     p_dp_default: float = 0.25   # all other times
 
-    # ── Custom transition windows (override hardcoded schedule) ──────────────
-    # Each entry: {"start_h": float, "end_h": float, "p_PD": float, "p_DP": float}
-    # Last matching window wins. Evaluated after the built-in peaks.
-    custom_windows: list = field(default_factory=list)
+    # ── Price discretisation ──────────────────────────────────────────────────
+    K: int = 20              # number of price bins
+    lambda_max: float = 0.75   # upper price bound for binning (€/kWh);
+                               # covers mean + 4σ of the most expensive period
 
     # ── Fixed conversion factor (not user-configurable) ───────────────────────
     omega: float = 1 / 60  # minutes → hours (h/min)

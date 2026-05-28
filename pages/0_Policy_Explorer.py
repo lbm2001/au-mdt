@@ -13,7 +13,7 @@ from models.baseline import (
     BaselineParams, mean_price, transition_probs, consumption, price_bin_probs,
     backward_induction_policy, maximal_charging_policy, price_oriented_policy,
     night_charging_policy, minimum_soc_policy, always_minimum_policy,
-    random_policy, plan_perfect_foresight, perfect_foresight_policy,
+    random_policy,
 )
 from models.baseline.rollout import (generate_rollout_scenario, rollout_metrics,
                                      simulate_policy_rollout)
@@ -30,7 +30,7 @@ _DEFAULTS = dict(
     price_evening=0.55, price_late=0.34, sigma_lambda=0.05,
     p_pd_morning=0.08, p_pd_lunch=0.03, p_pd_evening=0.07, p_pd_default=0.005,
     p_dp_morning=0.15, p_dp_lunch=0.20, p_dp_evening=0.15, p_dp_default=0.25,
-    N_e=200,
+    N_e=500, T_hours=48,
 )
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -77,8 +77,11 @@ p_dp_default = st.sidebar.slider("Default",                  0.0, 1.0, 0.25, 0.0
 
 st.sidebar.header("Solver")
 N_e = st.sidebar.select_slider("Battery grid points N_e", [25, 50, 100, 200, 500, 1000, 2000], value=200, key="N_e")
+T_hours = st.sidebar.select_slider("Time horizon (hours)", [24, 48, 72, 96], value=48, key="T_hours")
 
 # ── Assemble params and solve ─────────────────────────────────────────────────
+
+T = T_hours * 60
 
 params = BaselineParams(
     u_max=u_max, u_min=u_min, e_max=e_max, e_min=e_min,
@@ -99,7 +102,7 @@ with st.spinner("Running backward induction…"):
         transition_probs_fn=lambda t: transition_probs(t, params),
         consumption_fn=lambda chi: consumption(chi, params),
         price_bin_probs_fn=lambda t: price_bin_probs(t, params),
-        T=1440,
+        T=T,
         N_e=N_e,
     )
 
@@ -113,12 +116,12 @@ st.session_state["params"] = params
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-HOURS = np.arange(1440) / 60
+HOURS = np.arange(T) / 60
 
 
 def _binned_policy_rates(rates: np.ndarray, time_bin_minutes: int,
                          battery_bin_kwh: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    n_time_bins = 1440 // time_bin_minutes
+    n_time_bins = T // time_bin_minutes
     usable = n_time_bins * time_bin_minutes
     rates_time = rates[:usable].reshape(n_time_bins, time_bin_minutes, rates.shape[1]).mean(axis=1)
 
@@ -160,7 +163,7 @@ def _policy_heatmap_figure(rates: np.ndarray, title: str, time_bin_minutes: int,
         height=430,
         margin=dict(l=30, r=30, t=55, b=35),
     )
-    fig.update_xaxes(range=[0, 24], dtick=3)
+    fig.update_xaxes(range=[0, T_hours], dtick=T_hours // 8)
     return fig
 
 
@@ -169,10 +172,10 @@ def optimal_policy_rates(chi: int, lam_bin: int) -> np.ndarray:
 
 
 def benchmark_policy_rates(policy_fn, chi: int, **policy_kwargs) -> np.ndarray:
-    """Compute desired charge rates for a benchmark policy over (1440, N_e)."""
-    t_arr = np.arange(1440)
+    """Compute desired charge rates for a benchmark policy over (T, N_e)."""
+    t_arr = np.arange(T)
     if policy_fn is maximal_charging_policy:
-        desired_rates = np.full((1440, len(e_grid)), params.u_max)
+        desired_rates = np.full((T, len(e_grid)), params.u_max)
     elif policy_fn is price_oriented_policy:
         lam_path = np.array([mean_price(t, params) for t in t_arr])
         low, high = policy_kwargs["low_threshold"], policy_kwargs["high_threshold"]
@@ -180,16 +183,16 @@ def benchmark_policy_rates(policy_fn, chi: int, **policy_kwargs) -> np.ndarray:
                            np.where(lam_path <= high, params.u_max / 2, 0.0))
         desired_rates = np.repeat(per_min[:, np.newaxis], len(e_grid), axis=1)
     elif policy_fn is night_charging_policy:
-        per_min = np.where(t_arr < 360, params.u_max, 0.0)
+        per_min = np.where(t_arr % 1440 < 360, params.u_max, 0.0)
         desired_rates = np.repeat(per_min[:, np.newaxis], len(e_grid), axis=1)
     elif policy_fn is always_minimum_policy:
-        desired_rates = np.full((1440, len(e_grid)), params.u_min)
+        desired_rates = np.full((T, len(e_grid)), params.u_min)
     elif policy_fn is minimum_soc_policy:
         threshold = policy_kwargs["soc_threshold"]
         desired_rates = np.where(e_grid[np.newaxis, :] < threshold, params.u_max, 0.0)
-        desired_rates = np.broadcast_to(desired_rates, (1440, len(e_grid))).copy()
+        desired_rates = np.broadcast_to(desired_rates, (T, len(e_grid))).copy()
     else:
-        desired_rates = np.zeros((1440, len(e_grid)))
+        desired_rates = np.zeros((T, len(e_grid)))
         for t in t_arr:
             lam = mean_price(t, params)
             for i, e in enumerate(e_grid):
@@ -217,7 +220,7 @@ def policy_heatmap(chi: int, title: str, time_bin_minutes: int, battery_bin_kwh:
 
 
 def price_figure() -> go.Figure:
-    minutes = np.arange(1440)
+    minutes = np.arange(T)
     prices  = np.array([mean_price(t, params) for t in minutes])
     sigma   = params.sigma_lambda
     fig = go.Figure()
@@ -245,12 +248,12 @@ def price_figure() -> go.Figure:
         height=320,
         margin=dict(l=30, r=30, t=55, b=35),
     )
-    fig.update_xaxes(range=[0, 24], dtick=3)
+    fig.update_xaxes(range=[0, T_hours], dtick=T_hours // 8)
     return fig
 
 
 def transition_figure() -> go.Figure:
-    probs = np.array([transition_probs(t, params) for t in range(1440)])
+    probs = np.array([transition_probs(t, params) for t in range(T)])
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True,
         subplot_titles=("Parked → Driving", "Driving → Parked"),
@@ -261,7 +264,7 @@ def transition_figure() -> go.Figure:
     fig.add_trace(go.Scatter(x=HOURS, y=probs[:, 1], mode="lines",
                              line=dict(color="green", width=2, shape="hv"), name="p_DP"), row=2, col=1)
     fig.update_layout(height=430, margin=dict(l=30, r=30, t=60, b=35))
-    fig.update_xaxes(range=[0, 24], dtick=3)
+    fig.update_xaxes(range=[0, T_hours], dtick=T_hours // 8)
     fig.update_yaxes(title_text="Prob. / min", row=1, col=1)
     fig.update_yaxes(title_text="Prob. / min", row=2, col=1)
     fig.update_xaxes(title_text="Hour of day", row=2, col=1)
@@ -270,7 +273,7 @@ def transition_figure() -> go.Figure:
 
 def charge_vs_price_figure(low_threshold: float, high_threshold: float,
                            soc_threshold: float) -> go.Figure:
-    prices   = np.array([mean_price(t, params) for t in range(1440)])
+    prices   = np.array([mean_price(t, params) for t in range(T)])
     lam_bin  = st.session_state.get("lam_bin_sel", params.K // 2)
     policy_rates = {
         "Backward induction":      optimal_policy_rates(0, lam_bin),
@@ -301,13 +304,13 @@ def charge_vs_price_figure(low_threshold: float, high_threshold: float,
                              line=dict(color="steelblue", width=2, shape="hv"), name="λ̄_t"),
                   secondary_y=False)
     for name, rates in policy_rates.items():
-        mean_per_hour = rates.mean(axis=1).reshape(24, 60).mean(axis=1)
-        fig.add_trace(go.Scatter(x=np.arange(24), y=mean_per_hour, mode="lines",
+        mean_per_hour = rates.mean(axis=1).reshape(T_hours, 60).mean(axis=1)
+        fig.add_trace(go.Scatter(x=np.arange(T_hours), y=mean_per_hour, mode="lines",
                                  line=dict(color=colors[name], width=2, shape="hv"),
                                  name=f"{name}"), secondary_y=True)
     fig.update_layout(title="Mean charge rate vs. electricity price (parked, averaged over battery grid)",
                       height=430, margin=dict(l=30, r=30, t=55, b=35))
-    fig.update_xaxes(title_text="Hour of day", range=[0, 24], dtick=3)
+    fig.update_xaxes(title_text="Hour", range=[0, T_hours], dtick=T_hours // 8)
     fig.update_yaxes(title_text="€ / kWh", secondary_y=False)
     fig.update_yaxes(title_text="Mean charge rate (kW)", secondary_y=True, rangemode="tozero")
     return fig
@@ -445,9 +448,7 @@ else:
     seed = st.session_state.get("sim_seed", int(seed))
 
 chi0_int = 0 if chi0 == "Parked" else 1
-scenario = generate_rollout_scenario(params, int(seed))
-
-u_plan = plan_perfect_foresight(scenario, float(e0), chi0_int, params)
+scenario = generate_rollout_scenario(params, int(seed), horizon=T)
 
 single_day_rollouts = {
     "Backward induction": simulate_policy_rollout(
@@ -468,9 +469,6 @@ single_day_rollouts = {
     "Random": simulate_policy_rollout(
         random_policy, scenario, float(e0), chi0_int, params,
         rng=np.random.default_rng(int(seed))),
-    "Perfect foresight": simulate_policy_rollout(
-        perfect_foresight_policy, scenario, float(e0), chi0_int, params,
-        u_plan=u_plan),
 }
 
 POLICY_COLORS = {
@@ -481,10 +479,9 @@ POLICY_COLORS = {
     "Minimum SoC":        "darkorange",
     "Always minimum":     "gray",
     "Random":             "pink",
-    "Perfect foresight":  "black",
 }
 
-hours = np.arange(1440) / 60
+hours = np.arange(T) / 60
 lam_traj = scenario["lam_path"]
 chi_traj_ref = single_day_rollouts["Backward induction"]["chi_traj"]
 
@@ -517,14 +514,14 @@ def sim_figure() -> go.Figure:
                              line=dict(color="lightgray", width=1.0, shape="hv"),
                              name="λ_t sampled"), row=4, col=1, secondary_y=False)
     fig.add_trace(go.Scatter(x=hours,
-                             y=np.array([mean_price(t, params) for t in range(1440)]),
+                             y=np.array([mean_price(t, params) for t in range(T)]),
                              mode="lines",
                              line=dict(color="black", width=1.4, dash="dash", shape="hv"),
                              name="λ̄_t mean"), row=4, col=1, secondary_y=False)
     fig.update_layout(height=1000, hovermode="x unified",
                       margin=dict(l=30, r=30, t=80, b=35))
-    fig.update_xaxes(range=[0, 24], dtick=3)
-    fig.update_xaxes(title_text="Hour of day", row=4, col=1)
+    fig.update_xaxes(range=[0, T_hours], dtick=T_hours // 8)
+    fig.update_xaxes(title_text="Hour", row=4, col=1)
     fig.update_yaxes(title_text="Battery (kWh)",
                      range=[params.e_min - 0.5, params.e_max + 0.5], row=1, col=1)
     fig.update_yaxes(title_text="State", tickvals=[0, 1],
@@ -571,12 +568,11 @@ nd_chi0_int = 0 if nd_chi0 == "Parked" else 1
 
 with st.spinner(f"Rolling out all policies over {n_days} days…"):
     rng_nd = np.random.default_rng(int(nd_seed))
-    nd_scenarios = [generate_rollout_scenario(params, int(rng_nd.integers(0, 1_000_000)))
+    nd_scenarios = [generate_rollout_scenario(params, int(rng_nd.integers(0, 1_000_000)), horizon=T)
                     for _ in range(n_days)]
 
     nd_rollouts: dict[str, list] = {name: [] for name in POLICY_COLORS}
     for sc in nd_scenarios:
-        u_plan_nd = plan_perfect_foresight(sc, float(nd_e0), nd_chi0_int, params)
         rng_rand = np.random.default_rng(int(rng_nd.integers(0, 1_000_000)))
         nd_rollouts["Backward induction"].append(simulate_policy_rollout(
             backward_induction_policy, sc, float(nd_e0), nd_chi0_int, params,
@@ -595,8 +591,6 @@ with st.spinner(f"Rolling out all policies over {n_days} days…"):
             always_minimum_policy, sc, float(nd_e0), nd_chi0_int, params))
         nd_rollouts["Random"].append(simulate_policy_rollout(
             random_policy, sc, float(nd_e0), nd_chi0_int, params, rng=rng_rand))
-        nd_rollouts["Perfect foresight"].append(simulate_policy_rollout(
-            perfect_foresight_policy, sc, float(nd_e0), nd_chi0_int, params, u_plan=u_plan_nd))
 
 # Build statistics table
 def _nd_stats(rollout_list: list) -> dict:
@@ -634,8 +628,7 @@ def cost_box_figure() -> go.Figure:
     fig = go.Figure()
     for name, rolls in nd_rollouts.items():
         costs = [r["cost_traj"].sum() for r in rolls]
-        fig.add_trace(go.Box(y=costs, name=name, marker_color=POLICY_COLORS[name],
-                             boxmean="sd", whiskerwidth=0))
+        fig.add_trace(go.Box(y=costs, name=name, marker_color=POLICY_COLORS[name]))
     fig.update_layout(
         title=f"Daily cost distribution across {n_days} days",
         yaxis_title="Total cost (€)",

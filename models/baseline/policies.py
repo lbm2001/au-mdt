@@ -66,7 +66,7 @@ def night_charging_policy(
     params: BaselineParams,
 ) -> float:
     """Charge at u_max between 00:00–06:00, nothing otherwise."""
-    return float(params.u_max) if t < 360 else 0.0
+    return float(params.u_max) if t % 1440 < 360 else 0.0
 
 
 def minimum_soc_policy(
@@ -115,7 +115,7 @@ def plan_perfect_foresight(
     """Pre-plan a charging schedule given full knowledge of prices and mobility.
 
     Greedily assigns charging to the cheapest parked minutes, using just enough
-    energy to cover total driving consumption. Returns a u_plan array (1440,).
+    energy to cover total driving consumption. Returns a u_plan array of length horizon.
     """
     horizon = len(scenario["lam_path"])
     lam_path = scenario["lam_path"]

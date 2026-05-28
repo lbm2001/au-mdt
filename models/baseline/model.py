@@ -8,8 +8,8 @@ DRIVING = 1
 
 
 def mean_price(t: int, params: BaselineParams) -> float:
-    """Time-dependent mean electricity price λ̄_t (€/kWh); t is minute of day [0, 1440)."""
-    h = t / 60
+    """Time-dependent mean electricity price λ̄_t (€/kWh); t is absolute minute, periodic over 1440."""
+    h = (t % 1440) / 60
     if h < 6:
         return params.price_night
     elif h < 9:
@@ -23,8 +23,8 @@ def mean_price(t: int, params: BaselineParams) -> float:
 
 
 def transition_probs(t: int, params: BaselineParams) -> tuple[float, float]:
-    """Returns (p_PD, p_DP) at minute t."""
-    h = t / 60
+    """Returns (p_PD, p_DP) at minute t; periodic over 1440 minutes."""
+    h = (t % 1440) / 60
 
     if 7.0 <= h < 9.0:
         p_pd = params.p_pd_morning

@@ -8,7 +8,7 @@ from .policies import actual_charge_rate
 def generate_rollout_scenario(
     params: BaselineParams,
     seed: int,
-    horizon: int = 1440,
+    horizon: int = 2880,
 ) -> dict[str, np.ndarray]:
     """Generate sampled prices and mobility draws shared across policy rollouts."""
     rng = np.random.default_rng(int(seed))

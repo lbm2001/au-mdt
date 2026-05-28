@@ -10,7 +10,7 @@ def backward_induction(
     transition_probs_fn: Callable[[int], tuple],
     consumption_fn: Callable[[int], float],
     price_bin_probs_fn: Callable[[int], np.ndarray],
-    T: int = 1440,
+    T: int = 2880,
     N_e: int = 100,
 ):
     """

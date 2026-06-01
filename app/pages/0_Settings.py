@@ -103,15 +103,37 @@ with col3:
 
     if is_negbin:
         st.markdown("**NegBin trip duration: T ~ NegBin(k, q)**")
-        nb_k = st.slider("Phases k  (concentration)",
-                         1, 20, _DEFAULTS["nb_k"], 1, key="nb_k",
-                         help="Number of driving phases. E[T] = k / q.")
+        nb_phase_mode = st.radio(
+            "Phase count per trip",
+            ["Fixed k", "Poisson(λ_k) sampled"],
+            horizontal=True, key="nb_phase_mode",
+            help="Fixed: every trip has exactly k phases. Sampled: k ~ Poisson(λ_k) drawn at trip start.",
+        )
         nb_q = st.slider("Phase prob q  (timescale)",
                          0.01, 1.0, _DEFAULTS["nb_q"], 0.01,
                          format="%.2f", key="nb_q",
                          help="Per-phase transition probability. E[T] = k / q.")
-        st.caption(f"E[T] = {nb_k}/{nb_q:.2f} = **{nb_k / nb_q:.1f} min**,  "
-                   f"Var[T] = {nb_k * (1 - nb_q) / nb_q**2:.1f} min²")
+        if nb_phase_mode == "Fixed k":
+            nb_k = st.slider("Phases k",
+                             1, 20, _DEFAULTS["nb_k"], 1, key="nb_k",
+                             help="Fixed number of driving phases.")
+            nb_lambda_k = None
+            st.caption(f"E[T] = {nb_k}/{nb_q:.2f} = **{nb_k / nb_q:.1f} min**,  "
+                       f"Var[T] = {nb_k * (1 - nb_q) / nb_q**2:.1f} min²")
+        else:
+            nb_lambda_k = st.slider("Mean phases λ_k",
+                                    0.5, 20.0, float(_DEFAULTS["nb_k"]), 0.5, key="nb_lambda_k",
+                                    help="Mean of Poisson distribution for k. E[T] = λ_k / q.")
+            import math as _math
+            # k_max = 99.9th percentile of Poisson(lambda_k)
+            _cdf, _pmf_r, nb_k = 0.0, _math.exp(-nb_lambda_k), 0
+            while _cdf < 0.999:
+                nb_k += 1
+                _pmf_r *= nb_lambda_k / nb_k
+                _cdf   += _pmf_r
+            nb_k = max(nb_k, 1)
+            st.caption(f"λ_k = {nb_lambda_k:.1f},  k_max = {nb_k},  "
+                       f"E[T] = {nb_lambda_k:.1f}/{nb_q:.2f} = **{nb_lambda_k / nb_q:.1f} min**")
     else:
         st.markdown("**Driving → Parked**")
         p_dp_morning = st.slider("Morning  (07:30–09:30 h)", 0.0, 1.0, _DEFAULTS["p_dp_morning"], 0.01, key="p_dp_morning")
@@ -151,8 +173,10 @@ if run_btn:
     if is_negbin:
         from models.negative_binomial_trips import NegBinParams
         from models.negative_binomial_trips.backward_induction import backward_induction as _bi
-        params = NegBinParams(**common_kwargs, k=int(nb_k), q=float(nb_q))
-        with st.spinner(f"Running backward induction (NegBin k={nb_k}, q={nb_q:.2f}, T={T} min, N_e={N_e})…"):
+        params = NegBinParams(**common_kwargs, k=int(nb_k), q=float(nb_q),
+                              lambda_k=float(nb_lambda_k) if nb_lambda_k is not None else None)
+        mode_label = f"λ_k={nb_lambda_k:.1f}" if nb_lambda_k is not None else f"k={nb_k}"
+        with st.spinner(f"Running backward induction (NegBin {mode_label}, q={nb_q:.2f}, T={T} min, N_e={N_e})…"):
             V, pi, actions, e_grid, lam_grid = _bi(params, T=T, N_e=N_e)
     else:
         from models.baseline import BaselineParams

@@ -1,13 +1,23 @@
 import numpy as np
 
-from .model import PARKED, consumption, is_driving, mean_price, p_pd, transition_matrix
+import math
+
+from .model import PARKED, consumption, is_driving, mean_price, p_pd
 from .params import NegBinParams
+from models.policies import actual_charge_rate  # noqa: F401  (re-exported)
 
 
-def actual_charge_rate(chi: int, e: float, desired_u: float, params: NegBinParams) -> float:
-    if is_driving(chi) and e > params.e_min:
-        return 0.0
-    return float(np.clip(desired_u, 0.0, params.u_max))
+def _sample_poisson_k(uniform_draw: float, lambda_k: float, k_max: int) -> int:
+    """Inverse-CDF sample from Poisson(lambda_k) truncated to [1, k_max]."""
+    pmf_r = math.exp(-lambda_k)
+    total = 1.0 - pmf_r          # P(Poisson >= 1) for renormalization
+    cdf = 0.0
+    for r in range(1, k_max + 1):
+        pmf_r *= lambda_k / r
+        cdf += pmf_r / total
+        if uniform_draw <= cdf:
+            return r
+    return k_max
 
 
 def generate_rollout_scenario(
@@ -19,20 +29,24 @@ def generate_rollout_scenario(
     rng = np.random.default_rng(int(seed))
     lam_path       = np.zeros(horizon)
     mobility_draws = np.zeros(horizon)
+    phase_draws    = np.zeros(horizon)  # used only when lambda_k is set (trip-start k sampling)
     for t in range(horizon):
         lam_path[t]       = float(np.maximum(0.0, rng.normal(mean_price(t, params), params.sigma_lambda)))
         mobility_draws[t] = rng.random()
-    return {"lam_path": lam_path, "mobility_draws": mobility_draws}
+        phase_draws[t]    = rng.random()
+    return {"lam_path": lam_path, "mobility_draws": mobility_draws, "phase_draws": phase_draws}
 
 
-def _next_chi(chi: int, draw: float, t: int, params: NegBinParams) -> int:
-    """Advance the mobility state by one step."""
+def _next_chi(chi: int, mob_draw: float, phase_draw: float, t: int, params: NegBinParams) -> int:
+    """Advance mobility state. chi encodes remaining phases (0=Parked, r≥1=r phases left)."""
     if chi == PARKED:
-        return 1 if draw < p_pd(t, params) else PARKED
-    elif chi < params.k:                        # D_1 .. D_{k-1}
-        return chi + 1 if draw < params.q else chi
-    else:                                        # D_k
-        return PARKED if draw < params.q else chi
+        if mob_draw < p_pd(t, params):
+            if params.lambda_k is None:
+                return params.k                                          # fixed: start with k phases
+            return _sample_poisson_k(phase_draw, params.lambda_k, params.k)
+        return PARKED
+    # Driving: advance (reduce remaining) with prob q
+    return chi - 1 if mob_draw < params.q else chi                      # chi-1=0 → Parked when chi=1
 
 
 def simulate_policy_rollout(
@@ -71,7 +85,8 @@ def simulate_policy_rollout(
         cons = consumption(chi, params)
         e = float(np.clip(e + params.eta_c * params.omega * u_a - cons, params.e_min, params.e_max))
 
-        chi = _next_chi(chi, float(scenario["mobility_draws"][t]), t, params)
+        chi = _next_chi(chi, float(scenario["mobility_draws"][t]),
+                        float(scenario["phase_draws"][t]), t, params)
 
     return {
         "e_traj":    e_traj,

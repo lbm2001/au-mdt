@@ -39,14 +39,29 @@ def p_pd(t: int, params: NegBinParams) -> float:
         return params.p_pd_default
 
 
+def _poisson_entry_probs(params: NegBinParams) -> np.ndarray:
+    """PMF of k ~ Poisson(lambda_k) truncated to [1, k_max], length k_max."""
+    import math
+    lam = params.lambda_k
+    k_max = params.k
+    pmf = np.array([math.exp(-lam) * lam**r / math.factorial(r)
+                    for r in range(1, k_max + 1)])
+    total = pmf.sum()
+    return pmf / total if total > 0 else pmf
+
+
 def transition_matrix(t: int, params: NegBinParams) -> np.ndarray:
     """Return the (k+1)×(k+1) one-step transition matrix at minute t.
 
-    States: 0=P, 1=D_1, …, k=D_k.
-      P   → D_1      w.p. p_PD  (time-dependent)
-      D_i → D_{i+1}  w.p. q     (i = 1, …, k-1)
-      D_k → P        w.p. q
-      all self-loops with residual probability.
+    State encoding — remaining phases:
+      0       = Parked
+      r ≥ 1   = Driving with r phases left
+
+    Transitions:
+      P    → r    w.p. p_PD × entry(r)   (entry: point mass at k or Poisson PMF)
+      r>1  → r-1  w.p. q
+      r=1  → P    w.p. q
+      all states self-loop with residual probability.
     """
     n = params.k + 1
     P = np.zeros((n, n))
@@ -54,14 +69,15 @@ def transition_matrix(t: int, params: NegBinParams) -> np.ndarray:
     q = params.q
 
     P[0, 0] = 1.0 - pPD
-    P[0, 1] = pPD
+    if params.lambda_k is None:
+        P[0, params.k] = pPD                          # fixed k: point mass
+    else:
+        entry = _poisson_entry_probs(params)
+        P[0, 1:] = pPD * entry                        # distribute over 1..k
 
-    for i in range(1, params.k):        # D_1 .. D_{k-1}
-        P[i, i]     = 1.0 - q
-        P[i, i + 1] = q
-
-    P[params.k, params.k] = 1.0 - q    # D_k stays
-    P[params.k, 0]         = q          # D_k → P
+    for r in range(1, params.k + 1):                  # remaining r phases
+        P[r, r] = 1.0 - q
+        P[r, r - 1] = q                               # r-1=0 means → Parked
 
     return P
 
@@ -78,6 +94,25 @@ def price_bin(lam: float, params: NegBinParams) -> int:
 
 def bin_center_price(k: int, params: NegBinParams) -> float:
     return (k + 0.5) * params.lambda_max / params.K
+
+
+def transition_probs(t: int, params: NegBinParams) -> tuple[float, float]:
+    """Return (p_PD, p_DP_eff) at minute t.
+
+    p_DP_eff is the effective Driving→Parked probability, derived from the
+    stationary distribution over driving phases.  For fixed k: q/k.  For
+    Poisson-sampled k: q / E[k_trip], where E[k_trip] = sum_r P(k≥r) over
+    the truncated Poisson distribution.
+    """
+    p_PD = p_pd(t, params)
+    if params.lambda_k is None:
+        p_DP_eff = params.q / params.k
+    else:
+        entry = _poisson_entry_probs(params)   # PMF of k in [1..k_max]
+        # Stationary P(remaining=r | driving) ∝ P(k_trip ≥ r) = sum_{j≥r} entry[j-1]
+        sf = np.array([entry[r - 1:].sum() for r in range(1, params.k + 1)])
+        p_DP_eff = float(params.q * sf[0] / sf.sum())
+    return p_PD, p_DP_eff
 
 
 def price_bin_probs(t: int, params: NegBinParams) -> np.ndarray:

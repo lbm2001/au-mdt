@@ -36,6 +36,7 @@ if is_negbin:
         mean_price,
         backward_induction_policy, maximal_charging_policy, price_oriented_policy,
         night_charging_policy, minimum_soc_policy, always_minimum_policy, random_policy,
+        dp_heuristic_policy, expected_parking_policy,
     )
     from models.negative_binomial_trips.rollout import (
         generate_rollout_scenario, rollout_metrics, simulate_policy_rollout,

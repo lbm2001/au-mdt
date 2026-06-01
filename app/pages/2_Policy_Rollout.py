@@ -45,12 +45,15 @@ else:
         mean_price,
         backward_induction_policy, maximal_charging_policy, price_oriented_policy,
         night_charging_policy, minimum_soc_policy, always_minimum_policy, random_policy,
+        dp_heuristic_policy, expected_parking_policy,
     )
     from models.baseline.rollout import generate_rollout_scenario, rollout_metrics, simulate_policy_rollout
 
 POLICY_COLORS = {
-    "Backward induction": "steelblue",
-    "Maximal charging":   "seagreen",
+    "Backward induction":   "steelblue",
+    "DP heuristic":         "teal",
+    "Expected parking":     "darkviolet",
+    "Maximal charging":     "seagreen",
     "Price-oriented":     "crimson",
     "Night charging":     "purple",
     "Minimum SoC":        "darkorange",
@@ -94,6 +97,10 @@ single_rollouts = {
     "Backward induction": simulate_policy_rollout(
         backward_induction_policy, scenario, float(e0), chi0_int, params,
         pi=pi, actions=actions, e_grid=e_grid),
+    "DP heuristic": simulate_policy_rollout(
+        dp_heuristic_policy, scenario, float(e0), chi0_int, params),
+    "Expected parking": simulate_policy_rollout(
+        expected_parking_policy, scenario, float(e0), chi0_int, params),
     "Maximal charging": simulate_policy_rollout(
         maximal_charging_policy, scenario, float(e0), chi0_int, params),
     "Price-oriented": simulate_policy_rollout(
@@ -215,6 +222,10 @@ with st.spinner(f"Rolling out all policies over {n_days} scenarios…"):
         nd_rollouts["Backward induction"].append(simulate_policy_rollout(
             backward_induction_policy, sc, float(nd_e0), nd_chi0_int, params,
             pi=pi, actions=actions, e_grid=e_grid))
+        nd_rollouts["DP heuristic"].append(simulate_policy_rollout(
+            dp_heuristic_policy, sc, float(nd_e0), nd_chi0_int, params))
+        nd_rollouts["Expected parking"].append(simulate_policy_rollout(
+            expected_parking_policy, sc, float(nd_e0), nd_chi0_int, params))
         nd_rollouts["Maximal charging"].append(simulate_policy_rollout(
             maximal_charging_policy, sc, float(nd_e0), nd_chi0_int, params))
         nd_rollouts["Price-oriented"].append(simulate_policy_rollout(

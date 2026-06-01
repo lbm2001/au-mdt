@@ -4,6 +4,7 @@ from .policies import (actual_charge_rate, backward_induction_policy,
                        maximal_charging_policy, price_oriented_policy,
                        night_charging_policy, minimum_soc_policy,
                        always_minimum_policy, random_policy,
+                       dp_heuristic_policy, expected_parking_policy,
                        plan_perfect_foresight, perfect_foresight_policy)
 
 __all__ = ["BaselineParams", "mean_price", "transition_probs", "consumption",
@@ -12,4 +13,5 @@ __all__ = ["BaselineParams", "mean_price", "transition_probs", "consumption",
            "maximal_charging_policy", "price_oriented_policy",
            "night_charging_policy", "minimum_soc_policy",
            "always_minimum_policy", "random_policy",
+           "dp_heuristic_policy", "expected_parking_policy",
            "plan_perfect_foresight", "perfect_foresight_policy"]

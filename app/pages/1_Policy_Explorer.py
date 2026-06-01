@@ -40,9 +40,10 @@ if is_negbin:
     )
 else:
     from models.baseline import (
-        mean_price, transition_probs,
+        mean_price, transition_probs, price_bin_probs,
         maximal_charging_policy, price_oriented_policy,
         night_charging_policy, minimum_soc_policy, always_minimum_policy,
+        dp_heuristic_policy, expected_parking_policy,
     )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -126,6 +127,38 @@ def benchmark_policy_rates(policy_fn, chi: int, **policy_kwargs) -> np.ndarray:
         threshold = policy_kwargs["soc_threshold"]
         desired_rates = np.where(e_grid[np.newaxis, :] < threshold, params.u_max, 0.0)
         desired_rates = np.broadcast_to(desired_rates, (T, len(e_grid))).copy()
+    elif policy_fn is dp_heuristic_policy:
+        # E[u(t,e)] = u_max × Σ_k prob_k × 1[F_cdf(k) ≤ 1 − e/e_max]
+        desired_rates = np.zeros((T, len(e_grid)))
+        thresh = 1.0 - e_grid / params.e_max          # (N_e,) — higher when emptier
+        for t in t_arr:
+            probs = price_bin_probs(t, params)         # (K,)
+            F_cdf = np.cumsum(probs)                   # (K,)
+            # charge mask: (N_e, K) — True where price bin qualifies
+            mask = F_cdf[np.newaxis, :] <= thresh[:, np.newaxis]
+            desired_rates[t] = params.u_max * (probs[np.newaxis, :] * mask).sum(axis=1)
+    elif policy_fn is expected_parking_policy:
+        # Same three-band rule but with rem = π_P(t) × 1440, vectorised over (N_e, K).
+        energy_per_step = params.u_max * params.omega * params.eta_c
+        x_arr        = params.e_max - e_grid                                   # (N_e,)
+        k_arr        = np.floor(x_arr / energy_per_step).astype(int)          # (N_e,)
+        rem_arr_base = np.maximum(k_arr + 1, 1)                               # floor, at least k+1
+        rem_u        = (x_arr - k_arr * energy_per_step) / (params.omega * params.eta_c)  # (N_e,)
+        desired_rates = np.zeros((T, len(e_grid)))
+        for t in t_arr:
+            probs = price_bin_probs(t, params)         # (K,)
+            F_cdf = np.cumsum(probs)                   # (K,)
+            p_PD, p_DP = transition_probs(t, params)
+            denom  = p_PD + p_DP
+            pi_P   = p_DP / denom if denom > 0 else 0.5
+            base   = int(pi_P * 1440)
+            rem_arr = np.maximum(base, rem_arr_base)   # (N_e,)
+            thresh_k  = k_arr / rem_arr                # (N_e,)
+            thresh_k1 = (k_arr + 1) / rem_arr          # (N_e,)
+            F_mat  = F_cdf[np.newaxis, :]              # (1,  K)
+            u_mat  = np.where(F_mat <= thresh_k[:, np.newaxis],  params.u_max,
+                     np.where(F_mat <= thresh_k1[:, np.newaxis], rem_u[:, np.newaxis], 0.0))
+            desired_rates[t] = (probs[np.newaxis, :] * u_mat).sum(axis=1)
     else:
         desired_rates = np.zeros((T, len(e_grid)))
         for t in t_arr:
@@ -206,6 +239,8 @@ def charge_vs_price_figure(low_threshold: float, high_threshold: float,
     lam_bin = st.session_state.get("lam_bin_sel", params.K // 2)
     policy_rates = {
         "Backward induction": optimal_policy_rates(0, lam_bin),
+        "DP heuristic":       benchmark_policy_rates(dp_heuristic_policy, 0),
+        "Expected parking":   benchmark_policy_rates(expected_parking_policy, 0),
         "Maximal charging":   benchmark_policy_rates(maximal_charging_policy, 0),
         "Price-oriented":     benchmark_policy_rates(price_oriented_policy, 0,
                                   low_threshold=low_threshold, high_threshold=high_threshold),
@@ -216,11 +251,13 @@ def charge_vs_price_figure(low_threshold: float, high_threshold: float,
     }
     colors = {
         "Backward induction": "steelblue",
+        "DP heuristic":       "teal",
         "Maximal charging":   "seagreen",
         "Price-oriented":     "crimson",
         "Night charging":     "purple",
         "Minimum SoC":        "darkorange",
         "Always minimum":     "gray",
+        "Expected parking":   "darkviolet",
     }
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Scatter(
@@ -304,6 +341,7 @@ with col_soc:
 st.subheader("Benchmark Policy Heatmaps")
 bench_tabs = st.tabs([
     "Maximal charging", "Price-oriented", "Night charging", "Minimum SoC", "Always minimum",
+    "DP heuristic", "Expected parking",
 ])
 time_bin = st.session_state.get("time_bin", 10)
 bat_bin  = st.session_state.get("bat_bin", 1.0)
@@ -331,6 +369,14 @@ with bench_tabs[4]:
     st.plotly_chart(_policy_heatmap_figure(
         benchmark_policy_rates(always_minimum_policy, 0),
         "Always minimum rate — Parked", time_bin, bat_bin), use_container_width=True)
+with bench_tabs[5]:
+    st.plotly_chart(_policy_heatmap_figure(
+        benchmark_policy_rates(dp_heuristic_policy, 0),
+        "DP heuristic — Parked", time_bin, bat_bin), use_container_width=True)
+with bench_tabs[6]:
+    st.plotly_chart(_policy_heatmap_figure(
+        benchmark_policy_rates(expected_parking_policy, 0),
+        "Expected parking — Parked", time_bin, bat_bin), use_container_width=True)
 
 # ── Charge rate vs price ──────────────────────────────────────────────────────
 

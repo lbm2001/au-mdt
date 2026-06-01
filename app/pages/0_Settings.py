@@ -126,10 +126,11 @@ with col_btn:
     run_btn = st.button("▶ Run Backward Induction", type="primary", use_container_width=True)
 with col_status:
     if "e_grid" in st.session_state:
-        stored_T   = st.session_state.get("T", 0)
-        stored_N_e = len(st.session_state["e_grid"])
-        stored_model = st.session_state.get("solved_model", "unknown")
-        st.success(f"Solution ready — model: {stored_model}, N_e = {stored_N_e}, T = {stored_T} min ({stored_T // 60} h)")
+        stored_T      = st.session_state.get("T", 0)
+        stored_N_e    = len(st.session_state["e_grid"])
+        stored_N_a    = len(st.session_state["actions"])
+        stored_model  = st.session_state.get("solved_model", "unknown")
+        st.success(f"Solution ready — model: {stored_model}, N_e = {stored_N_e}, N_a = {stored_N_a}, T = {stored_T} min ({stored_T // 60} h)")
     else:
         st.info("No solution computed yet. Click **Run Backward Induction** to start.")
 

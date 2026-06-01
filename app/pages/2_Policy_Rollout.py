@@ -38,7 +38,7 @@ if is_negbin:
         night_charging_policy, minimum_soc_policy, always_minimum_policy, random_policy,
         dp_heuristic_policy, expected_parking_policy,
     )
-    from models.negative_binomial_trips.rollout import (
+    from models.negative_binomial_trips import (
         generate_rollout_scenario, rollout_metrics, simulate_policy_rollout,
     )
 else:
@@ -47,8 +47,8 @@ else:
         backward_induction_policy, maximal_charging_policy, price_oriented_policy,
         night_charging_policy, minimum_soc_policy, always_minimum_policy, random_policy,
         dp_heuristic_policy, expected_parking_policy,
+        generate_rollout_scenario, rollout_metrics, simulate_policy_rollout,
     )
-    from models.baseline.rollout import generate_rollout_scenario, rollout_metrics, simulate_policy_rollout
 
 POLICY_COLORS = {
     "Backward induction":   "steelblue",

@@ -179,8 +179,7 @@ if run_btn:
         with st.spinner(f"Running backward induction (NegBin {mode_label}, q={nb_q:.2f}, T={T} min, N_e={N_e})…"):
             V, pi, actions, e_grid, lam_grid = _bi(params, T=T, N_e=N_e)
     else:
-        from models.baseline import BaselineParams
-        from models.baseline.model import transition_probs, consumption, price_bin_probs
+        from models.baseline import BaselineParams, transition_probs, consumption, price_bin_probs
         from utils.backward_induction import backward_induction as _bi
         params = BaselineParams(
             **common_kwargs,

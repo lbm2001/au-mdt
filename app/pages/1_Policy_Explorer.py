@@ -32,15 +32,18 @@ HOURS = np.arange(T) / 60
 
 # ── Model-specific imports ────────────────────────────────────────────────────
 
+from models.model_utils import price_bin_probs
+
 if is_negbin:
     from models.negative_binomial_trips import (
-        mean_price, p_pd,
+        mean_price, transition_probs, p_pd,
         maximal_charging_policy, price_oriented_policy,
         night_charging_policy, minimum_soc_policy, always_minimum_policy,
+        dp_heuristic_policy, expected_parking_policy,
     )
 else:
     from models.baseline import (
-        mean_price, transition_probs, price_bin_probs,
+        mean_price, transition_probs,
         maximal_charging_policy, price_oriented_policy,
         night_charging_policy, minimum_soc_policy, always_minimum_policy,
         dp_heuristic_policy, expected_parking_policy,

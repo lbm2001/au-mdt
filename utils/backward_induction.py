@@ -12,6 +12,7 @@ def backward_induction(
     price_bin_probs_fn: Callable[[int], np.ndarray],
     T: int = 2880,
     N_e: int = 100,
+    N_a: int | None = None,
 ):
     """
     Solve the EV charging MDP via backward induction with price as a state variable.
@@ -34,18 +35,24 @@ def backward_induction(
     price_bin_probs_fn   : t -> (K,) ndarray — bin probabilities for the price at t
     T                    : time horizon in minutes
     N_e                  : battery grid points
+    N_a                  : number of non-zero charge rates; None (default) uses the original
+                           [0, u_min, u_max/2, u_max]; an integer N_a uses
+                           [0] + linspace(u_min, u_max, N_a)
 
     Returns
     -------
     V        : ndarray (T+1, 2, N_e, K)
     pi       : ndarray (T,   2, N_e, K)  — index into `actions`
-    actions  : ndarray (4,)
+    actions  : ndarray (N_a+1,)
     e_grid   : ndarray (N_e,)
     lam_grid : ndarray (K,)              — bin-centre prices (€/kWh)
     """
     K       = params.K
     e_grid  = np.linspace(params.e_min, params.e_max, N_e)
-    actions = np.array([0.0, params.u_min, params.u_max / 2, params.u_max])
+    if N_a is None:
+        actions = np.array([0.0, params.u_min, params.u_max / 2, params.u_max])
+    else:
+        actions = np.concatenate([[0.0], np.linspace(params.u_min, params.u_max, N_a)])
     n_a     = len(actions)
 
     # Bin-centre prices (€/kWh), used for the immediate charging cost

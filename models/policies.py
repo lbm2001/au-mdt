@@ -1,41 +1,7 @@
 """Shared charging policies — work with any params that has the standard fields."""
-from math import erf as _erf, sqrt as _sqrt
-
 import numpy as np
 
-
-# ── Internal helpers ───────────────────────────────────────────────────────────
-
-def _price_bin(lam: float, params) -> int:
-    return int(min(max(0.0, lam) / (params.lambda_max / params.K), params.K - 1))
-
-
-def _price_bin_probs(t: int, params) -> np.ndarray:
-    lam_bar = _mean_price(t, params)
-    sigma   = params.sigma_lambda
-    delta   = params.lambda_max / params.K
-
-    def _cdf(x: float) -> float:
-        if sigma <= 0:
-            return 1.0 if x > lam_bar else 0.0
-        return 0.5 * (1.0 + _erf((x - lam_bar) / (sigma * _sqrt(2.0))))
-
-    edges = [j * delta for j in range(params.K + 1)]
-    probs = np.empty(params.K)
-    probs[0] = _cdf(edges[1])
-    for j in range(1, params.K - 1):
-        probs[j] = _cdf(edges[j + 1]) - _cdf(edges[j])
-    probs[-1] = 1.0 - _cdf(edges[-2])
-    return probs
-
-
-def _mean_price(t: int, params) -> float:
-    h = (t % 1440) / 60
-    if h < 6:   return params.price_night
-    if h < 9:   return params.price_morning
-    if h < 16:  return params.price_midday
-    if h < 21:  return params.price_evening
-    return params.price_late
+from models.model_utils import price_bin, price_bin_probs
 
 
 def _transition_probs(t: int, params) -> tuple[float, float]:
@@ -48,7 +14,7 @@ def _transition_probs(t: int, params) -> tuple[float, float]:
 # ── Shared policies ────────────────────────────────────────────────────────────
 
 def actual_charge_rate(chi: int, e: float, desired_u: float, params) -> float:
-    if chi > 0 and e > params.e_min:   # driving and battery above minimum
+    if chi > 0 and e > params.e_min:
         return 0.0
     return float(np.clip(desired_u, 0.0, params.u_max))
 
@@ -58,7 +24,7 @@ def backward_induction_policy(
     *, pi: np.ndarray, actions: np.ndarray, e_grid: np.ndarray,
 ) -> float:
     e_idx   = int(np.argmin(np.abs(e_grid - e)))
-    lam_idx = _price_bin(lam, params)
+    lam_idx = price_bin(lam, params)
     return float(actions[pi[t, chi, e_idx, lam_idx]])
 
 
@@ -114,7 +80,7 @@ def dp_heuristic_policy(
     if e >= params.e_max:
         return 0.0
     thresh   = 1.0 - e / params.e_max
-    probs    = _price_bin_probs(t, params)
+    probs    = price_bin_probs(t, params)
     lam_grid = np.array([(j + 0.5) * params.lambda_max / params.K for j in range(params.K)])
     F_p      = float(probs[lam_grid <= lam].sum())
     return float(params.u_max) if F_p <= thresh else 0.0
@@ -138,7 +104,7 @@ def expected_parking_policy(
     pi_P  = p_DP / denom if denom > 0 else 0.5
     rem   = max(int(pi_P * 1440), k + 1)
 
-    probs    = _price_bin_probs(t, params)
+    probs    = price_bin_probs(t, params)
     lam_grid = np.array([(j + 0.5) * params.lambda_max / params.K for j in range(params.K)])
     F_p      = float(probs[lam_grid <= lam].sum())
 

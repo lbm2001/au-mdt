@@ -1,6 +1,7 @@
 import numpy as np
 
-from .model import consumption, is_driving, price_bin_probs, transition_matrix
+from models.model_utils import consumption, price_bin_probs
+from .model import is_driving, transition_matrix
 from .params import NegBinParams
 
 

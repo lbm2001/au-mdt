@@ -110,6 +110,14 @@ def optimal_policy_rates(chi: int, lam_bin: int) -> np.ndarray:
     return effective_policy_rates(chi, actions[pi[:, chi, :, lam_bin]])
 
 
+def optimal_policy_rates_averaged(chi: int) -> np.ndarray:
+    """E_λ[actions[π(t,χ,e,k)]] weighted by the time-dependent price distribution."""
+    desired = actions[pi[:, chi, :, :]]                                    # (T, N_e, K)
+    weights = np.array([price_bin_probs(t, params) for t in range(T)])     # (T, K)
+    averaged = (desired * weights[:, np.newaxis, :]).sum(axis=2)           # (T, N_e)
+    return effective_policy_rates(chi, averaged)
+
+
 def benchmark_policy_rates(policy_fn, chi: int, **policy_kwargs) -> np.ndarray:
     """Compute desired charge rates for a benchmark policy over (T, N_e)."""
     t_arr = np.arange(T)
@@ -309,13 +317,25 @@ st.session_state["benchmark_low_threshold"] = min(
 
 st.subheader("Optimal Policy")
 
+avg_bins = st.toggle("Average over all price bins", value=False, key="opt_avg_bins",
+                     help="Weight each price-bin policy by the time-dependent price distribution p_t(k).")
+
 lam_bin_sel   = st.session_state.get("lam_bin_sel", params.K // 2)
 lam_bin_label = f"λ̂ = {lam_grid[lam_bin_sel]:.3f} €/kWh (bin {lam_bin_sel})"
 
-st.plotly_chart(policy_heatmap(0, f"Optimal policy — Parked  |  {lam_bin_label}",
-                               st.session_state.get("time_bin", 10),
-                               st.session_state.get("bat_bin", 1.0),
-                               lam_bin_sel), use_container_width=True)
+if avg_bins:
+    _opt_rates = optimal_policy_rates_averaged(0)
+    _opt_title = "Optimal policy — Parked  |  price-averaged"
+else:
+    _opt_rates = optimal_policy_rates(0, lam_bin_sel)
+    _opt_title = f"Optimal policy — Parked  |  {lam_bin_label}"
+
+st.plotly_chart(
+    _policy_heatmap_figure(_opt_rates, _opt_title,
+                           st.session_state.get("time_bin", 10),
+                           st.session_state.get("bat_bin", 1.0)),
+    use_container_width=True,
+)
 
 col_tb, col_bb, col_lb, col_low, col_high, col_soc = st.columns(6)
 with col_tb:
@@ -324,8 +344,11 @@ with col_tb:
 with col_bb:
     st.slider("Battery bin (kWh)", 0.5, 10.0, 1.0, 0.5, key="bat_bin")
 with col_lb:
-    st.slider("Price bin λ̂", 0, params.K - 1, params.K // 2, 1, key="lam_bin_sel",
-              help=f"Bin centre: {lam_grid[lam_bin_sel]:.3f} €/kWh")
+    if not avg_bins:
+        st.slider("Price bin λ̂", 0, params.K - 1, params.K // 2, 1, key="lam_bin_sel",
+                  help=f"Bin centre: {lam_grid[lam_bin_sel]:.3f} €/kWh")
+    else:
+        st.empty()
 with col_low:
     low_threshold = st.slider("Low price threshold (€/kWh)", 0.0, 1.0,
                               key="benchmark_low_threshold", step=0.01)

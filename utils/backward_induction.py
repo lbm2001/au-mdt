@@ -1,6 +1,8 @@
 import numpy as np
 from typing import Callable
 
+from models.solver_config import N_e as _N_E, T_hours as _T_HOURS
+
 PARKED  = 0
 DRIVING = 1
 
@@ -10,8 +12,8 @@ def backward_induction(
     transition_probs_fn: Callable[[int], tuple],
     consumption_fn: Callable[[int], float],
     price_bin_probs_fn: Callable[[int], np.ndarray],
-    T: int = 2880,
-    N_e: int = 100,
+    T: int = _T_HOURS * 60,
+    N_e: int = _N_E,
     N_a: int | None = None,
 ):
     """

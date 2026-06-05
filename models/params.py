@@ -27,10 +27,10 @@ class SharedParams:
     sigma_lambda: float = 0.05
 
     # ── Parked → Driving departure probabilities (per minute) ─────────────────
-    p_pd_morning: float = 0.08
-    p_pd_lunch: float = 0.03
-    p_pd_evening: float = 0.07
-    p_pd_default: float = 0.005
+    p_pd_morning: float = 0.04
+    p_pd_lunch: float = 0.015
+    p_pd_evening: float = 0.035
+    p_pd_default: float = 0.0025
 
     # ── Price discretisation ──────────────────────────────────────────────────
     K: int = 20

@@ -1,14 +1,18 @@
 import numpy as np
+from typing import Callable
 
 from models.model_utils import consumption, price_bin_probs
+from models.solver_config import N_e as _N_E, T_hours as _T_HOURS
 from .model import is_driving, transition_matrix
 from .params import NegBinParams
 
 
 def backward_induction(
     params: NegBinParams,
-    T: int = 2880,
-    N_e: int = 100,
+    price_bin_probs_fn: Callable[[int], np.ndarray] | None = None,
+    T: int = _T_HOURS * 60,
+    N_e: int = _N_E,
+    N_a: int | None = None,
 ):
     """Solve the NegBin EV charging MDP via backward induction.
 
@@ -20,14 +24,17 @@ def backward_induction(
     -------
     V        : ndarray (T+1, k+1, N_e, K)
     pi       : ndarray (T,   k+1, N_e, K)  — index into `actions`
-    actions  : ndarray (4,)
+    actions  : ndarray (N_a+1,)
     e_grid   : ndarray (N_e,)
     lam_grid : ndarray (K,)
     """
     K      = params.K
     n_chi  = params.k + 1
     e_grid = np.linspace(params.e_min, params.e_max, N_e)
-    actions = np.array([0.0, params.u_min, params.u_max / 2, params.u_max])
+    if N_a is None:
+        actions = np.array([0.0, params.u_min, params.u_max / 2, params.u_max])
+    else:
+        actions = np.concatenate([[0.0], np.linspace(params.u_min, params.u_max, N_a)])
     n_a    = len(actions)
 
     lam_grid = np.array([(j + 0.5) * params.lambda_max / K for j in range(K)])
@@ -35,7 +42,8 @@ def backward_induction(
     V  = np.zeros((T + 1, n_chi, N_e, K))
     pi = np.zeros((T,     n_chi, N_e, K), dtype=int)
 
-    all_p_next = np.array([price_bin_probs(t + 1, params) for t in range(T)])  # (T, K)
+    _pbp = price_bin_probs_fn if price_bin_probs_fn is not None else (lambda t: price_bin_probs(t, params))
+    all_p_next = np.array([_pbp(t + 1) for t in range(T)])  # (T, K)
 
     E = e_grid[:, np.newaxis]    # (N_e, 1)
     A = actions[np.newaxis, :]   # (1, n_a)

@@ -38,3 +38,7 @@ htmlcov/
 # Environment variables
 .env
 .env.local
+
+# Streamlit secrets (contains API keys)
+.streamlit/secrets.toml
+wandb/

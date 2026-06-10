@@ -1,5 +1,6 @@
-"""Load and preprocess ENTSO-E day-ahead price CSV files."""
+"""Load and preprocess ENTSO-E day-ahead price data — from CSV files or the live API."""
 
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -7,13 +8,14 @@ import pandas as pd
 _DATA_DIR = Path(__file__).parent.parent / "data" / "entsoe"
 
 # MTU column is like "01/01/2015 00:00:00 - 01/01/2015 01:00:00"
-_MTU_COL = "MTU (CET/CEST)"
+_MTU_COL   = "MTU (CET/CEST)"
 _PRICE_COL = "Day-ahead Price (EUR/MWh)"
 
 
+# ── CSV loader ────────────────────────────────────────────────────────────────
+
 def _parse_file(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, thousands=None)
-    # Extract start timestamp from MTU range string
     # Some DST-transition rows have " (CET)" or " (CEST)" appended — strip it.
     start_str = (
         df[_MTU_COL]
@@ -25,9 +27,23 @@ def _parse_file(path: Path) -> pd.DataFrame:
     return df[["timestamp", "price_eur_mwh"]].dropna()
 
 
-def load_prices(data_dir: Path | None = None) -> pd.DataFrame:
+def load_prices(
+    data_dir: Path | None = None,
+    api_key: str | None = None,
+    _log=None,
+) -> pd.DataFrame:
     """
-    Load all ENTSO-E CSV files and return a single DataFrame.
+    Load ENTSO-E day-ahead prices and return a preprocessed DataFrame.
+
+    Loads all CSV files from data_dir, then automatically tops up with live data
+    from the ENTSO-E API if an API key is available.  The key is resolved in order:
+      1. The ``api_key`` argument
+      2. The ``ENTSOE_API_KEY`` environment variable
+      3. ``[entsoe] api_key`` in .streamlit/secrets.toml
+
+    If no key is found (or the fetch fails) only the CSV data is returned.
+
+    _log: optional callable(message: str) called after each loading step.
 
     Columns
     -------
@@ -41,22 +57,169 @@ def load_prices(data_dir: Path | None = None) -> pd.DataFrame:
     month           : month (1–12)
     season          : 'spring' | 'summer' | 'autumn' | 'winter'
     """
-    root = data_dir or _DATA_DIR
+    root  = data_dir or _DATA_DIR
     files = sorted(root.glob("GUI_ENERGY_PRICES_*.csv"))
     if not files:
         raise FileNotFoundError(f"No ENTSO-E CSV files found in {root}")
 
     parts = [_parse_file(f) for f in files]
-    df = pd.concat(parts, ignore_index=True).drop_duplicates("timestamp").sort_values("timestamp")
+    raw   = pd.concat(parts, ignore_index=True).drop_duplicates("timestamp").sort_values("timestamp")
+    df    = _add_features(raw)
 
+    if _log is not None:
+        y0 = df["timestamp"].dt.year.min()
+        y1 = df["timestamp"].dt.year.max()
+        _log(f"CSV files: {len(df):,} samples from {len(files)} files ({y0}–{y1})")
+
+    key = _resolve_api_key(api_key)
+    if key:
+        df = _top_up(df, key, _log=_log)
+    elif _log is not None:
+        _log("API: no key found — using CSV data only")
+
+    return df
+
+
+def _resolve_api_key(explicit: str | None) -> str | None:
+    """Return the first non-empty API key from: argument → env var → streamlit secrets."""
+    if explicit:
+        return explicit
+    env = os.environ.get("ENTSOE_API_KEY", "")
+    if env:
+        return env
+    try:
+        import streamlit as st
+        key = st.secrets.get("entsoe", {}).get("api_key", "")
+        return key or None
+    except Exception:
+        return None
+
+
+def _top_up(df: pd.DataFrame, api_key: str, _log=None) -> pd.DataFrame:
+    """Fetch any data newer than the last CSV timestamp and append it."""
+    today = pd.Timestamp.now().normalize()
+    last  = df["timestamp"].max()
+    if last >= today - pd.Timedelta(days=1):
+        if _log is not None:
+            _log(f"API: CSV data is up to date (last: {last.date()})")
+        return df
+    try:
+        n_before = len(df)
+        fetcher  = EntsoeFetcher(api_key)
+        df_new   = fetcher.fetch_and_append(df, end=today + pd.Timedelta(days=1))
+        n_api    = len(df_new) - n_before
+        if _log is not None:
+            _log(f"API: fetched {n_api:,} additional samples (up to {df_new['timestamp'].max().date()})")
+        return df_new
+    except Exception as exc:
+        import warnings
+        warnings.warn(f"ENTSO-E API top-up failed ({exc}); using CSV data only.")
+        if _log is not None:
+            _log(f"API: fetch failed ({exc}) — using CSV data only")
+        return df
+
+
+# ── API loader ────────────────────────────────────────────────────────────────
+
+class EntsoeFetcher:
+    """
+    Fetch day-ahead prices directly from the ENTSO-E Transparency Platform API
+    via entsoe-py and return the same preprocessed DataFrame as load_prices().
+
+    Parameters
+    ----------
+    api_key     : ENTSO-E API key (obtain at transparency.entsoe.eu → My Account)
+    country_code: ENTSO-E bidding-zone code, default "DK_1" (West Denmark)
+
+    Usage
+    -----
+        fetcher = EntsoeFetcher(api_key="YOUR_KEY")
+        df = fetcher.fetch("2023-01-01", "2024-01-01")
+        # df has the same columns as load_prices()
+    """
+
+    def __init__(self, api_key: str, country_code: str = "DK_1") -> None:
+        self.api_key      = api_key
+        self.country_code = country_code
+
+    def fetch(
+        self,
+        start: str | pd.Timestamp,
+        end:   str | pd.Timestamp,
+        tz:    str = "Europe/Copenhagen",
+    ) -> pd.DataFrame:
+        """
+        Fetch day-ahead prices for [start, end) and return a preprocessed DataFrame.
+
+        Parameters
+        ----------
+        start : start date/datetime (inclusive), e.g. "2023-01-01"
+        end   : end date/datetime (exclusive),   e.g. "2024-01-01"
+        tz    : timezone for the timestamps (default: Europe/Copenhagen = CET/CEST)
+
+        Returns
+        -------
+        DataFrame with the same columns as load_prices().
+        """
+        from entsoe import EntsoePandasClient
+
+        client = EntsoePandasClient(api_key=self.api_key)
+
+        ts_start = pd.Timestamp(start, tz=tz)
+        ts_end   = pd.Timestamp(end,   tz=tz)
+
+        series = client.query_day_ahead_prices(
+            self.country_code, start=ts_start, end=ts_end,
+        )
+
+        raw = (
+            series
+            .rename("price_eur_mwh")
+            .reset_index()
+            .rename(columns={"index": "timestamp"})
+        )
+        # Strip timezone info to match the CSV-based loader
+        raw["timestamp"] = raw["timestamp"].dt.tz_localize(None)
+        raw = raw.dropna(subset=["price_eur_mwh"])
+
+        return _add_features(raw)
+
+    def fetch_and_append(
+        self,
+        existing: pd.DataFrame,
+        end: str | pd.Timestamp,
+        tz: str = "Europe/Copenhagen",
+    ) -> pd.DataFrame:
+        """
+        Fetch data from the day after the last timestamp in `existing` up to `end`
+        and return the combined, deduplicated DataFrame.
+
+        Useful for topping up the CSV-based dataset with recent data.
+        """
+        last = existing["timestamp"].max()
+        start = last + pd.Timedelta(hours=1)
+        new   = self.fetch(start, end, tz=tz)
+        combined = (
+            pd.concat([existing, new], ignore_index=True)
+            .drop_duplicates("timestamp")
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        return combined
+
+
+# ── Shared feature engineering ────────────────────────────────────────────────
+
+def _add_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add derived columns to a raw (timestamp, price_eur_mwh) DataFrame."""
+    df = df.copy()
     df["price_eur_kwh"] = df["price_eur_mwh"] / 1000.0
-    df["dow"] = df["timestamp"].dt.dayofweek
-    df["is_weekend"] = df["dow"] >= 5
-    df["hour"] = df["timestamp"].dt.hour
-    df["minute"] = df["timestamp"].dt.minute
-    df["month"] = df["timestamp"].dt.month
-    df["season"] = df["month"].map(_month_to_season)
-
+    df["dow"]           = df["timestamp"].dt.dayofweek
+    df["is_weekend"]    = df["dow"] >= 5
+    df["hour"]          = df["timestamp"].dt.hour
+    df["minute"]        = df["timestamp"].dt.minute
+    df["month"]         = df["timestamp"].dt.month
+    df["season"]        = df["month"].map(_month_to_season)
     return df.reset_index(drop=True)
 
 

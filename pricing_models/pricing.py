@@ -57,8 +57,11 @@ class AbstractSampler(ABC):
     """Base class for electricity price samplers."""
 
     @abstractmethod
-    def fit(self, df: pd.DataFrame) -> "AbstractSampler":
-        """Fit the sampler to a preprocessed price DataFrame (from entsoe_loader)."""
+    def fit(self, df: pd.DataFrame, _progress=None) -> "AbstractSampler":
+        """Fit the sampler to a preprocessed price DataFrame (from entsoe_loader).
+
+        _progress: optional callable(fraction: float, message: str) called periodically.
+        """
 
     @abstractmethod
     def sample(self, dow: int, hour: int, season: Season) -> float:
@@ -81,13 +84,17 @@ class GaussianBinnedSampler(AbstractSampler):
     def __init__(self) -> None:
         self._params: dict[tuple, tuple[float, float]] = {}
 
-    def fit(self, df: pd.DataFrame) -> "GaussianBinnedSampler":
-        for key, group in df.groupby(["is_weekend", "hour", "season"]):
+    def fit(self, df: pd.DataFrame, _progress=None) -> "GaussianBinnedSampler":
+        groups = list(df.groupby(["is_weekend", "hour", "season"]))
+        n = len(groups)
+        for i, (key, group) in enumerate(groups):
             prices = group["price_eur_kwh"].to_numpy(dtype=float)
             prices = prices[~np.isnan(prices)]
             mean = float(np.mean(prices))
             std  = float(np.std(prices, ddof=1)) if len(prices) > 1 else 0.0
             self._params[key] = (mean, std)
+            if _progress is not None:
+                _progress((i + 1) / n, f"Bin {i + 1}/{n}")
         return self
 
     def sample(self, dow: int, hour: int, season: Season) -> float:
@@ -109,50 +116,6 @@ class GaussianBinnedSampler(AbstractSampler):
         return p
 
 
-class KDESampler(AbstractSampler):
-    """
-    Fits a kernel density estimate per (is_weekend, hour, season) bin.
-
-    Uses scipy gaussian_kde with Scott's bandwidth rule.  bin_probs integrates
-    the KDE over each bin interval; mass below 0 is assigned to bin 0,
-    mass above lambda_max to the last bin.
-    """
-
-    def __init__(self) -> None:
-        self._kdes: dict[tuple, object] = {}
-
-    def fit(self, df: pd.DataFrame) -> "KDESampler":
-        from scipy.stats import gaussian_kde
-        for key, group in df.groupby(["is_weekend", "hour", "season"]):
-            prices = group["price_eur_kwh"].to_numpy(dtype=float)
-            prices = prices[~np.isnan(prices)]
-            if len(prices) >= 2:
-                self._kdes[key] = gaussian_kde(prices)
-        return self
-
-    def sample(self, dow: int, hour: int, season: Season) -> float:
-        kde = self._get_kde(dow, hour, season)
-        return float(max(0.0, kde.resample(1)[0, 0]))
-
-    def bin_probs(self, dow: int, hour: int, season: Season, params) -> np.ndarray:
-        kde = self._get_kde(dow, hour, season)
-        delta = params.lambda_max / params.K
-        edges = [j * delta for j in range(params.K + 1)]
-        probs = np.array([kde.integrate_box_1d(edges[j], edges[j + 1]) for j in range(params.K)])
-        # absorb out-of-range mass into boundary bins
-        probs[0]  += kde.integrate_box_1d(-np.inf, 0.0)
-        probs[-1] += kde.integrate_box_1d(params.lambda_max, np.inf)
-        total = probs.sum()
-        return probs / total if total > 0 else np.full(params.K, 1.0 / params.K)
-
-    def _get_kde(self, dow: int, hour: int, season: Season):
-        key = (dow >= 5, hour, season)
-        kde = self._kdes.get(key)
-        if kde is None:
-            raise KeyError(f"No KDE for bin {key}")
-        return kde
-
-
 class GMMSampler(AbstractSampler):
     """
     Fits a Gaussian Mixture Model per (is_weekend, hour, season) bin.
@@ -165,15 +128,19 @@ class GMMSampler(AbstractSampler):
         self.n_components = n_components
         self._gmms: dict[tuple, object] = {}
 
-    def fit(self, df: pd.DataFrame) -> "GMMSampler":
+    def fit(self, df: pd.DataFrame, _progress=None) -> "GMMSampler":
         from sklearn.mixture import GaussianMixture
-        for key, group in df.groupby(["is_weekend", "hour", "season"]):
+        groups = list(df.groupby(["is_weekend", "hour", "season"]))
+        n_groups = len(groups)
+        for i, (key, group) in enumerate(groups):
             prices = group["price_eur_kwh"].to_numpy(dtype=float).reshape(-1, 1)
             prices = prices[~np.isnan(prices[:, 0])]
             n = min(self.n_components, len(prices))
             gmm = GaussianMixture(n_components=n, covariance_type="full", random_state=0)
             gmm.fit(prices)
             self._gmms[key] = gmm
+            if _progress is not None:
+                _progress((i + 1) / n_groups, f"Bin {i + 1}/{n_groups}")
         return self
 
     def sample(self, dow: int, hour: int, season: Season) -> float:
@@ -201,7 +168,7 @@ class MDNSampler(AbstractSampler):
     """
     Mixture Density Network: one model trained on all data jointly.
 
-    Input  : 7-dim context vector (is_weekend, sin_hour, cos_hour, season_onehot)
+    Input  : 7-dim context vector (is_weekend, sin_hour, cos_hour, season_onehot(4))
     Output : parameters of a K-component Gaussian mixture (π, μ, σ)
 
     Training minimises negative log-likelihood over all observations.
@@ -216,29 +183,40 @@ class MDNSampler(AbstractSampler):
         lr: float = 1e-3,
     ) -> None:
         self.n_components = n_components
-        self.hidden_dims  = hidden_dims or [64, 64]
+        self.hidden_dims  = hidden_dims or [128, 128]
         self.epochs       = epochs
         self.batch_size   = batch_size
         self.lr           = lr
         self._net         = None
 
-    def fit(self, df: pd.DataFrame) -> "MDNSampler":
+    def fit(self, df: pd.DataFrame, _progress=None, _wandb_run=None) -> "MDNSampler":
         import torch
         import torch.nn as nn
+
+        torch.set_num_threads(1)
 
         prices = df["price_eur_kwh"].to_numpy(dtype=np.float32)
         mask   = ~np.isnan(prices)
         prices = prices[mask]
 
-        # Build feature matrix (N, 7)
-        rows = df[mask]
-        X = np.stack([
-            _encode_context(bool(r.is_weekend), int(r.hour), r.season)
-            for r in rows.itertuples()
-        ])
+        # Build feature matrix (N, 7) — vectorised, avoids slow itertuples loop
+        rows = df[mask].reset_index(drop=True)
+        if _progress is not None:
+            _progress(0.0, "Building feature matrix…")
+        angle      = (2 * np.pi * rows["hour"].to_numpy(dtype=np.float32)) / 24
+        is_we      = rows["is_weekend"].to_numpy(dtype=np.float32)
+        season_idx = rows["season"].map(_SEASON_IDX).to_numpy(dtype=np.int32)
+        onehot     = np.zeros((len(rows), 4), dtype=np.float32)
+        onehot[np.arange(len(rows)), season_idx] = 1.0
+        X = np.column_stack([is_we, np.sin(angle), np.cos(angle), onehot])
+
+        # Standardise target so network sigma heads initialise near the right scale
+        self._price_mean = float(prices.mean())
+        self._price_std  = float(prices.std()) or 1.0
+        prices_norm = (prices - self._price_mean) / self._price_std
 
         X_t = torch.from_numpy(X)
-        y_t = torch.from_numpy(prices).unsqueeze(1)
+        y_t = torch.from_numpy(prices_norm).unsqueeze(1)
 
         self._net = _MDNNet(
             in_dim=7,
@@ -248,16 +226,41 @@ class MDNSampler(AbstractSampler):
         optimiser = torch.optim.Adam(self._net.parameters(), lr=self.lr)
         N = len(prices)
 
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimiser, patience=10, factor=0.5, min_lr=1e-5
+        )
+
         self._net.train()
-        for _ in range(self.epochs):
+        for epoch in range(self.epochs):
             perm = torch.randperm(N)
+            epoch_loss = 0.0
+            n_batches = 0
             for start in range(0, N, self.batch_size):
                 idx = perm[start:start + self.batch_size]
                 pi, mu, sigma = self._net(X_t[idx])
                 loss = -_mdn_log_prob(pi, mu, sigma, y_t[idx]).mean()
                 optimiser.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self._net.parameters(), max_norm=1.0)
                 optimiser.step()
+                epoch_loss += loss.item()
+                n_batches += 1
+            epoch_loss /= n_batches
+            scheduler.step(epoch_loss)
+            if _wandb_run is not None:
+                with torch.no_grad():
+                    pi_all, _, _ = self._net(X_t[:2048])
+                    mean_weights = pi_all.mean(dim=0)
+                log_dict = {
+                    "loss": epoch_loss,
+                    "loss_original_space": epoch_loss + np.log(self._price_std),
+                }
+                for k, w in enumerate(mean_weights.tolist()):
+                    log_dict[f"pi_{k}"] = w
+                _wandb_run.log(log_dict, step=epoch + 1)
+            if _progress is not None and (epoch % 5 == 0 or epoch == self.epochs - 1):
+                _progress((epoch + 1) / self.epochs,
+                          f"Epoch {epoch + 1}/{self.epochs}  loss {epoch_loss:.4f}")
 
         self._net.eval()
         return self
@@ -278,7 +281,9 @@ class MDNSampler(AbstractSampler):
         x = torch.from_numpy(_encode_context(dow >= 5, hour, season)).unsqueeze(0)
         with torch.no_grad():
             pi, mu, sigma = self._net(x)
-        return pi[0].numpy(), mu[0].numpy(), sigma[0].numpy()
+        mu_np    = mu[0].numpy()    * self._price_std + self._price_mean
+        sigma_np = sigma[0].numpy() * self._price_std
+        return pi[0].numpy(), mu_np, sigma_np
 
 
 class _MDNNet:
@@ -290,7 +295,7 @@ class _MDNNet:
         layers: list[nn.Module] = []
         prev = in_dim
         for h in hidden_dims:
-            layers += [nn.Linear(prev, h), nn.Tanh()]
+            layers += [nn.Linear(prev, h), nn.ELU()]
             prev = h
         self._trunk = nn.Sequential(*layers)
         self._pi_head    = nn.Linear(prev, K)
@@ -348,9 +353,11 @@ def make_price_bin_probs_fn(
     is_weekend : whether the horizon is a weekend (True) or weekday (False)
     """
     _dow = 5 if is_weekend else 0
+    # Pre-compute all 24 hourly bin-prob vectors so repeated calls (e.g. from
+    # the backward-induction precomputation loop) are O(1) dict lookups.
+    _cache = {h: sampler.bin_probs(_dow, h, season, params) for h in range(24)}
 
     def fn(t: int) -> np.ndarray:
-        hour = (t // 60) % 24
-        return sampler.bin_probs(_dow, hour, season, params)
+        return _cache[(t // 60) % 24]
 
     return fn

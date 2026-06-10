@@ -12,8 +12,7 @@ st.caption("Adjust all model parameters here, then click **Run Backward Inductio
 # ── Model selector ────────────────────────────────────────────────────────────
 
 def _on_model_change():
-    _sampler_keys = ["price_sampler_Gaussian bins", "price_sampler_KDE",
-                     "price_sampler_GMM", "price_sampler_MDN"]
+    _sampler_keys = ["price_sampler_Gaussian bins", "price_sampler_GMM", "price_sampler_MDN"]
     for key in ["V", "pi", "actions", "e_grid", "lam_grid", "params", "T"] + _sampler_keys:
         st.session_state.pop(key, None)
 
@@ -95,12 +94,12 @@ with col2:
     st.subheader("Electricity Price")
     price_source = st.radio(
         "Price source",
-        ["Gaussian (parametric)", "Gaussian bins", "KDE", "GMM", "MDN"],
+        ["Gaussian (parametric)", "Gaussian bins", "GMM", "MDN"],
         key="price_source",
         horizontal=True,
         help=(
             "**Gaussian (parametric)**: manual time-of-day mean prices. "
-            "**Gaussian bins / KDE / GMM**: per-(weekend, hour, season) bin fitted from ENTSO-E data. "
+            "**Gaussian bins / GMM**: per-(weekend, hour, season) bin fitted from ENTSO-E data. "
             "**MDN**: single neural network conditioned on context, trained on all data jointly."
         ),
     )
@@ -118,7 +117,24 @@ with col2:
         # Dummy values — not used by the solver when sampler is active
         price_night = price_morning = price_midday = price_evening = price_late = _DEFAULTS["price_night"]
         sigma_lambda = _DEFAULTS["sigma_lambda"]
+
+        if price_source == "MDN":
+            st.divider()
+            use_wandb = st.checkbox("Log MDN training to W&B", key="use_wandb")
+            if use_wandb:
+                _wc1, _wc2 = st.columns(2)
+                with _wc1:
+                    wandb_project = st.text_input("W&B project", value="au-mdt", key="wandb_project")
+                with _wc2:
+                    wandb_run_name = st.text_input("Run name", placeholder="auto", value="", key="wandb_run_name")
+            else:
+                wandb_project = wandb_run_name = None
+        else:
+            use_wandb = False
+            wandb_project = wandb_run_name = None
     else:
+        use_wandb = False
+        wandb_project = wandb_run_name = None
         price_is_weekend = price_season = None
         lambda_max = _DEFAULTS["lambda_max"]
         st.markdown("*Mean prices (€/kWh)*")
@@ -280,13 +296,12 @@ if run_btn:
     if use_sampler:
         from pricing_models.entsoe_loader import load_prices
         from pricing_models.pricing import (
-            GaussianBinnedSampler, KDESampler, GMMSampler, MDNSampler,
+            GaussianBinnedSampler, GMMSampler, MDNSampler,
             make_price_bin_probs_fn,
         )
 
         _sampler_classes = {
             "Gaussian bins": GaussianBinnedSampler,
-            "KDE": KDESampler,
             "GMM": GMMSampler,
             "MDN": MDNSampler,
         }
@@ -294,9 +309,51 @@ if run_btn:
 
         if _cache_key not in st.session_state:
             _label = f"Fitting {price_source} price model on ENTSO-E data…"
-            with st.spinner(_label):
-                _df = load_prices()
-                st.session_state[_cache_key] = _sampler_classes[price_source]().fit(_df)
+            with st.status(_label, expanded=True) as _fit_status:
+                _log_lines = []
+                _log_area  = st.empty()
+                _prog      = st.progress(0.0)
+                _detail    = st.empty()
+
+                def _loader_log(msg: str) -> None:
+                    _log_lines.append(msg)
+                    _log_area.caption("  \n".join(_log_lines))
+
+                _detail.caption("Loading ENTSO-E price data…")
+                _df = load_prices(_log=_loader_log)
+
+                def _fit_progress(fraction: float, message: str) -> None:
+                    _prog.progress(min(fraction, 1.0))
+                    _detail.caption(message)
+
+                _wandb_run = None
+                if use_wandb and price_source == "MDN":
+                    try:
+                        import wandb
+                        _wandb_run = wandb.init(
+                            project=wandb_project,
+                            name=wandb_run_name or None,
+                            config={
+                                "n_components": 3,
+                                "epochs": 200,
+                                "batch_size": 1024,
+                                "lr": 1e-3,
+                                "n_samples": len(_df),
+                            },
+                            reinit="create_new",
+                        )
+                    except ImportError:
+                        st.warning("wandb is not installed — run `uv add wandb` to enable logging.")
+
+                _sampler = _sampler_classes[price_source]()
+                if _wandb_run is not None:
+                    st.session_state[_cache_key] = _sampler.fit(
+                        _df, _progress=_fit_progress, _wandb_run=_wandb_run,
+                    )
+                    _wandb_run.finish()
+                else:
+                    st.session_state[_cache_key] = _sampler.fit(_df, _progress=_fit_progress)
+                _fit_status.update(label=f"{price_source} model ready.", state="complete", expanded=False)
 
         from models.params import SharedParams as _SP
         _sp_tmp = _SP(**{k: v for k, v in common_kwargs.items() if k in _SP.__dataclass_fields__})

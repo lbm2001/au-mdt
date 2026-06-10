@@ -9,7 +9,7 @@ from .policies import (
     backward_induction_policy, maximal_charging_policy,
     price_oriented_policy, night_charging_policy,
     minimum_soc_policy, always_minimum_policy, random_policy,
-    dp_heuristic_policy, expected_parking_policy,
+    dp_heuristic_policy,
 )
 
 __all__ = [
@@ -22,5 +22,5 @@ __all__ = [
     "backward_induction_policy", "maximal_charging_policy",
     "price_oriented_policy", "night_charging_policy",
     "minimum_soc_policy", "always_minimum_policy", "random_policy",
-    "dp_heuristic_policy", "expected_parking_policy",
+    "dp_heuristic_policy",
 ]

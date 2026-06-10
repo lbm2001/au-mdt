@@ -86,35 +86,3 @@ def dp_heuristic_policy(
     return float(params.u_max) if F_p <= thresh else 0.0
 
 
-def expected_parking_policy(
-    t: int, chi: int, e: float, lam: float, params,
-) -> float:
-    """Textbook three-band rule with rem = expected parked minutes per day at time t."""
-    if chi > 0 and e > params.e_min:
-        return 0.0
-    x = params.e_max - e
-    if x <= 0:
-        return 0.0
-
-    energy_per_step = params.u_max * params.omega * params.eta_c
-    k = int(x // energy_per_step)
-
-    p_PD, p_DP = _transition_probs(t, params)
-    denom = p_PD + p_DP
-    pi_P  = p_DP / denom if denom > 0 else 0.5
-    rem   = max(int(pi_P * 1440), k + 1)
-
-    probs    = price_bin_probs(t, params)
-    lam_grid = np.array([(j + 0.5) * params.lambda_max / params.K for j in range(params.K)])
-    F_p      = float(probs[lam_grid <= lam].sum())
-
-    thresh_k  = k / rem
-    thresh_k1 = (k + 1) / rem
-
-    if F_p <= thresh_k:
-        u = params.u_max
-    elif F_p <= thresh_k1:
-        u = (x - k * energy_per_step) / (params.omega * params.eta_c)
-    else:
-        u = 0.0
-    return float(np.clip(u, 0.0, params.u_max))

@@ -8,7 +8,6 @@ from models.policies import (
     always_minimum_policy,
     random_policy,
     dp_heuristic_policy,
-    expected_parking_policy,
 )
 
 __all__ = [
@@ -21,5 +20,4 @@ __all__ = [
     "always_minimum_policy",
     "random_policy",
     "dp_heuristic_policy",
-    "expected_parking_policy",
 ]

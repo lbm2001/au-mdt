@@ -73,14 +73,20 @@ def random_policy(
 
 def dp_heuristic_policy(
     t: int, chi: int, e: float, lam: float, params,
+    *, price_bin_probs_fn=None,
 ) -> float:
-    """SoC-urgency heuristic: charge at u_max when F_t(lam) ≤ 1 − e/e_max."""
+    """SoC-urgency heuristic: charge at u_max when F_t(lam) ≤ 1 − e/e_max.
+
+    price_bin_probs_fn : t -> (K,) bin-probability vector for the active pricing
+    world.  When None, falls back to the Gaussian-parametric distribution derived
+    from `params` (correct only when that *is* the world being simulated).
+    """
     if chi > 0 and e > params.e_min:
         return 0.0
     if e >= params.e_max:
         return 0.0
     thresh   = 1.0 - e / params.e_max
-    probs    = price_bin_probs(t, params)
+    probs    = price_bin_probs(t, params) if price_bin_probs_fn is None else price_bin_probs_fn(t)
     lam_grid = np.array([(j + 0.5) * params.lambda_max / params.K for j in range(params.K)])
     F_p      = float(probs[lam_grid <= lam].sum())
     return float(params.u_max) if F_p <= thresh else 0.0

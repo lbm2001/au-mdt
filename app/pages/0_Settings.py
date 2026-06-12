@@ -112,8 +112,8 @@ with col2:
             horizontal=True, key="price_season",
         ).lower()
         price_is_weekend = st.toggle("Weekend", key="price_is_weekend")
-        lambda_max = 1.0  # historical data peaks at ~0.94 EUR/kWh (2022/2024 crisis)
-        st.caption(f"λ_max set to {lambda_max} EUR/kWh (covers historical peak of 0.94)")
+        lambda_max = _DEFAULTS["lambda_max"]  # wholesale range; matches the Sensitivity page
+        st.caption(f"λ_max = {lambda_max} EUR/kWh (wholesale range; rare crisis peaks clip to the top bin)")
         # Dummy values — not used by the solver when sampler is active
         price_night = price_morning = price_midday = price_evening = price_late = _DEFAULTS["price_night"]
         sigma_lambda = _DEFAULTS["sigma_lambda"]

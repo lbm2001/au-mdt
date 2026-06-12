@@ -185,13 +185,24 @@ def _make_scenario(params, seed: int, horizon: int,
     return {"lam_path": lam_path, "mobility_draws": mobility_draws, "phase_draws": phase_draws}
 
 
-def _run_rollouts(pi, actions, e_grid, params, scenarios: list, rollout_fn) -> dict:
+def _run_rollouts(pi, actions, e_grid, params, scenarios: list, rollout_fn, pbp_fn) -> dict:
     """
     Run all four policies on each scenario using the model-specific rollout_fn.
+    The DP heuristic is fed the active world's price distribution (pbp_fn) so it
+    judges prices against the same distribution the world is drawn from, not the
+    hard-coded Gaussian-parametric one.
     Returns {policy_name: [metrics_dict, ...]} for N_rollouts scenarios.
     """
     e0   = float(params.e_max / 2)
     chi0 = 0  # start parked
+
+    # (name, fn, extra policy kwargs)
+    benchmarks = [
+        ("Night charging",   night_charging_policy,   {}),
+        ("DP heuristic",     dp_heuristic_policy,      {"price_bin_probs_fn": pbp_fn}),
+        ("Maximal charging", maximal_charging_policy,  {}),
+        ("Always minimum",   always_minimum_policy,    {}),
+    ]
 
     results: dict[str, list] = {p: [] for p in POLICY_ORDER}
     for sc in scenarios:
@@ -203,13 +214,8 @@ def _run_rollouts(pi, actions, e_grid, params, scenarios: list, rollout_fn) -> d
         results["Optimal (BI)"].append(rollout_metrics(ro, params))
 
         # Benchmark policies
-        for name, fn in [
-            ("Night charging",   night_charging_policy),
-            ("DP heuristic",     dp_heuristic_policy),
-            ("Maximal charging", maximal_charging_policy),
-            ("Always minimum",   always_minimum_policy),
-        ]:
-            ro = rollout_fn(fn, sc, e0, chi0, params)
+        for name, fn, kw in benchmarks:
+            ro = rollout_fn(fn, sc, e0, chi0, params, **kw)
             results[name].append(rollout_metrics(ro, params))
 
     return results
@@ -264,7 +270,7 @@ def _run_sweep_step(model_label: str, label: str, params, pbp_fn,
                        season=season, is_weekend=is_weekend)
         for i in range(N_rollouts)
     ]
-    rollouts = _run_rollouts(pi, actions, e_grid, params, scenarios, _rollout_fn(model_label))
+    rollouts = _run_rollouts(pi, actions, e_grid, params, scenarios, _rollout_fn(model_label), pbp_fn)
     return {
         "model":   model_label,
         "label":   label,
@@ -728,14 +734,21 @@ st.title("Sensitivity Analysis")
 with st.expander("About this page", expanded=False):
     st.markdown("""
 **Baseline configuration** (SharedParams / BaselineParams defaults):
-battery e_max = 40 kWh · η_c = 0.95 · u_max = 11 kW · φ = 1000 €/h · K = 20 bins · λ_max = 0.75 €/kWh
+battery e_max = 40 kWh · η_c = 0.95 · u_max = 11 kW · φ = 1000 €/h · K = 20 bins · λ_max = 0.30 €/kWh
 
-**Policies compared:** Optimal (Backward induction) · Night charging · DP heuristic · Maximal charging
+**Prices** are wholesale DK1 day-ahead levels (€/kWh). The Gaussian-parametric means are fitted to
+ENTSO-E data **excluding** the 2021–23 crisis; the data-driven models (bins/GMM/MDN) train on **all**
+years. Negative wholesale prices (~2.6% of hours) are floored to 0.
+
+**Policies compared:** Optimal (Backward induction) · Night charging · DP heuristic · Maximal charging · Always minimum
 
 **Mobility model** (sidebar — applies to every sweep):
-- **Baseline** — trip duration ~ Geom(p_DP); 2-state mobility chain.
-- **NegBin (fixed k)** — trip ~ NegBin(k, q) via a k-phase chain; mean = k/q min.
-- **NegBin (sampled k)** — k ~ Poisson(λ_k) drawn at each trip start.
+- **Baseline** — trip ~ Geom(p_DP); 2-state chain; default E[T] ≈ 11 min.
+- **NegBin (fixed k)** — trip ~ NegBin(k, q); k-phase chain; default E[T] = k/q = 25 min.
+- **NegBin (sampled k)** — k ~ Poisson(λ_k) drawn at each trip start; default E[T] ≈ 25 min.
+
+> Default trip durations differ across models, so switching the model is **not** a controlled
+> comparison — read each model's sweeps on their own.
 
 **Four independent sweep dimensions** (others held at baseline):
 1. **Pricing model** — Gaussian parametric · Gaussian bins · GMM · MDN
@@ -743,10 +756,11 @@ battery e_max = 40 kWh · η_c = 0.95 · u_max = 11 kW · φ = 1000 €/h · K =
 3. **Horizon T** — {24 h, 48 h, 168 h}
 4. **Season × Day type** — all 8 combinations of {winter, spring, summer, autumn} × {weekday, weekend}
 
-> **Note:** The DP-heuristic benchmark uses the Gaussian parametric price model internally
-> regardless of the pricing-model sweep. All other policies are agnostic to the pricing model.
-> The NegBin models have more mobility states, so their solves are slower — lower **N_e** if needed.
-> Re-run a single sweep by clicking its **Run** button in the corresponding tab.
+> **Reading the Pricing tab:** each pricing model is solved *and* evaluated in its **own** price
+> world. Compare policies *within* a column (which policy wins, optimality gap, feasibility) — not
+> absolute costs *across* columns. The DP heuristic uses each world's own price distribution.
+> NegBin models have more mobility states → slower solves; lower **N_e** if needed.
+> Re-run a single sweep with its **Run** button.
     """)
 
 # ── Sidebar controls ──────────────────────────────────────────────────────────
@@ -774,11 +788,6 @@ with st.sidebar:
         ),
     )
 
-    inherit = st.toggle(
-        "Inherit params from Settings page",
-        value=False, key="sa_inherit",
-        help="When on, uses the params object from the last backward-induction run in Settings.",
-    )
     N_rollouts = st.slider("Rollouts per config", 10, 500, 50, 10, key="sa_N_rollouts")
     N_e        = st.select_slider("Battery grid points N_e",
                                   [50, 100, 200, 500], value=500, key="sa_N_e")
@@ -928,7 +937,8 @@ with tab_T:
     st.markdown(
         f"Compares horizon lengths T ∈ {HORIZON_HOURS} h.  "
         "Uses Gaussian parametric pricing.  All other params at baseline.  "
-        "Note: the 168 h solve is slower (~30 s at N_e=100)."
+        "Note: the 168 h solve is the slow one — and NegBin models add mobility "
+        "states on top, so lower **N_e** (sidebar) if it drags."
     )
     if st.button("Run horizon sweep", key="sa_run_T"):
         st.session_state.pop("sa_horizon_results", None)

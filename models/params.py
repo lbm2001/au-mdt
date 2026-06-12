@@ -19,12 +19,15 @@ class SharedParams:
     mu: float = 0.2
 
     # ── Electricity price (€/kWh) ─────────────────────────────────────────────
-    price_night: float = 0.30
-    price_morning: float = 0.48
-    price_midday: float = 0.39
-    price_evening: float = 0.55
-    price_late: float = 0.34
-    sigma_lambda: float = 0.05
+    # Wholesale DK1 day-ahead means by time-of-day window, fitted to ENTSO-E data
+    # excluding the 2021–2023 energy crisis (a "typical" normal-market day).
+    # Note the duck-curve shape: midday is cheapest (wind+solar), peaks morning/evening.
+    price_night: float = 0.053    # 00–06 h
+    price_morning: float = 0.068  # 06–09 h
+    price_midday: float = 0.047   # 09–16 h
+    price_evening: float = 0.073  # 16–21 h
+    price_late: float = 0.066     # 21–24 h
+    sigma_lambda: float = 0.045
 
     # ── Parked → Driving departure probabilities (per minute) ─────────────────
     p_pd_morning: float = 0.04
@@ -34,7 +37,7 @@ class SharedParams:
 
     # ── Price discretisation ──────────────────────────────────────────────────
     K: int = 20
-    lambda_max: float = 0.75
+    lambda_max: float = 0.30  # wholesale range (covers ~99% of normal-market DK1 prices)
 
     # ── Fixed conversion factor ───────────────────────────────────────────────
     omega: float = 1 / 60

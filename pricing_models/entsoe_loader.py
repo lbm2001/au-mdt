@@ -1,18 +1,21 @@
-"""Load and preprocess ENTSO-E day-ahead price data — from CSV files or the live API."""
+"""Load and preprocess ENTSO-E day-ahead price data straight from the live API."""
 
 import os
 from pathlib import Path
 
 import pandas as pd
 
-_DATA_DIR = Path(__file__).parent.parent / "data" / "entsoe"
+_DATA_DIR = Path(__file__).parent.parent / "data" / "entsoe"  # legacy CSV archive (no longer read)
+
+_DEFAULT_START   = "2015-01-01"  # ENTSO-E DK1 day-ahead history starts here
+_DEFAULT_COUNTRY = "DK_1"        # West Denmark bidding zone (entsoe-py area code)
 
 # MTU column is like "01/01/2015 00:00:00 - 01/01/2015 01:00:00"
 _MTU_COL   = "MTU (CET/CEST)"
 _PRICE_COL = "Day-ahead Price (EUR/MWh)"
 
 
-# ── CSV loader ────────────────────────────────────────────────────────────────
+# ── CSV parsing (legacy archive only — kept for offline reuse) ─────────────────
 
 def _parse_file(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, thousands=None)
@@ -31,19 +34,26 @@ def load_prices(
     data_dir: Path | None = None,
     api_key: str | None = None,
     _log=None,
+    *,
+    start: "str | pd.Timestamp" = _DEFAULT_START,
+    end: "str | pd.Timestamp | None" = None,
+    country_code: str = _DEFAULT_COUNTRY,
 ) -> pd.DataFrame:
     """
-    Load ENTSO-E day-ahead prices and return a preprocessed DataFrame.
+    Fetch the full ENTSO-E day-ahead price history from the API and return a
+    preprocessed DataFrame.
 
-    Loads all CSV files from data_dir, then automatically tops up with live data
-    from the ENTSO-E API if an API key is available.  The key is resolved in order:
+    The range [start, end) is pulled in one-year chunks and concatenated; end
+    defaults to tomorrow (so the latest day-ahead prices are included).  Requires
+    an API key, resolved in order:
       1. The ``api_key`` argument
       2. The ``ENTSOE_API_KEY`` environment variable
       3. ``[entsoe] api_key`` in .streamlit/secrets.toml
 
-    If no key is found (or the fetch fails) only the CSV data is returned.
+    The legacy ``data_dir`` argument is accepted but ignored — prices are no
+    longer read from CSV (the archived CSVs live in data/entsoe_archive/).
 
-    _log: optional callable(message: str) called after each loading step.
+    _log: optional callable(message: str) called after each yearly chunk.
 
     Columns
     -------
@@ -57,25 +67,27 @@ def load_prices(
     month           : month (1–12)
     season          : 'spring' | 'summer' | 'autumn' | 'winter'
     """
-    root  = data_dir or _DATA_DIR
-    files = sorted(root.glob("GUI_ENERGY_PRICES_*.csv"))
-    if not files:
-        raise FileNotFoundError(f"No ENTSO-E CSV files found in {root}")
+    key = _resolve_api_key(api_key)
+    if not key:
+        raise RuntimeError(
+            "No ENTSO-E API key configured. Set ENTSOE_API_KEY, pass api_key=…, "
+            "or add [entsoe] api_key to .streamlit/secrets.toml."
+        )
 
-    parts = [_parse_file(f) for f in files]
-    raw   = pd.concat(parts, ignore_index=True).drop_duplicates("timestamp").sort_values("timestamp")
-    df    = _add_features(raw)
+    if end is None:
+        end = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)
+
+    if _log is not None:
+        _log(f"API: fetching {country_code} day-ahead prices "
+             f"{pd.Timestamp(start).date()} → {pd.Timestamp(end).date()}…")
+
+    fetcher = EntsoeFetcher(key, country_code=country_code)
+    df = fetcher.fetch_range(start, end, _log=_log)
 
     if _log is not None:
         y0 = df["timestamp"].dt.year.min()
         y1 = df["timestamp"].dt.year.max()
-        _log(f"CSV files: {len(df):,} samples from {len(files)} files ({y0}–{y1})")
-
-    key = _resolve_api_key(api_key)
-    if key:
-        df = _top_up(df, key, _log=_log)
-    elif _log is not None:
-        _log("API: no key found — using CSV data only")
+        _log(f"API: loaded {len(df):,} samples ({y0}–{y1})")
 
     return df
 
@@ -93,30 +105,6 @@ def _resolve_api_key(explicit: str | None) -> str | None:
         return key or None
     except Exception:
         return None
-
-
-def _top_up(df: pd.DataFrame, api_key: str, _log=None) -> pd.DataFrame:
-    """Fetch any data newer than the last CSV timestamp and append it."""
-    today = pd.Timestamp.now().normalize()
-    last  = df["timestamp"].max()
-    if last >= today - pd.Timedelta(days=1):
-        if _log is not None:
-            _log(f"API: CSV data is up to date (last: {last.date()})")
-        return df
-    try:
-        n_before = len(df)
-        fetcher  = EntsoeFetcher(api_key)
-        df_new   = fetcher.fetch_and_append(df, end=today + pd.Timedelta(days=1))
-        n_api    = len(df_new) - n_before
-        if _log is not None:
-            _log(f"API: fetched {n_api:,} additional samples (up to {df_new['timestamp'].max().date()})")
-        return df_new
-    except Exception as exc:
-        import warnings
-        warnings.warn(f"ENTSO-E API top-up failed ({exc}); using CSV data only.")
-        if _log is not None:
-            _log(f"API: fetch failed ({exc}) — using CSV data only")
-        return df
 
 
 # ── API loader ────────────────────────────────────────────────────────────────
@@ -183,6 +171,50 @@ class EntsoeFetcher:
         raw = raw.dropna(subset=["price_eur_mwh"])
 
         return _add_features(raw)
+
+    def fetch_range(
+        self,
+        start: str | pd.Timestamp,
+        end:   str | pd.Timestamp,
+        tz:    str = "Europe/Copenhagen",
+        _log=None,
+    ) -> pd.DataFrame:
+        """
+        Fetch [start, end) in one-year chunks and return the combined DataFrame.
+
+        Chunking keeps each request within ENTSO-E's per-query window and lets a
+        single empty/failed year (e.g. a future partial year) be skipped without
+        failing the whole load.
+
+        _log: optional callable(message: str) called after each yearly chunk.
+        """
+        start = pd.Timestamp(start)
+        end   = pd.Timestamp(end)
+        frames: list[pd.DataFrame] = []
+        cur = start
+        while cur < end:
+            nxt = min(pd.Timestamp(year=cur.year + 1, month=1, day=1), end)
+            try:
+                part = self.fetch(cur, nxt, tz=tz)
+                frames.append(part)
+                if _log is not None:
+                    _log(f"API: {cur.date()}–{nxt.date()}  {len(part):,} rows")
+            except Exception as exc:  # NoMatchingDataError, network error, …
+                if _log is not None:
+                    _log(f"API: {cur.date()}–{nxt.date()} skipped ({type(exc).__name__})")
+            cur = nxt
+
+        if not frames:
+            raise RuntimeError(
+                f"ENTSO-E API returned no data for {start.date()}–{end.date()} "
+                f"({self.country_code})."
+            )
+        return (
+            pd.concat(frames, ignore_index=True)
+            .drop_duplicates("timestamp")
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
 
     def fetch_and_append(
         self,

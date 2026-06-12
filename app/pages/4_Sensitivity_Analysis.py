@@ -9,6 +9,11 @@ Baseline configuration (SharedParams / BaselineParams defaults)
   Cost     : φ=1000 €/h (unserved-driving penalty), β=0.999
   Solver   : K=20 price bins, λ_max=0.75 €/kWh
 
+Mobility model (sidebar selector, applies to every sweep):
+  • Baseline           — trip duration ~ Geom(p_DP); 2-state mobility chain
+  • NegBin (fixed k)   — trip ~ NegBin(k, q) via a k-phase chain; mean = k/q min
+  • NegBin (sampled k) — k ~ Poisson(λ_k) drawn at each trip start
+
 Four independent sweep dimensions (one at a time, others held at baseline):
   1. Pricing model  — Gaussian parametric · Gaussian bins · GMM · MDN
   2. Penalty φ      — {0,100,500,1000,2000,5000,10 000} €/h
@@ -40,13 +45,20 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from models.baseline import (
-    BaselineParams, transition_probs, consumption,
+    BaselineParams, transition_probs as _baseline_transition_probs,
+    consumption as _baseline_consumption,
     backward_induction_policy, maximal_charging_policy,
     night_charging_policy, always_minimum_policy, dp_heuristic_policy,
-    simulate_policy_rollout, rollout_metrics,
+    simulate_policy_rollout as _baseline_simulate_rollout, rollout_metrics,
+)
+from models.negative_binomial_trips import (
+    NegBinParams, simulate_policy_rollout as _negbin_simulate_rollout,
+)
+from models.negative_binomial_trips.backward_induction import (
+    backward_induction as _negbin_run_bi,
 )
 from models.model_utils import mean_price, price_bin_probs as _gaussian_pbp
-from utils.backward_induction import backward_induction as _run_bi
+from utils.backward_induction import backward_induction as _baseline_run_bi
 from pricing_models.pricing import (
     GaussianBinnedSampler, GMMSampler, MDNSampler,
     make_price_bin_probs_fn,
@@ -74,15 +86,50 @@ SAMPLER_CLASSES  = {
     "MDN":           MDNSampler,
 }
 
+# ── Mobility models ─────────────────────────────────────────────────────────────
+# Each sweep can run against any of these.  The Baseline uses a 2-state mobility
+# chain; the NegBin variants use a (k+1)-state phase chain (parked + k driving
+# phases), so they have their own solver and rollout dynamics.
+MODEL_LABELS    = ["Baseline", "NegBin trips (fixed k)", "NegBin trips (sampled k)"]
+NEGBIN_LAMBDA_K = 5.0   # mean phases for the Poisson-sampled-k NegBin model
+
+
+def _poisson_kmax(lambda_k: float, quantile: float = 0.999) -> int:
+    """Smallest k_max with P(X ≤ k_max) ≥ quantile for X ~ Poisson(lambda_k)."""
+    import math
+    pmf = math.exp(-lambda_k)
+    cdf = pmf
+    k   = 0
+    while cdf < quantile:
+        k   += 1
+        pmf *= lambda_k / k
+        cdf += pmf
+    return max(k, 1)
+
 
 # ── Pure computation helpers ───────────────────────────────────────────────────
 
-def _base_params(**overrides) -> BaselineParams:
-    """Build BaselineParams from dataclass defaults, applying any overrides."""
-    return BaselineParams(**overrides)
+def _build_params(model_label: str, **overrides):
+    """Build the params object for the selected mobility model, applying overrides.
+
+    Baseline → BaselineParams.  NegBin variants → NegBinParams; the sampled-k
+    variant additionally sets lambda_k (Poisson mean) and truncates the phase
+    chain at the 99.9th-percentile k.
+    """
+    if model_label == "Baseline":
+        return BaselineParams(**overrides)
+    if model_label == "NegBin trips (sampled k)":
+        return NegBinParams(**overrides, lambda_k=NEGBIN_LAMBDA_K,
+                            k=_poisson_kmax(NEGBIN_LAMBDA_K))
+    return NegBinParams(**overrides)  # fixed-k NegBin (lambda_k=None by default)
 
 
-def _make_pbp_fn(label: str, params: BaselineParams, season: str, is_weekend: bool,
+def _rollout_fn(model_label: str):
+    """Return the model-specific simulate_policy_rollout."""
+    return _baseline_simulate_rollout if model_label == "Baseline" else _negbin_simulate_rollout
+
+
+def _make_pbp_fn(label: str, params, season: str, is_weekend: bool,
                  sampler_cache: dict):
     """Return a price_bin_probs_fn for the given pricing label."""
     if label == "Gaussian (parametric)":
@@ -91,19 +138,29 @@ def _make_pbp_fn(label: str, params: BaselineParams, season: str, is_weekend: bo
     return make_price_bin_probs_fn(sampler, params, season, is_weekend)
 
 
-def _solve(params: BaselineParams, pbp_fn, T: int, N_e: int):
-    """Run backward induction; returns (pi, actions, e_grid, lam_grid)."""
-    _, pi, actions, e_grid, lam_grid = _run_bi(
-        params,
-        transition_probs_fn=lambda t: transition_probs(t, params),
-        consumption_fn=lambda chi: consumption(chi, params),
-        price_bin_probs_fn=pbp_fn,
-        T=T, N_e=N_e,
-    )
+def _solve(model_label: str, params, pbp_fn, T: int, N_e: int):
+    """Run the model-appropriate backward induction; returns (pi, actions, e_grid, lam_grid).
+
+    The NegBin solver carries the phase chain internally, so it takes only
+    price_bin_probs_fn; the Baseline solver is parameterised by transition and
+    consumption functions.
+    """
+    if model_label == "Baseline":
+        _, pi, actions, e_grid, lam_grid = _baseline_run_bi(
+            params,
+            transition_probs_fn=lambda t: _baseline_transition_probs(t, params),
+            consumption_fn=lambda chi: _baseline_consumption(chi, params),
+            price_bin_probs_fn=pbp_fn,
+            T=T, N_e=N_e,
+        )
+    else:
+        _, pi, actions, e_grid, lam_grid = _negbin_run_bi(
+            params, price_bin_probs_fn=pbp_fn, T=T, N_e=N_e,
+        )
     return pi, actions, e_grid, lam_grid
 
 
-def _make_scenario(params: BaselineParams, seed: int, horizon: int,
+def _make_scenario(params, seed: int, horizon: int,
                    sampler=None, season: str = "winter", is_weekend: bool = False) -> dict:
     """
     Generate one rollout scenario.  Uses separate sub-seeds for mobility and
@@ -122,15 +179,15 @@ def _make_scenario(params: BaselineParams, seed: int, horizon: int,
     else:
         dow = 5 if is_weekend else 0
         lam_path = np.array([
-            max(0.0, sampler.sample(dow, (t // 60) % 24, season))
+            max(0.0, sampler.sample(dow, (t // 60) % 24, season, rng=rng_lam))
             for t in range(horizon)
         ])
     return {"lam_path": lam_path, "mobility_draws": mobility_draws, "phase_draws": phase_draws}
 
 
-def _run_rollouts(pi, actions, e_grid, params: BaselineParams, scenarios: list) -> dict:
+def _run_rollouts(pi, actions, e_grid, params, scenarios: list, rollout_fn) -> dict:
     """
-    Run all four policies on each scenario.
+    Run all four policies on each scenario using the model-specific rollout_fn.
     Returns {policy_name: [metrics_dict, ...]} for N_rollouts scenarios.
     """
     e0   = float(params.e_max / 2)
@@ -139,7 +196,7 @@ def _run_rollouts(pi, actions, e_grid, params: BaselineParams, scenarios: list) 
     results: dict[str, list] = {p: [] for p in POLICY_ORDER}
     for sc in scenarios:
         # Optimal BI
-        ro = simulate_policy_rollout(
+        ro = rollout_fn(
             backward_induction_policy, sc, e0, chi0, params,
             pi=pi, actions=actions, e_grid=e_grid,
         )
@@ -152,7 +209,7 @@ def _run_rollouts(pi, actions, e_grid, params: BaselineParams, scenarios: list) 
             ("Maximal charging", maximal_charging_policy),
             ("Always minimum",   always_minimum_policy),
         ]:
-            ro = simulate_policy_rollout(fn, sc, e0, chi0, params)
+            ro = rollout_fn(fn, sc, e0, chi0, params)
             results[name].append(rollout_metrics(ro, params))
 
     return results
@@ -197,18 +254,19 @@ def _heatmap_z(rates, T: int, N_e: int, time_bin_min: int = 60):
     return binned.T  # (N_e, n_time_bins)
 
 
-def _run_sweep_step(label: str, params: BaselineParams, pbp_fn,
+def _run_sweep_step(model_label: str, label: str, params, pbp_fn,
                     T: int, N_e: int, N_rollouts: int, seed: int,
                     sampler=None, season: str = "winter", is_weekend: bool = False) -> dict:
     """Solve + run rollouts for one sweep configuration."""
-    pi, actions, e_grid, lam_grid = _solve(params, pbp_fn, T, N_e)
+    pi, actions, e_grid, lam_grid = _solve(model_label, params, pbp_fn, T, N_e)
     scenarios = [
         _make_scenario(params, seed + i, T, sampler=sampler,
                        season=season, is_weekend=is_weekend)
         for i in range(N_rollouts)
     ]
-    rollouts = _run_rollouts(pi, actions, e_grid, params, scenarios)
+    rollouts = _run_rollouts(pi, actions, e_grid, params, scenarios, _rollout_fn(model_label))
     return {
+        "model":   model_label,
         "label":   label,
         "params":  params,
         "pbp_fn":  pbp_fn,
@@ -224,15 +282,15 @@ def _run_sweep_step(label: str, params: BaselineParams, pbp_fn,
 # ── Sweep orchestrators ────────────────────────────────────────────────────────
 
 def sweep_pricing_models(
-    N_rollouts: int, N_e: int, seed: int,
+    model_label: str, N_rollouts: int, N_e: int, seed: int,
     season: str, is_weekend: bool,
     sampler_cache: dict, progress_cb=None,
 ) -> list[dict]:
     """
-    Compare all pricing models.  Baseline params are SharedParams defaults.
+    Compare all pricing models for the selected mobility model.
     Returns a list of sweep-step result dicts, one per pricing label.
     """
-    base = _base_params()
+    base = _build_params(model_label)
     results = []
     for i, label in enumerate(PRICING_LABELS):
         if progress_cb:
@@ -240,7 +298,7 @@ def sweep_pricing_models(
         sampler = sampler_cache.get(label)  # None for Gaussian parametric
         pbp_fn  = _make_pbp_fn(label, base, season, is_weekend, sampler_cache)
         result  = _run_sweep_step(
-            label, base, pbp_fn, T=24 * 60, N_e=N_e, N_rollouts=N_rollouts,
+            model_label, label, base, pbp_fn, T=24 * 60, N_e=N_e, N_rollouts=N_rollouts,
             seed=seed, sampler=sampler, season=season, is_weekend=is_weekend,
         )
         results.append(result)
@@ -250,7 +308,7 @@ def sweep_pricing_models(
 
 
 def sweep_penalty(
-    N_rollouts: int, N_e: int, seed: int, progress_cb=None,
+    model_label: str, N_rollouts: int, N_e: int, seed: int, progress_cb=None,
 ) -> list[dict]:
     """
     Sweep φ ∈ PHI_VALUES.  Uses Gaussian parametric pricing.
@@ -260,10 +318,10 @@ def sweep_penalty(
     for i, phi in enumerate(PHI_VALUES):
         if progress_cb:
             progress_cb(i / len(PHI_VALUES), f"Solving φ = {phi} €/h…")
-        params = _base_params(phi=float(phi))
+        params = _build_params(model_label, phi=float(phi))
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         result = _run_sweep_step(
-            f"φ={phi}", params, pbp_fn, T=24 * 60, N_e=N_e,
+            model_label, f"φ={phi}", params, pbp_fn, T=24 * 60, N_e=N_e,
             N_rollouts=N_rollouts, seed=seed,
         )
         results.append(result)
@@ -273,14 +331,14 @@ def sweep_penalty(
 
 
 def sweep_season_weekend(
-    N_rollouts: int, N_e: int, seed: int,
+    model_label: str, N_rollouts: int, N_e: int, seed: int,
     pricing_label: str, sampler_cache: dict, progress_cb=None,
 ) -> list[dict]:
     """
     Compare all 8 (season, day-type) combinations using a data-driven pricing model.
     Returns a list of sweep-step result dicts, one per combination.
     """
-    base   = _base_params()
+    base   = _build_params(model_label)
     combos = [(s, w) for s in ["winter", "spring", "summer", "autumn"] for w in [False, True]]
     results = []
     for i, (season, is_weekend) in enumerate(combos):
@@ -290,7 +348,7 @@ def sweep_season_weekend(
         sampler = sampler_cache.get(pricing_label)
         pbp_fn  = _make_pbp_fn(pricing_label, base, season, is_weekend, sampler_cache)
         result  = _run_sweep_step(
-            label, base, pbp_fn, T=24 * 60, N_e=N_e, N_rollouts=N_rollouts,
+            model_label, label, base, pbp_fn, T=24 * 60, N_e=N_e, N_rollouts=N_rollouts,
             seed=seed, sampler=sampler, season=season, is_weekend=is_weekend,
         )
         results.append(result)
@@ -300,7 +358,7 @@ def sweep_season_weekend(
 
 
 def sweep_horizon(
-    N_rollouts: int, N_e: int, seed: int, progress_cb=None,
+    model_label: str, N_rollouts: int, N_e: int, seed: int, progress_cb=None,
 ) -> list[dict]:
     """
     Compare T ∈ {24h, 48h, 168h}.  Uses Gaussian parametric pricing.
@@ -310,11 +368,11 @@ def sweep_horizon(
     for i, T_h in enumerate(HORIZON_HOURS):
         if progress_cb:
             progress_cb(i / len(HORIZON_HOURS), f"Solving T = {T_h} h…")
-        params = _base_params()
+        params = _build_params(model_label)
         T      = T_h * 60
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         result = _run_sweep_step(
-            f"{T_h} h", params, pbp_fn, T=T, N_e=N_e,
+            model_label, f"{T_h} h", params, pbp_fn, T=T, N_e=N_e,
             N_rollouts=N_rollouts, seed=seed,
         )
         results.append(result)
@@ -534,7 +592,8 @@ def _append_sweep_pages(pdf, W, XPos, YPos, results: list[dict], sweep_label: st
     pdf.cell(0, 12, _pdf_str(f"Sensitivity Analysis - {sweep_label}"),
              new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
     pdf.set_font("Helvetica", "", 11)
-    pdf.cell(0, 8, f"EV Charging MDP  |  {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}",
+    _model = results[0].get("model", "?") if results else "?"
+    pdf.cell(0, 8, _pdf_str(f"EV Charging MDP  |  Model: {_model}  |  {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}"),
              new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
     pdf.ln(6)
     pdf.set_font("Helvetica", "", 10)
@@ -614,6 +673,8 @@ def _ensure_samplers(sampler_cache: dict, labels: list[str], status_fn=None):
 
 def _show_results(results: list[dict], sweep_label: str):
     """Render all output plots and tables for a completed sweep."""
+    if results:
+        st.caption(f"Mobility model: **{results[0].get('model', '?')}**")
     st.subheader("Policy heatmaps")
     st.plotly_chart(fig_heatmap_grid(results), use_container_width=True)
 
@@ -671,6 +732,11 @@ battery e_max = 40 kWh · η_c = 0.95 · u_max = 11 kW · φ = 1000 €/h · K =
 
 **Policies compared:** Optimal (Backward induction) · Night charging · DP heuristic · Maximal charging
 
+**Mobility model** (sidebar — applies to every sweep):
+- **Baseline** — trip duration ~ Geom(p_DP); 2-state mobility chain.
+- **NegBin (fixed k)** — trip ~ NegBin(k, q) via a k-phase chain; mean = k/q min.
+- **NegBin (sampled k)** — k ~ Poisson(λ_k) drawn at each trip start.
+
 **Four independent sweep dimensions** (others held at baseline):
 1. **Pricing model** — Gaussian parametric · Gaussian bins · GMM · MDN
 2. **Penalty φ** — {0, 100, 500, 1000, 2000, 5000, 10 000} €/h
@@ -679,13 +745,34 @@ battery e_max = 40 kWh · η_c = 0.95 · u_max = 11 kW · φ = 1000 €/h · K =
 
 > **Note:** The DP-heuristic benchmark uses the Gaussian parametric price model internally
 > regardless of the pricing-model sweep. All other policies are agnostic to the pricing model.
+> The NegBin models have more mobility states, so their solves are slower — lower **N_e** if needed.
 > Re-run a single sweep by clicking its **Run** button in the corresponding tab.
     """)
 
 # ── Sidebar controls ──────────────────────────────────────────────────────────
 
+def _clear_sweep_results():
+    """Drop cached sweep results so they are recomputed after a model switch."""
+    for k in ["sa_pricing_results", "sa_phi_results",
+              "sa_horizon_results", "sa_season_results", "sa_combined_pdf"]:
+        st.session_state.pop(k, None)
+
+
 with st.sidebar:
     st.header("Sweep settings")
+
+    model_label = st.selectbox(
+        "Mobility model",
+        MODEL_LABELS,
+        key="sa_model",
+        on_change=_clear_sweep_results,
+        help=(
+            "**Baseline** — trip duration ~ Geom(p_DP), 2-state mobility chain.  "
+            "**NegBin (fixed k)** — trip ~ NegBin(k, q) via a k-phase chain, mean = k/q min.  "
+            f"**NegBin (sampled k)** — k ~ Poisson(λ_k={NEGBIN_LAMBDA_K:g}) drawn at each trip start.  "
+            "NegBin solves are slower (more mobility states) — lower N_e if needed."
+        ),
+    )
 
     inherit = st.toggle(
         "Inherit params from Settings page",
@@ -740,7 +827,7 @@ if st.session_state.pop("sa_run_all_triggered", False):
 
     bar.progress(0.05, "Pricing model sweep…")
     st.session_state["sa_pricing_results"] = sweep_pricing_models(
-        N_rollouts=N_rollouts, N_e=N_e, seed=seed,
+        model_label=model_label, N_rollouts=N_rollouts, N_e=N_e, seed=seed,
         season=season, is_weekend=is_weekend,
         sampler_cache=sampler_cache,
         progress_cb=lambda f, m: bar.progress(0.05 + f * 0.2, m),
@@ -748,19 +835,19 @@ if st.session_state.pop("sa_run_all_triggered", False):
 
     bar.progress(0.25, "Penalty sweep…")
     st.session_state["sa_phi_results"] = sweep_penalty(
-        N_rollouts=N_rollouts, N_e=N_e, seed=seed,
+        model_label=model_label, N_rollouts=N_rollouts, N_e=N_e, seed=seed,
         progress_cb=lambda f, m: bar.progress(0.25 + f * 0.2, m),
     )
 
     bar.progress(0.45, "Horizon sweep…")
     st.session_state["sa_horizon_results"] = sweep_horizon(
-        N_rollouts=N_rollouts, N_e=N_e, seed=seed,
+        model_label=model_label, N_rollouts=N_rollouts, N_e=N_e, seed=seed,
         progress_cb=lambda f, m: bar.progress(0.45 + f * 0.2, m),
     )
 
     bar.progress(0.65, "Season x day-type sweep…")
     st.session_state["sa_season_results"] = sweep_season_weekend(
-        N_rollouts=N_rollouts, N_e=N_e, seed=seed,
+        model_label=model_label, N_rollouts=N_rollouts, N_e=N_e, seed=seed,
         pricing_label=run_all_pricing_label,
         sampler_cache=sampler_cache,
         progress_cb=lambda f, m: bar.progress(0.65 + f * 0.2, m),
@@ -798,7 +885,7 @@ with tab_price:
         bar  = st.progress(0.0, text="Starting…")
         with st.spinner("Running pricing model sweep…"):
             results = sweep_pricing_models(
-                N_rollouts=N_rollouts, N_e=N_e, seed=seed,
+                model_label=model_label, N_rollouts=N_rollouts, N_e=N_e, seed=seed,
                 season=season, is_weekend=is_weekend,
                 sampler_cache=sampler_cache,
                 progress_cb=lambda frac, msg: bar.progress(frac, text=msg),
@@ -824,7 +911,7 @@ with tab_phi:
         bar  = st.progress(0.0, text="Starting…")
         with st.spinner("Running penalty sweep…"):
             results = sweep_penalty(
-                N_rollouts=N_rollouts, N_e=N_e, seed=seed,
+                model_label=model_label, N_rollouts=N_rollouts, N_e=N_e, seed=seed,
                 progress_cb=lambda frac, msg: bar.progress(frac, text=msg),
             )
         st.session_state["sa_phi_results"] = results
@@ -849,7 +936,7 @@ with tab_T:
         bar  = st.progress(0.0, text="Starting…")
         with st.spinner("Running horizon sweep…"):
             results = sweep_horizon(
-                N_rollouts=N_rollouts, N_e=N_e, seed=seed,
+                model_label=model_label, N_rollouts=N_rollouts, N_e=N_e, seed=seed,
                 progress_cb=lambda frac, msg: bar.progress(frac, text=msg),
             )
         st.session_state["sa_horizon_results"] = results
@@ -882,7 +969,7 @@ with tab_season:
         bar = st.progress(0.0, text="Starting…")
         with st.spinner("Running season × day-type sweep…"):
             results = sweep_season_weekend(
-                N_rollouts=N_rollouts, N_e=N_e, seed=seed,
+                model_label=model_label, N_rollouts=N_rollouts, N_e=N_e, seed=seed,
                 pricing_label=pricing_label_season,
                 sampler_cache=sampler_cache,
                 progress_cb=lambda frac, msg: bar.progress(frac, text=msg),

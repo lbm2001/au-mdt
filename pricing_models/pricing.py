@@ -17,6 +17,16 @@ _SEASON_IDX: dict[str, int] = {s: i for i, s in enumerate(SEASONS)}
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
 
+def _as_rng(rng: "np.random.Generator | None") -> np.random.Generator:
+    """Return the given Generator, or a fresh seeded-from-entropy one if None.
+
+    Passing an explicit Generator makes draws reproducible and lets callers share
+    a stream across samplers (common random numbers); None preserves the old
+    non-reproducible behaviour for incidental callers.
+    """
+    return rng if rng is not None else np.random.default_rng()
+
+
 def _gaussian_cdf(x: float, mean: float, std: float) -> float:
     if std <= 0:
         return 1.0 if x > mean else 0.0
@@ -64,8 +74,12 @@ class AbstractSampler(ABC):
         """
 
     @abstractmethod
-    def sample(self, dow: int, hour: int, season: Season) -> float:
-        """Sample a price in EUR/kWh given day-of-week, hour, and season."""
+    def sample(self, dow: int, hour: int, season: Season,
+               rng: "np.random.Generator | None" = None) -> float:
+        """Sample a price in EUR/kWh given day-of-week, hour, and season.
+
+        rng: optional NumPy Generator for reproducible draws; None uses a fresh one.
+        """
 
     @abstractmethod
     def bin_probs(self, dow: int, hour: int, season: Season, params) -> np.ndarray:
@@ -97,9 +111,10 @@ class GaussianBinnedSampler(AbstractSampler):
                 _progress((i + 1) / n, f"Bin {i + 1}/{n}")
         return self
 
-    def sample(self, dow: int, hour: int, season: Season) -> float:
+    def sample(self, dow: int, hour: int, season: Season,
+               rng: "np.random.Generator | None" = None) -> float:
         mean, std = self._get_params(dow, hour, season)
-        return float(max(0.0, np.random.normal(mean, std)))
+        return float(max(0.0, _as_rng(rng).normal(mean, std)))
 
     def bin_probs(self, dow: int, hour: int, season: Season, params) -> np.ndarray:
         mean, std = self._get_params(dow, hour, season)
@@ -143,9 +158,18 @@ class GMMSampler(AbstractSampler):
                 _progress((i + 1) / n_groups, f"Bin {i + 1}/{n_groups}")
         return self
 
-    def sample(self, dow: int, hour: int, season: Season) -> float:
+    def sample(self, dow: int, hour: int, season: Season,
+               rng: "np.random.Generator | None" = None) -> float:
+        # Draw from the mixture explicitly with the supplied Generator.
+        # GaussianMixture.sample() is avoided: it reseeds from the fixed
+        # random_state every call, so it returns the same value each time.
         gmm = self._get_gmm(dow, hour, season)
-        return float(max(0.0, gmm.sample(1)[0][0, 0]))
+        r       = _as_rng(rng)
+        weights = gmm.weights_
+        means   = gmm.means_[:, 0]
+        stds    = np.sqrt(gmm.covariances_[:, 0, 0])
+        k = int(r.choice(len(weights), p=weights))
+        return float(max(0.0, r.normal(means[k], stds[k])))
 
     def bin_probs(self, dow: int, hour: int, season: Season, params) -> np.ndarray:
         gmm = self._get_gmm(dow, hour, season)
@@ -265,10 +289,12 @@ class MDNSampler(AbstractSampler):
         self._net.eval()
         return self
 
-    def sample(self, dow: int, hour: int, season: Season) -> float:
+    def sample(self, dow: int, hour: int, season: Season,
+               rng: "np.random.Generator | None" = None) -> float:
         pi, mu, sigma = self._predict(dow, hour, season)
-        k = np.random.choice(len(pi), p=pi)
-        return float(max(0.0, np.random.normal(mu[k], sigma[k])))
+        r = _as_rng(rng)
+        k = int(r.choice(len(pi), p=pi))
+        return float(max(0.0, r.normal(mu[k], sigma[k])))
 
     def bin_probs(self, dow: int, hour: int, season: Season, params) -> np.ndarray:
         pi, mu, sigma = self._predict(dow, hour, season)

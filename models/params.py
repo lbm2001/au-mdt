@@ -36,7 +36,7 @@ class SharedParams:
     p_pd_default: float = 0.0025
 
     # ── Price discretisation ──────────────────────────────────────────────────
-    K: int = 20
+    K: int = 100
     lambda_max: float = 0.30  # wholesale range (covers ~99% of normal-market DK1 prices)
 
     # ── Fixed conversion factor ───────────────────────────────────────────────

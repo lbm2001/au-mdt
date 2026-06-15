@@ -29,6 +29,27 @@ def _parse_file(path: Path) -> pd.DataFrame:
     df["price_eur_mwh"] = pd.to_numeric(df[_PRICE_COL], errors="coerce")
     return df[["timestamp", "price_eur_mwh"]].dropna()
 
+def load_prices_dir(
+    data_dir: Path | None = "/Users/lukasmueller/git/github/au-mdt/data/entsoe",
+) -> pd.DataFrame:
+    if data_dir is None:
+        data_dir = _DATA_DIR
+
+    files = sorted(Path(data_dir).glob("*.csv"))
+
+    if not files:
+        raise RuntimeError(f"No CSV files found in {data_dir}")
+
+    dfs = [_parse_file(f) for f in files]
+
+    df = (
+        pd.concat(dfs, ignore_index=True)
+        .drop_duplicates("timestamp")
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+    return _add_features(df)
 
 def load_prices(
     data_dir: Path | None = None,
@@ -67,6 +88,7 @@ def load_prices(
     month           : month (1–12)
     season          : 'spring' | 'summer' | 'autumn' | 'winter'
     """
+    return load_prices_dir()
     key = _resolve_api_key(api_key)
     if not key:
         raise RuntimeError(
@@ -178,30 +200,59 @@ class EntsoeFetcher:
         end:   str | pd.Timestamp,
         tz:    str = "Europe/Copenhagen",
         _log=None,
+        retries: int = 4,
+        backoff: float = 2.0,
     ) -> pd.DataFrame:
         """
         Fetch [start, end) in one-year chunks and return the combined DataFrame.
 
-        Chunking keeps each request within ENTSO-E's per-query window and lets a
-        single empty/failed year (e.g. a future partial year) be skipped without
-        failing the whole load.
+        Each chunk is retried with exponential backoff because the ENTSO-E API
+        intermittently returns 503/504.  A genuinely empty period (e.g. a future
+        chunk with no published prices) is skipped; a chunk that still fails after
+        all retries raises, so we never silently return a dataset with missing
+        years.
 
-        _log: optional callable(message: str) called after each yearly chunk.
+        _log: optional callable(message: str) — progress and retry notices.
         """
+        # Note: HTTP error messages embed the API key in the URL, so only the
+        # exception *type* is ever logged/raised — never the message.
+        try:
+            from entsoe.exceptions import NoMatchingDataError
+        except Exception:                       # pragma: no cover
+            NoMatchingDataError = ()            # nothing to special-case → all retryable
+
+        import time
+
         start = pd.Timestamp(start)
         end   = pd.Timestamp(end)
         frames: list[pd.DataFrame] = []
         cur = start
         while cur < end:
             nxt = min(pd.Timestamp(year=cur.year + 1, month=1, day=1), end)
-            try:
-                part = self.fetch(cur, nxt, tz=tz)
-                frames.append(part)
-                if _log is not None:
-                    _log(f"API: {cur.date()}–{nxt.date()}  {len(part):,} rows")
-            except Exception as exc:  # NoMatchingDataError, network error, …
-                if _log is not None:
-                    _log(f"API: {cur.date()}–{nxt.date()} skipped ({type(exc).__name__})")
+            for attempt in range(retries):
+                try:
+                    part = self.fetch(cur, nxt, tz=tz)
+                    frames.append(part)
+                    if _log is not None:
+                        _log(f"API: {cur.date()}–{nxt.date()}  {len(part):,} rows")
+                    break
+                except NoMatchingDataError:
+                    if _log is not None:
+                        _log(f"API: {cur.date()}–{nxt.date()} no data, skipped")
+                    break
+                except Exception as exc:
+                    if attempt < retries - 1:
+                        wait = backoff * (2 ** attempt)
+                        if _log is not None:
+                            _log(f"API: {cur.date()}–{nxt.date()} {type(exc).__name__}, "
+                                 f"retry {attempt + 1}/{retries - 1} in {wait:.0f}s…")
+                        time.sleep(wait)
+                    else:
+                        raise RuntimeError(
+                            f"ENTSO-E API failed for {cur.date()}–{nxt.date()} after "
+                            f"{retries} attempts ({type(exc).__name__}). The service is "
+                            f"likely temporarily unavailable (503/504) — try again shortly."
+                        ) from None
             cur = nxt
 
         if not frames:

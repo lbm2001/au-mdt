@@ -33,23 +33,39 @@ HOURS = np.arange(T) / 60
 # ── Model-specific imports ────────────────────────────────────────────────────
 
 from models.model_utils import price_bin_probs
+from utils.viz import POLICY_COLORS    # shared canonical colour map
 
 if is_negbin:
     from models.negative_binomial_trips import (
         mean_price, transition_probs, p_pd,
         maximal_charging_policy, price_oriented_policy,
         night_charging_policy, minimum_soc_policy, always_minimum_policy,
-        dp_heuristic_policy,
+        dp_heuristic_policy, backward_induction_policy,
+        simulate_policy_rollout, generate_rollout_scenario,
     )
 else:
     from models.baseline import (
         mean_price, transition_probs,
         maximal_charging_policy, price_oriented_policy,
         night_charging_policy, minimum_soc_policy, always_minimum_policy,
-        dp_heuristic_policy,
+        dp_heuristic_policy, backward_induction_policy,
+        simulate_policy_rollout, generate_rollout_scenario,
     )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _paper_config(filename: str) -> dict:
+    """Plotly config so the modebar download button exports a clean, paper-ready vector SVG."""
+    return {
+        "displaylogo": False,
+        "toImageButtonOptions": {"format": "png", "filename": filename, "scale": 4},
+    }
+
+
+def _chart(fig, filename: str):
+    """Render a chart full-width with a paper-ready SVG download configured."""
+    st.plotly_chart(fig, use_container_width=True, config=_paper_config(filename))
+
 
 def _binned_policy_rates(rates: np.ndarray, time_bin_minutes: int,
                          battery_bin_kwh: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -85,13 +101,13 @@ def _policy_heatmap_figure(rates: np.ndarray, title: str, time_bin_minutes: int,
         zmin=0,
         zmax=params.u_max,
         colorscale="RdYlBu_r",
-        colorbar=dict(title="kW"),
+        colorbar=dict(title="u (kW)"),
         hovertemplate="Hour: %{x:.2f}<br>Battery: %{y:.2f} kWh<br>Charge: %{z:.2f} kW<extra></extra>",
     ))
     fig.update_layout(
-        title=title,
-        xaxis_title="Hour",
-        yaxis_title="Battery level (kWh)",
+        #title=title,
+        xaxis_title="Hour (h)",
+        yaxis_title="Battery (kWh)",
         height=430,
         margin=dict(l=30, r=30, t=55, b=35),
     )
@@ -116,6 +132,96 @@ def optimal_policy_rates_averaged(chi: int) -> np.ndarray:
     weights = np.array([price_bin_probs(t, params) for t in range(T)])     # (T, K)
     averaged = (desired * weights[:, np.newaxis, :]).sum(axis=2)           # (T, N_e)
     return effective_policy_rates(chi, averaged)
+
+
+def policy_price_map_figure(chi: int, t: int, title: str) -> go.Figure:
+    """u*(battery × price bin) at a fixed minute t.
+
+    Unlike the time–battery heatmap (which averages over price), this keeps the price
+    axis, so the policy's price response — the charge-vs-defer threshold per SoC — is
+    directly visible.
+    """
+    rates = actions[pi[t, chi, :, :]].astype(float, copy=True)   # (N_e, K)
+    if chi > 0:  # driving: can only charge when essentially empty
+        rates[e_grid > params.e_min, :] = 0.0
+    fig = go.Figure(data=go.Heatmap(
+        x=lam_grid,
+        y=e_grid,
+        z=rates,
+        zmin=0,
+        zmax=params.u_max,
+        colorscale="RdYlBu_r",
+        colorbar=dict(title="u (kW)"),
+        hovertemplate="Price: %{x:.3f} €/kWh<br>Battery: %{y:.2f} kWh<br>Charge: %{z:.2f} kW<extra></extra>",
+    ))
+    fig.update_layout(
+        xaxis_title="Price (€/kWh)",
+        yaxis_title="Battery (kWh)",
+        height=430,
+        margin=dict(l=30, r=30, t=55, b=35),
+    )
+    return fig
+
+
+def policy_threshold_figure(chi: int, time_bin_minutes: int, title: str) -> go.Figure:
+    """Charging price-threshold map: colour = highest price at which the policy still charges.
+
+    Collapses the price dimension to a single interpretable surface — charge while the current
+    price ≤ colour; blank where it never charges at that (t, e).
+    """
+    import warnings
+    u = actions[pi[:, chi, :, :]].astype(float)        # (T, N_e, K)
+    if chi > 0:
+        u[:, e_grid > params.e_min, :] = 0.0
+    charging = u > 0
+    last_k   = (charging * (np.arange(len(lam_grid)) + 1)).max(axis=2) - 1     # (T, N_e)
+    thr = np.where(charging.any(axis=2),
+                   lam_grid[np.clip(last_k, 0, len(lam_grid) - 1)], np.nan)    # (T, N_e)
+    n_t    = max(1, T // time_bin_minutes)
+    usable = n_t * time_bin_minutes
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        thr_b = np.nanmean(thr[:usable].reshape(n_t, time_bin_minutes, -1), axis=1)   # (n_t, N_e)
+    t_centers = (np.arange(n_t) + 0.5) * time_bin_minutes / 60
+    fig = go.Figure(data=go.Heatmap(
+        x=t_centers, y=e_grid, z=thr_b.T,
+        colorscale="Viridis", colorbar=dict(title="€/kWh"),
+        hovertemplate="Hour: %{x:.2f}<br>Battery: %{y:.1f} kWh<br>charge if price ≤ %{z:.3f} €/kWh<extra></extra>",
+    ))
+    fig.update_layout(xaxis_title="Hour (h)", yaxis_title="Battery (kWh)",
+                      height=430, margin=dict(l=30, r=30, t=55, b=35))
+    fig.update_xaxes(range=[0, T_hours], dtick=T_hours // 8)
+    return fig
+
+
+def rollout_trajectory_figure(seed: int) -> go.Figure:
+    """One simulated optimal-policy trajectory: price, battery SoC (driving shaded), charge rate."""
+    scenario = generate_rollout_scenario(params, seed, horizon=T)
+    ro = simulate_policy_rollout(
+        backward_induction_policy, scenario, float(params.e_max / 2), 0, params,
+        pi=pi, actions=actions, e_grid=e_grid,
+    )
+    hours   = np.arange(T) / 60
+    driving = ro["chi_traj"] > 0
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.3, 0.4, 0.3],
+        subplot_titles=("Electricity price λ_t", "Battery SoC  (grey = driving)", "Charge rate u_t"),
+    )
+    fig.add_trace(go.Scatter(x=hours, y=ro["lam_traj"], mode="lines",
+                             line=dict(color="steelblue", width=1.5, shape="hv")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=hours, y=np.where(driving, params.e_max, 0.0), fill="tozeroy",
+                             fillcolor="rgba(150,150,150,0.25)", line=dict(width=0),
+                             hoverinfo="skip"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=hours, y=ro["e_traj"], mode="lines",
+                             line=dict(color="seagreen", width=2)), row=2, col=1)
+    fig.add_trace(go.Scatter(x=hours, y=ro["u_traj"], mode="lines",
+                             line=dict(color="crimson", width=1.5, shape="hv")), row=3, col=1)
+    fig.update_layout(height=560, margin=dict(l=30, r=30, t=55, b=35), showlegend=False)
+    fig.update_yaxes(title_text="€/kWh", row=1, col=1)
+    fig.update_yaxes(title_text="kWh", range=[0, params.e_max], row=2, col=1)
+    fig.update_yaxes(title_text="kW", row=3, col=1)
+    fig.update_xaxes(title_text="Hour (h)", range=[0, T_hours], dtick=T_hours // 8, row=3, col=1)
+    return fig
 
 
 def benchmark_policy_rates(policy_fn, chi: int, **policy_kwargs) -> np.ndarray:
@@ -182,8 +288,8 @@ def price_figure() -> go.Figure:
         line=dict(color="steelblue", width=2, shape="hv"), name="λ̄_t",
         hovertemplate="Hour: %{x:.2f}<br>Price: %{y:.3f} €/kWh<extra></extra>",
     ))
-    fig.update_layout(title="Mean electricity price", xaxis_title="Hour",
-                      yaxis_title="€ / kWh", height=320,
+    fig.update_layout(xaxis_title="Hour (h)",
+                      yaxis_title="€/kWh", height=320,
                       margin=dict(l=30, r=30, t=55, b=35))
     fig.update_xaxes(range=[0, T_hours], dtick=T_hours // 8)
     return fig
@@ -218,7 +324,7 @@ def transition_figure() -> go.Figure:
     fig.update_xaxes(range=[0, T_hours], dtick=T_hours // 8)
     fig.update_yaxes(title_text="Prob. / min", row=1, col=1)
     fig.update_yaxes(title_text="Prob. / min", row=2, col=1)
-    fig.update_xaxes(title_text="Hour", row=2, col=1)
+    fig.update_xaxes(title_text="Hour (h)", row=2, col=1)
     return fig
 
 
@@ -237,15 +343,6 @@ def charge_vs_price_figure(low_threshold: float, high_threshold: float,
                                   soc_threshold=soc_threshold),
         "Always minimum":     benchmark_policy_rates(always_minimum_policy, 0),
     }
-    colors = {
-        "Backward induction": "steelblue",
-        "DP heuristic":       "teal",
-        "Maximal charging":   "seagreen",
-        "Price-oriented":     "crimson",
-        "Night charging":     "purple",
-        "Minimum SoC":        "darkorange",
-        "Always minimum":     "gray",
-    }
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Scatter(
         x=np.concatenate([HOURS, HOURS[::-1]]),
@@ -259,14 +356,12 @@ def charge_vs_price_figure(low_threshold: float, high_threshold: float,
     for name, rates in policy_rates.items():
         mean_per_hour = rates.mean(axis=1).reshape(T_hours, 60).mean(axis=1)
         fig.add_trace(go.Scatter(x=np.arange(T_hours), y=mean_per_hour, mode="lines",
-                                 line=dict(color=colors[name], width=2, shape="hv"),
+                                 line=dict(color=POLICY_COLORS[name], width=2, shape="hv"),
                                  name=name), secondary_y=True)
-    fig.update_layout(
-        title="Mean charge rate vs. electricity price (parked, averaged over battery grid)",
-        height=430, margin=dict(l=30, r=30, t=55, b=35))
-    fig.update_xaxes(title_text="Hour", range=[0, T_hours], dtick=T_hours // 8)
-    fig.update_yaxes(title_text="€ / kWh", secondary_y=False)
-    fig.update_yaxes(title_text="Mean charge rate (kW)", secondary_y=True, rangemode="tozero")
+    fig.update_layout(height=430, margin=dict(l=30, r=30, t=55, b=35))
+    fig.update_xaxes(title_text="Hour (h)", range=[0, T_hours], dtick=T_hours // 8)
+    fig.update_yaxes(title_text="€/kWh", secondary_y=False)
+    fig.update_yaxes(title_text="u (kW)", secondary_y=True, rangemode="tozero")
     return fig
 
 
@@ -306,11 +401,11 @@ else:
     _opt_rates = optimal_policy_rates(0, lam_bin_sel)
     _opt_title = f"Optimal policy — Parked  |  {lam_bin_label}"
 
-st.plotly_chart(
+_chart(
     _policy_heatmap_figure(_opt_rates, _opt_title,
                            st.session_state.get("time_bin", 10),
                            st.session_state.get("bat_bin", 1.0)),
-    use_container_width=True,
+    "explorer_optimal_policy",
 )
 
 col_tb, col_bb, col_lb, col_low, col_high, col_soc = st.columns(6)
@@ -338,6 +433,35 @@ with col_soc:
                               float(params.e_max), float(params.e_max * 0.25), 0.5,
                               key="soc_threshold")
 
+# ── Optimal policy vs price (fixed hour) ──────────────────────────────────────
+
+st.subheader("Optimal Policy vs Price")
+st.caption(
+    "u*(battery × price) at a fixed hour — keeps the price axis instead of averaging it out, "
+    "so the policy's charge-vs-defer price response per SoC is visible."
+)
+ppmap_hour = st.slider("Hour of day", 0, T_hours - 1, min(12, T_hours - 1), key="ppmap_hour")
+_chart(
+    policy_price_map_figure(
+        0, ppmap_hour * 60,
+        f"Optimal u*(battery × price) — Parked  |  hour {ppmap_hour:02d}:00",
+    ),
+    "explorer_policy_vs_price",
+)
+
+# ── Charging price threshold ──────────────────────────────────────────────────
+
+st.subheader("Charging Price Threshold")
+st.caption(
+    "Colour = the highest price at which the parked policy still charges (charge while price ≤ "
+    "colour). Collapses the price response to one surface; blank where it never charges."
+)
+_chart(
+    policy_threshold_figure(0, st.session_state.get("time_bin", 10),
+                            "Charging price threshold — Parked"),
+    "explorer_price_threshold",
+)
+
 # ── Benchmark heatmaps ────────────────────────────────────────────────────────
 
 st.subheader("Benchmark Policy Heatmaps")
@@ -349,44 +473,54 @@ time_bin = st.session_state.get("time_bin", 10)
 bat_bin  = st.session_state.get("bat_bin", 1.0)
 
 with bench_tabs[0]:
-    st.plotly_chart(_policy_heatmap_figure(
+    _chart(_policy_heatmap_figure(
         benchmark_policy_rates(maximal_charging_policy, 0),
-        "Maximal charging — Parked", time_bin, bat_bin), use_container_width=True)
+        "Maximal charging — Parked", time_bin, bat_bin), "explorer_benchmark_maximal")
 with bench_tabs[1]:
-    st.plotly_chart(_policy_heatmap_figure(
+    _chart(_policy_heatmap_figure(
         benchmark_policy_rates(price_oriented_policy, 0,
                                low_threshold=float(low_threshold),
                                high_threshold=float(high_threshold)),
-        "Price-oriented charging — Parked", time_bin, bat_bin), use_container_width=True)
+        "Price-oriented charging — Parked", time_bin, bat_bin), "explorer_benchmark_price_oriented")
 with bench_tabs[2]:
-    st.plotly_chart(_policy_heatmap_figure(
+    _chart(_policy_heatmap_figure(
         benchmark_policy_rates(night_charging_policy, 0),
-        "Night charging — Parked", time_bin, bat_bin), use_container_width=True)
+        "Night charging — Parked", time_bin, bat_bin), "explorer_benchmark_night")
 with bench_tabs[3]:
-    st.plotly_chart(_policy_heatmap_figure(
+    _chart(_policy_heatmap_figure(
         benchmark_policy_rates(minimum_soc_policy, 0, soc_threshold=float(soc_threshold)),
         f"Minimum SoC — Parked  |  threshold = {soc_threshold:.1f} kWh",
-        time_bin, bat_bin), use_container_width=True)
+        time_bin, bat_bin), "explorer_benchmark_minimum_soc")
 with bench_tabs[4]:
-    st.plotly_chart(_policy_heatmap_figure(
+    _chart(_policy_heatmap_figure(
         benchmark_policy_rates(always_minimum_policy, 0),
-        "Always minimum rate — Parked", time_bin, bat_bin), use_container_width=True)
+        "Always minimum rate — Parked", time_bin, bat_bin), "explorer_benchmark_always_minimum")
 with bench_tabs[5]:
-    st.plotly_chart(_policy_heatmap_figure(
+    _chart(_policy_heatmap_figure(
         benchmark_policy_rates(dp_heuristic_policy, 0),
-        "DP heuristic — Parked", time_bin, bat_bin), use_container_width=True)
+        "DP heuristic — Parked", time_bin, bat_bin), "explorer_benchmark_dp_heuristic")
 
 # ── Charge rate vs price ──────────────────────────────────────────────────────
 
 st.subheader("Charge Rate vs. Price")
-st.plotly_chart(charge_vs_price_figure(float(low_threshold), float(high_threshold),
-                                       float(soc_threshold)), use_container_width=True)
+_chart(charge_vs_price_figure(float(low_threshold), float(high_threshold),
+                              float(soc_threshold)), "explorer_charge_vs_price")
+
+# ── Sample rollout ────────────────────────────────────────────────────────────
+
+st.subheader("Sample Rollout (Optimal Policy)")
+st.caption(
+    "One simulated trajectory under the optimal policy: the price path it faced, the resulting "
+    "battery SoC (driving periods shaded), and the charge rate. Shows what the policy actually does."
+)
+rollout_seed = st.number_input("Rollout seed", 0, 9999, 0, key="explorer_rollout_seed")
+_chart(rollout_trajectory_figure(int(rollout_seed)), "explorer_sample_rollout")
 
 # ── Input schedules ───────────────────────────────────────────────────────────
 
 st.subheader("Input Schedules")
 col1, col2 = st.columns(2)
 with col1:
-    st.plotly_chart(price_figure(), use_container_width=True)
+    _chart(price_figure(), "explorer_price_schedule")
 with col2:
-    st.plotly_chart(transition_figure(), use_container_width=True)
+    _chart(transition_figure(), "explorer_transition_schedule")

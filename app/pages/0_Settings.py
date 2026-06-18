@@ -87,7 +87,8 @@ with col1:
 with col2:
     st.subheader("Charging & Cost")
     eta_c = st.slider("Charging efficiency η_c", 0.50, 1.00, _DEFAULTS["eta_c"], 0.01, key="eta_c")
-    phi   = st.slider("Unserved-driving penalty φ (€/h)", 0.0, 5000.0, _DEFAULTS["phi"], 50.0, key="phi")
+    phi   = st.number_input("Unserved-driving penalty φ (€/h)", min_value=0.0, max_value=5000.0,
+                            value=_DEFAULTS["phi"], step=0.5, key="phi")
     beta  = st.slider("Discount factor β", 0.900, 1.000, _DEFAULTS["beta"], 0.001,
                       format="%.3f", key="beta")
 

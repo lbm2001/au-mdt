@@ -35,7 +35,7 @@ if is_negbin:
     from models.negative_binomial_trips import (
         mean_price,
         backward_induction_policy, maximal_charging_policy, price_oriented_policy,
-        night_charging_policy, minimum_soc_policy, always_minimum_policy, random_policy,
+        night_charging_policy, minimum_soc_policy, always_minimum_policy,
         dp_heuristic_policy,
     )
     from models.negative_binomial_trips import (
@@ -45,21 +45,34 @@ else:
     from models.baseline import (
         mean_price,
         backward_induction_policy, maximal_charging_policy, price_oriented_policy,
-        night_charging_policy, minimum_soc_policy, always_minimum_policy, random_policy,
+        night_charging_policy, minimum_soc_policy, always_minimum_policy,
         dp_heuristic_policy,
         generate_rollout_scenario, rollout_metrics, simulate_policy_rollout,
     )
 
-POLICY_COLORS = {
-    "Backward induction":   "steelblue",
-    "DP heuristic":         "teal",
-    "Maximal charging":     "seagreen",
-    "Price-oriented":     "crimson",
-    "Night charging":     "purple",
-    "Minimum SoC":        "darkorange",
-    "Always minimum":     "gray",
-    "Random":             "pink",
-}
+from utils.viz import POLICY_COLORS    # shared canonical colour map (7 policies)
+
+# Both mobility models' machinery, for the trip-duration comparison (independent of the
+# solved model). We sample mobility only (reusing the tested _next_state), skipping the
+# price path and charging cost — ~12× faster than a full rollout.
+from models.baseline import BaselineParams
+from models.negative_binomial_trips import NegBinParams
+from models.baseline.rollout import _next_state as _ns_base
+from models.negative_binomial_trips.rollout import _next_state as _ns_nb
+
+MOBILITY_COLORS = {"Baseline": "#4477AA", "NegBin (fixed k)": "#EE6677",
+                   "NegBin (Poisson k)": "#228833"}
+
+# Named colours used for non-policy bands (price/mobility) → "r,g,b".
+_CSS_RGB = {"orange": "255,165,0", "lightgray": "211,211,211"}
+
+
+def _rgba(color: str, alpha: float) -> str:
+    """rgba() string for a hex (#RRGGBB) or named colour, at the given opacity."""
+    if color.startswith("#"):
+        h = color.lstrip("#")
+        return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{alpha})"
+    return f"rgba({_CSS_RGB.get(color, '128,128,128')},{alpha})"
 
 # Read policy thresholds set in Policy Explorer (with sensible defaults)
 low_threshold  = float(st.session_state.get("benchmark_low_threshold",  params.price_night))
@@ -111,9 +124,6 @@ single_rollouts = {
         soc_threshold=soc_threshold),
     "Always minimum": simulate_policy_rollout(
         always_minimum_policy, scenario, float(e0), chi0_int, params),
-    "Random": simulate_policy_rollout(
-        random_policy, scenario, float(e0), chi0_int, params,
-        rng=np.random.default_rng(int(seed))),
 }
 
 hours        = np.arange(T) / 60
@@ -149,6 +159,12 @@ def sim_figure() -> go.Figure:
                              name="Driving state",
                              hovertemplate="Hour: %{x:.2f}<br>State: %{y}<extra></extra>"),
                   row=2, col=1)
+    # Label each trip (contiguous driving block) with its duration, on the mobility row.
+    _edges = np.diff(np.concatenate([[0], driving_traj, [0]]))
+    for _s, _e in zip(np.where(_edges == 1)[0], np.where(_edges == -1)[0]):
+        fig.add_annotation(x=(_s + _e) / 2 / 60, y=1.0, yshift=9,
+                           text=f"{_e - _s} min", showarrow=False,
+                           font=dict(size=8, color="#555"), row=2, col=1)
     fig.add_trace(go.Scatter(x=hours, y=lam_traj, mode="lines",
                              line=dict(color="lightgray", width=1.0, shape="hv"),
                              name="λ_t sampled"), row=4, col=1, secondary_y=False)
@@ -160,14 +176,14 @@ def sim_figure() -> go.Figure:
     fig.update_layout(height=1000, hovermode="x unified",
                       margin=dict(l=30, r=30, t=80, b=35))
     fig.update_xaxes(range=[0, T_hours], dtick=T_hours // 8)
-    fig.update_xaxes(title_text="Hour", row=4, col=1)
+    fig.update_xaxes(title_text="Hour (h)", row=4, col=1)
     fig.update_yaxes(title_text="Battery (kWh)",
                      range=[params.e_min - 0.5, params.e_max + 0.5], row=1, col=1)
     fig.update_yaxes(title_text="State", tickvals=[0, 1],
-                     ticktext=["Parked", "Driving"], row=2, col=1)
-    fig.update_yaxes(title_text="Charge rate (kW)",
+                     ticktext=["Parked", "Driving"], range=[-0.1, 1.35], row=2, col=1)
+    fig.update_yaxes(title_text="u (kW)",
                      range=[-0.2, params.u_max + 0.5], row=3, col=1)
-    fig.update_yaxes(title_text="€ / kWh", row=4, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="€/kWh", row=4, col=1, secondary_y=False)
     fig.update_yaxes(title_text="Cumulative cost (€)", row=4, col=1, secondary_y=True)
     return fig
 
@@ -195,47 +211,54 @@ st.divider()
 
 st.subheader("N-Scenario Policy Comparison")
 
-nd_col1, nd_col2, nd_col3, nd_col4 = st.columns(4)
+nd_col1, nd_col2, nd_col3 = st.columns(3)
 with nd_col1:
-    n_days = st.slider("Number of scenarios N", 10, 500, 100, 10, key="n_days")
+    n_days = st.slider("Number of scenarios N", 10, 500, 500, 10, key="n_days")
 with nd_col2:
-    nd_e0 = st.slider("Initial battery (kWh) ", float(params.e_min), float(params.e_max),
-                      float(params.e_max / 2), 0.5, key="nd_e0")
-with nd_col3:
     nd_chi0 = st.radio("Initial state ", ["Parked", "Driving"], horizontal=True, key="nd_chi0")
-with nd_col4:
+with nd_col3:
     nd_seed = st.number_input("Seed", min_value=0, max_value=9999, value=42, step=1, key="nd_seed")
+st.caption("Initial battery is randomised uniformly over [e_min, e_max] per scenario (seeded; "
+           "same start for all policies within a scenario).")
 
 nd_chi0_int = 0 if nd_chi0 == "Parked" else 1
 
-with st.spinner(f"Rolling out all policies over {n_days} scenarios…"):
-    rng_nd = np.random.default_rng(int(nd_seed))
-    nd_scenarios = [
-        generate_rollout_scenario(params, int(rng_nd.integers(0, 1_000_000)), horizon=T)
-        for _ in range(n_days)
-    ]
-    nd_rollouts: dict[str, list] = {name: [] for name in POLICY_COLORS}
-    for sc in nd_scenarios:
-        rng_rand = np.random.default_rng(int(rng_nd.integers(0, 1_000_000)))
-        nd_rollouts["Backward induction"].append(simulate_policy_rollout(
-            backward_induction_policy, sc, float(nd_e0), nd_chi0_int, params,
-            pi=pi, actions=actions, e_grid=e_grid))
-        nd_rollouts["DP heuristic"].append(simulate_policy_rollout(
-            dp_heuristic_policy, sc, float(nd_e0), nd_chi0_int, params))
-        nd_rollouts["Maximal charging"].append(simulate_policy_rollout(
-            maximal_charging_policy, sc, float(nd_e0), nd_chi0_int, params))
-        nd_rollouts["Price-oriented"].append(simulate_policy_rollout(
-            price_oriented_policy, sc, float(nd_e0), nd_chi0_int, params,
-            low_threshold=low_threshold, high_threshold=high_threshold))
-        nd_rollouts["Night charging"].append(simulate_policy_rollout(
-            night_charging_policy, sc, float(nd_e0), nd_chi0_int, params))
-        nd_rollouts["Minimum SoC"].append(simulate_policy_rollout(
-            minimum_soc_policy, sc, float(nd_e0), nd_chi0_int, params,
-            soc_threshold=soc_threshold))
-        nd_rollouts["Always minimum"].append(simulate_policy_rollout(
-            always_minimum_policy, sc, float(nd_e0), nd_chi0_int, params))
-        nd_rollouts["Random"].append(simulate_policy_rollout(
-            random_policy, sc, float(nd_e0), nd_chi0_int, params, rng=rng_rand))
+# Cache the rollouts so re-renders (e.g. toggling a plot option) don't recompute them.
+_nd_key = (n_days, nd_chi0_int, int(nd_seed),
+           low_threshold, high_threshold, soc_threshold, T, id(pi))
+if st.session_state.get("_nd_key") != _nd_key:
+    with st.spinner(f"Rolling out all policies over {n_days} scenarios…"):
+        rng_nd = np.random.default_rng(int(nd_seed))
+        nd_scenarios = [
+            generate_rollout_scenario(params, int(rng_nd.integers(0, 1_000_000)), horizon=T)
+            for _ in range(n_days)
+        ]
+        nd_rollouts = {name: [] for name in POLICY_COLORS}
+        for sc in nd_scenarios:
+            e0_i = float(rng_nd.uniform(params.e_min, params.e_max))   # random SoC per scenario
+            nd_rollouts["Backward induction"].append(simulate_policy_rollout(
+                backward_induction_policy, sc, e0_i, nd_chi0_int, params,
+                pi=pi, actions=actions, e_grid=e_grid))
+            nd_rollouts["DP heuristic"].append(simulate_policy_rollout(
+                dp_heuristic_policy, sc, e0_i, nd_chi0_int, params))
+            nd_rollouts["Maximal charging"].append(simulate_policy_rollout(
+                maximal_charging_policy, sc, e0_i, nd_chi0_int, params))
+            nd_rollouts["Price-oriented"].append(simulate_policy_rollout(
+                price_oriented_policy, sc, e0_i, nd_chi0_int, params,
+                low_threshold=low_threshold, high_threshold=high_threshold))
+            nd_rollouts["Night charging"].append(simulate_policy_rollout(
+                night_charging_policy, sc, e0_i, nd_chi0_int, params))
+            nd_rollouts["Minimum SoC"].append(simulate_policy_rollout(
+                minimum_soc_policy, sc, e0_i, nd_chi0_int, params,
+                soc_threshold=soc_threshold))
+            nd_rollouts["Always minimum"].append(simulate_policy_rollout(
+                always_minimum_policy, sc, e0_i, nd_chi0_int, params))
+    st.session_state["_nd_rollouts"]  = nd_rollouts
+    st.session_state["_nd_scenarios"] = nd_scenarios
+    st.session_state["_nd_key"]       = _nd_key
+
+nd_rollouts  = st.session_state["_nd_rollouts"]
+nd_scenarios = st.session_state["_nd_scenarios"]
 
 
 def _nd_stats(rollout_list: list) -> dict:
@@ -270,19 +293,161 @@ st.dataframe(
 )
 
 
-def cost_box_figure() -> go.Figure:
-    fig = go.Figure()
-    for name, rolls in nd_rollouts.items():
-        costs = [r["cost_traj"].sum() for r in rolls]
-        fig.add_trace(go.Box(y=costs, name=name, marker_color=POLICY_COLORS[name]))
-    fig.update_layout(
-        title=f"Cost distribution across {n_days} scenarios",
-        yaxis_title="Total cost (€)",
-        height=500,
-        margin=dict(l=30, r=30, t=55, b=35),
-        showlegend=False,
-    )
+def cost_bar_figure(error: str, log_y: bool) -> go.Figure:
+    """Mean total cost (incl. penalty) ± error per policy — matches the sensitivity page."""
+    names, means, errs = list(nd_rollouts), [], []
+    for name in names:
+        costs = np.array([r["cost_traj"].sum() for r in nd_rollouts[name]])
+        m  = len(costs)
+        sd = float(costs.std(ddof=1)) if m > 1 else 0.0
+        means.append(float(costs.mean()))
+        errs.append(sd / np.sqrt(m) if (error == "sem" and m > 0) else sd)
+    minus = [min(e, mu) for mu, e in zip(means, errs)]   # cost ≥ 0 → don't dip below 0
+    fig = go.Figure(go.Bar(
+        x=names, y=means, marker_color=[POLICY_COLORS[n] for n in names],
+        error_y=dict(type="data", symmetric=False, array=errs, arrayminus=minus,
+                     visible=True, thickness=1.2, width=4),
+    ))
+    yaxis = dict(title="Mean total cost incl. penalty (€)" + ("  [log]" if log_y else ""),
+                 type="log" if log_y else "linear")
+    if log_y:
+        yaxis["dtick"] = 1
+    fig.update_layout(yaxis=yaxis, xaxis_title="Policy", height=460,
+                      margin=dict(l=40, r=20, t=20, b=110), showlegend=False)
+    fig.update_xaxes(categoryorder="total ascending")   # order policies by total cost
     return fig
 
 
-st.plotly_chart(cost_box_figure(), use_container_width=True)
+st.subheader("Mean cost")
+st.caption("Mean total cost per scenario — **including the unserved-driving penalty** — "
+           "one bar per policy. SEM = uncertainty of the mean (std/√N); Std = spread across "
+           "scenarios. Lower bar clamped at 0.")
+cc1, cc2 = st.columns(2)
+with cc1:
+    nd_cost_axis = st.radio("Cost axis", ["Log", "Linear"], horizontal=True, key="nd_cost_axis")
+with cc2:
+    nd_err = st.radio("Error bars", ["SEM", "Std"], horizontal=True, key="nd_cost_err")
+st.plotly_chart(cost_bar_figure(nd_err.lower(), nd_cost_axis == "Log"), use_container_width=True)
+
+
+def mean_trajectory_figure() -> go.Figure:
+    """Scenario-averaged trajectories vs time: price, mobility, and per-policy charge rate."""
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+        subplot_titles=("Mean price λ_t (± SEM)",
+                        "Mean mobility — 0 parked, 1 driving (± SEM)",
+                        "Mean charge rate u per policy (± SEM)"),
+    )
+
+    def band(mean, half, color, name, row, legend=False):
+        fill = _rgba(color, 0.12)
+        fig.add_trace(go.Scatter(x=hours, y=mean + half, mode="lines", line=dict(width=0),
+                                 showlegend=False, hoverinfo="skip", legendgroup=name),
+                      row=row, col=1)
+        fig.add_trace(go.Scatter(x=hours, y=mean - half, mode="lines", line=dict(width=0),
+                                 fill="tonexty", fillcolor=fill, showlegend=False,
+                                 hoverinfo="skip", legendgroup=name), row=row, col=1)
+        fig.add_trace(go.Scatter(x=hours, y=mean, mode="lines", line=dict(color=color, width=1.6),
+                                 name=name, legendgroup=name, showlegend=legend), row=row, col=1)
+
+    P = np.array([sc["lam_path"] for sc in nd_scenarios])                       # (N, T)
+    n_scen = max(P.shape[0], 1)
+    sem = lambda a: a.std(axis=0) / np.sqrt(n_scen)    # ±1 standard error of the mean
+    band(P.mean(0), sem(P), "lightgray", "λ_t", row=1)
+    # mobility is policy-independent → take it from any policy's rollouts
+    Mob = np.array([(r["chi_traj"] > 0).astype(float)
+                    for r in nd_rollouts["Backward induction"]])               # (N, T)
+    band(Mob.mean(0), sem(Mob), "orange", "driving", row=2)
+    for name, rolls in nd_rollouts.items():
+        U = np.array([r["u_traj"] for r in rolls])                             # (N, T)
+        band(U.mean(0), sem(U), POLICY_COLORS[name], name, row=3, legend=True)
+
+    fig.update_layout(height=900, hovermode="x unified",
+                      margin=dict(l=40, r=30, t=60, b=40),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    fig.update_xaxes(range=[0, T_hours], dtick=T_hours // 8)
+    fig.update_xaxes(title_text="Hour (h)", row=3, col=1)
+    fig.update_yaxes(title_text="€/kWh", row=1, col=1)
+    fig.update_yaxes(title_text="Fraction driving", tickvals=[0, 0.5, 1], row=2, col=1)
+    fig.update_yaxes(title_text="u (kW)", range=[-0.2, params.u_max + 0.5], row=3, col=1)
+    return fig
+
+
+st.subheader("Mean trajectories across scenarios")
+st.caption("Averaged over the N scenarios at each minute, with ±1 SEM bands (std/√N, faint) — "
+           "the uncertainty of the mean. Charge-rate bands collapse to ~0 where a policy is deterministic.")
+st.plotly_chart(mean_trajectory_figure(), use_container_width=True)
+
+st.divider()
+
+# ── Trip-duration distribution by mobility model ──────────────────────────────
+
+st.subheader("Trip-duration distribution by mobility model")
+st.caption("Samples each mobility model's trips (default params; independent of the solved "
+           "policy). Baseline → geometric (decaying); NegBin → peaked; Poisson-k → wider.")
+
+
+@st.cache_data(show_spinner="Sampling trip durations…")
+def _compute_trip_durations(n_scen: int = 10000, horizon: int = 1440, seed: int = 0):
+    """Driving-spell lengths (minutes) per mobility model, from simulated mobility."""
+    def _kmax(lam, q=0.999):
+        import math
+        pmf, cdf, k = math.exp(-lam), math.exp(-lam), 0
+        while cdf < q:
+            k += 1; pmf *= lam / k; cdf += pmf
+        return max(k, 1)
+
+    specs = {
+        "Baseline":            (BaselineParams(),                          _ns_base),
+        "NegBin (fixed k)":    (NegBinParams(),                            _ns_nb),
+        "NegBin (Poisson k)":  (NegBinParams(lambda_k=5.0, k=_kmax(5.0)),  _ns_nb),
+    }
+    out = {}
+    for name, (p, next_state) in specs.items():
+        durs = []
+        for i in range(n_scen):
+            rng = np.random.default_rng(seed + i)
+            sc  = {"mobility_draws": rng.random(horizon), "phase_draws": rng.random(horizon)}
+            chi = np.empty(horizon, dtype=int)
+            c = 0
+            for t in range(horizon):
+                chi[t] = c
+                c = next_state(c, sc, t, p)
+            d  = (chi > 0).astype(int)
+            ed = np.diff(np.concatenate([[0], d, [0]]))
+            durs.extend((np.where(ed == -1)[0] - np.where(ed == 1)[0]).tolist())
+        out[name] = np.asarray(durs, dtype=float)
+    return out
+
+
+def trip_duration_figure(durs: dict) -> go.Figure:
+    cap   = int(np.ceil(max((np.percentile(d, 99) for d in durs.values() if len(d)), default=30)))
+    edges = np.arange(0, cap + 2, 2)
+    ctr   = (edges[:-1] + edges[1:]) / 2
+    tgrid = np.arange(0, cap + 1)
+    fig = make_subplots(rows=1, cols=2)
+    for name, d in durs.items():
+        col = MOBILITY_COLORS[name]
+        dens, _ = np.histogram(d, bins=edges, density=True)
+        fig.add_trace(go.Scatter(x=ctr, y=dens, mode="lines",
+                                 line=dict(color=col, width=2, shape="spline"),
+                                 name=name, legendgroup=name),
+                      row=1, col=1)
+        surv = np.array([float((d > t).mean()) for t in tgrid])
+        fig.add_trace(go.Scatter(x=tgrid, y=surv, mode="lines", line=dict(color=col, width=2),
+                                 name=name, legendgroup=name, showlegend=False), row=1, col=2)
+    fig.update_xaxes(title_text="Trip duration (min)", row=1, col=1)
+    fig.update_xaxes(title_text="Trip duration (min)", row=1, col=2)
+    fig.update_yaxes(title_text="Density", row=1, col=1)
+    fig.update_yaxes(title_text="P(duration > t)", type="log", row=1, col=2)
+    fig.update_layout(height=420, margin=dict(l=40, r=20, t=60, b=40),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.06))
+    return fig
+
+
+st.plotly_chart(
+    trip_duration_figure(_compute_trip_durations()),
+    use_container_width=True,
+    config={"displaylogo": False,
+            "toImageButtonOptions": {"format": "png", "filename": "trip_duration_by_model", "scale": 4}},
+)

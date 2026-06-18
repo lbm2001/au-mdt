@@ -37,7 +37,7 @@ class SharedParams:
 
     # ── Price discretisation ──────────────────────────────────────────────────
     K: int = 100
-    lambda_max: float = 0.30  # wholesale range (covers ~99% of normal-market DK1 prices)
+    lambda_max: float = 0.25  # max_t price + 4*sigma_lambda (covers ~99.6% of normal-market DK1 prices)
 
     # ── Fixed conversion factor ───────────────────────────────────────────────
     omega: float = 1 / 60

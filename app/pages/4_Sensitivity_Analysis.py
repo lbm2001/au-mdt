@@ -15,8 +15,8 @@ Mobility model (sidebar selector, applies to every sweep):
   • NegBin (sampled k) — k ~ Poisson(λ_k) drawn at each trip start
 
 Four independent sweep dimensions (one at a time, others held at baseline):
-  1. Pricing model  — Gaussian parametric · Gaussian bins · GMM · MDN
-  2. Penalty φ      — {0,100,500,1000,2000,5000,10 000} €/h
+  1. Pricing model  — Gaussian parametric · Gaussian Bins · GMM · MDN
+  2. Penalty        — {0,100,500,1000,2000,5000,10 000} €/h
   3. Horizon T      — {24 h, 48 h, 168 h}
   4. Season × Day type — all 8 combinations of {winter,spring,summer,autumn} × {weekday,weekend}
 
@@ -201,7 +201,7 @@ def _run_rollouts(pi, actions, e_grid, params, scenarios: list, rollout_fn, pbp_
         ("Always-Minimum",   always_minimum_policy,    {}),
         ("Price-Oriented",   price_oriented_policy,
          {"low_threshold": params.price_night, "high_threshold": params.price_evening}),
-        ("Minimum-Charge",      minimum_soc_policy,       {"soc_threshold": params.e_max * 0.25}),
+        ("Minimum Battery Level", minimum_soc_policy,       {"soc_threshold": params.e_max * 0.25}),
     ]
 
     results: dict[str, list] = {p: [] for p in POLICY_ORDER}
@@ -312,7 +312,7 @@ def _gbins_step(label: str, sampler, season: str, is_weekend: bool,
 
 def sweep_pricing_season(sampler, N_rollouts: int, N_e: int, seed: int,
                          progress_cb=None) -> list[dict]:
-    """Gaussian bins (crisis-excluded): vary season, held at weekday."""
+    """Gaussian Bins (crisis-excluded): vary season, held at weekday."""
     seasons = ["winter", "spring", "summer", "autumn"]
     results = []
     for i, s in enumerate(seasons):
@@ -326,7 +326,7 @@ def sweep_pricing_season(sampler, N_rollouts: int, N_e: int, seed: int,
 
 def sweep_pricing_daytype(sampler, N_rollouts: int, N_e: int, seed: int,
                           progress_cb=None) -> list[dict]:
-    """Gaussian bins (crisis-excluded): vary weekday/weekend, held at spring."""
+    """Gaussian Bins (crisis-excluded): vary weekday/weekend, held at spring."""
     combos = [("Weekday", False), ("Weekend", True)]
     results = []
     for i, (label, we) in enumerate(combos):
@@ -340,7 +340,7 @@ def sweep_pricing_daytype(sampler, N_rollouts: int, N_e: int, seed: int,
 
 def sweep_pricing_crisis(sampler_excl, sampler_incl, N_rollouts: int, N_e: int, seed: int,
                          progress_cb=None) -> list[dict]:
-    """Gaussian bins: vary crisis inclusion, held at spring + weekday."""
+    """Gaussian Bins: vary crisis inclusion, held at spring + weekday."""
     items = [("Excluding crisis", sampler_excl), ("Including crisis", sampler_incl)]
     results = []
     for i, (label, sampler) in enumerate(items):
@@ -354,7 +354,7 @@ def sweep_pricing_crisis(sampler_excl, sampler_incl, N_rollouts: int, N_e: int, 
 
 def sweep_pricing_model(samplers: dict, N_rollouts: int, N_e: int, seed: int,
                         progress_cb=None) -> list[dict]:
-    """Vary the price model (Gaussian bins / GMM / MDN), held at spring · weekday · crisis-excluded.
+    """Vary the price model (Gaussian Bins / GMM / MDN), held at spring · weekday · crisis-excluded.
 
     `samplers` maps a model label to a fitted sampler; each drives its own sampled price world.
     """
@@ -383,7 +383,7 @@ def sweep_penalty(
         params = _build_params(model_label, phi=float(phi))
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         result = _run_sweep_step(
-            model_label, f"φ={phi}", params, pbp_fn, T=24 * 60, N_e=N_e,
+            model_label, f"{phi} €/h", params, pbp_fn, T=24 * 60, N_e=N_e,
             N_rollouts=N_rollouts, seed=seed,
         )
         results.append(result)
@@ -665,7 +665,7 @@ def _get_gbins(exclude_crisis: bool) -> GaussianBinnedSampler:
 
 
 _PRICE_MODEL_CLASSES = {
-    "Gaussian bins": GaussianBinnedSampler,
+    "Gaussian Bins": GaussianBinnedSampler,
     "GMM":           GMMSampler,
     "MDN":           MDNSampler,
 }
@@ -673,7 +673,7 @@ _PRICE_MODEL_CLASSES = {
 
 def _get_price_model(model_name: str):
     """Fitted price sampler of the given type (crisis-excluded data, baseline context), cached."""
-    if model_name == "Gaussian bins":
+    if model_name == "Gaussian Bins":
         return _get_gbins(exclude_crisis=True)   # reuse the already-cached bins fit
     key = f"sa_pmodel_{model_name}"
     if key not in st.session_state:
@@ -744,7 +744,7 @@ def _run_rollouts_full(pi, actions, e_grid, params, scenarios, rollout_fn, pbp_f
         ("Always-Minimum",   always_minimum_policy,    {}),
         ("Price-Oriented",   price_oriented_policy,
          {"low_threshold": params.price_night, "high_threshold": params.price_evening}),
-        ("Minimum-Charge",      minimum_soc_policy,       {"soc_threshold": params.e_max * 0.25}),
+        ("Minimum Battery Level", minimum_soc_policy,       {"soc_threshold": params.e_max * 0.25}),
     ]
     out: dict[str, list] = {p: [] for p in POLICY_ORDER}
     for sc in scenarios:
@@ -779,14 +779,13 @@ def _baseline_cost_fig(full: dict) -> go.Figure:
 
 
 def _baseline_traj_fig(full: dict, scenarios: list, T: int, params) -> go.Figure:
-    """Scenario-averaged trajectories: price, mobility, per-policy charge rate (±SEM bands)."""
+    """Scenario-averaged trajectories: price and mobility (±SEM bands)."""
     hours, T_hours = np.arange(T) / 60, T // 60
     n = max(len(scenarios), 1)
     sem = lambda a: a.std(axis=0) / np.sqrt(n)
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-                        subplot_titles=("Mean price λ̄<sub>t</sub>",
-                                        "Mean mobility — 0 parked, 1 driving",
-                                        "Mean charge rate u per policy"))
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                        subplot_titles=("Mean price",
+                                        "Mean mobility (0 parked, 1 driving)"))
 
     def band(mean, half, color, name, row, legend=False):
         fill = _rgba(color, 0.12)
@@ -802,17 +801,13 @@ def _baseline_traj_fig(full: dict, scenarios: list, T: int, params) -> go.Figure
     band(P.mean(0), sem(P), "lightgray", "λ̄<sub>t</sub>", row=1)
     Mob = np.array([(r["chi_traj"] > 0).astype(float) for r in full["Backward Induction"]])
     band(Mob.mean(0), sem(Mob), "orange", "driving", row=2)
-    for name, rolls in full.items():
-        U = np.array([r["u_traj"] for r in rolls])
-        band(U.mean(0), sem(U), POLICY_COLORS[name], name, row=3, legend=True)
 
-    fig.update_layout(height=900, margin=dict(l=40, r=30, t=60, b=40),
+    fig.update_layout(height=620, margin=dict(l=40, r=30, t=60, b=40),
                       legend=dict(orientation="h", yanchor="bottom", y=1.02))
     fig.update_xaxes(range=[0, T_hours], dtick=max(T_hours // 8, 1))
-    fig.update_xaxes(title_text="Hour (h)", row=3, col=1)
+    fig.update_xaxes(title_text="Hour (h)", row=2, col=1)
     fig.update_yaxes(title_text="€/kWh", row=1, col=1)
     fig.update_yaxes(title_text="Fraction driving", tickvals=[0, 0.5, 1], row=2, col=1)
-    fig.update_yaxes(title_text="u (kW)", range=[-0.2, params.u_max + 0.5], row=3, col=1)
     return fig
 
 
@@ -849,31 +844,6 @@ def _sweep_export_ids(key: str) -> list[str]:
     """Export figure IDs for one computed sweep."""
     return [f"sweep:{key}:{name}" for name in ("policy_heatmaps", "charge_border", "cost")]
 
-
-def _auto_download_png(filename: str, data: bytes, token: str) -> None:
-    """Ask the browser to download one PNG immediately, with no extra user click.
-
-    Browsers may block repeated automatic downloads until the user allows them for the app.
-    The sidebar also keeps fallback download buttons for completed run-all exports.
-    """
-    import base64
-    import html
-    import re
-
-    element_id = "sa_dl_" + re.sub(r"[^A-Za-z0-9_-]", "_", token)
-    safe_filename = html.escape(filename, quote=True)
-    b64 = base64.b64encode(data).decode("ascii")
-    components.html(
-        f"""
-        <a id="{element_id}" download="{safe_filename}" href="data:image/png;base64,{b64}"></a>
-        <script>
-        const link = document.getElementById("{element_id}");
-        if (link) link.click();
-        </script>
-        """,
-        height=0,
-        width=0,
-    )
 
 
 def _available_export_figures() -> list[dict]:
@@ -955,7 +925,7 @@ SWEEP_AXIS_LABEL = {
     "pricing_season":    "Season",
     "pricing_daytype":   "Day type",
     "pricing_crisis":    "Energy-crisis data",
-    "penalty":           "Penalty φ (€/h)",
+    "penalty":           "Penalty (€/h)",
     "beta":              "Discount factor β",
     "horizon":           "Horizon T (h)",
     "departure_profile": "Departure profile",
@@ -1032,8 +1002,8 @@ years. Negative wholesale prices (~2.6% of hours) are floored to 0.
 > comparison — read each model's sweeps on their own.
 
 **Four independent sweep dimensions** (others held at baseline):
-1. **Pricing model** — Gaussian parametric · Gaussian bins · GMM · MDN
-2. **Penalty φ** — {0, 100, 500, 1000, 2000, 5000, 10 000} €/h
+1. **Pricing model** — Gaussian parametric · Gaussian Bins · GMM · MDN
+2. **Penalty** — {0, 100, 500, 1000, 2000, 5000, 10 000} €/h
 3. **Horizon T** — {24 h, 48 h, 168 h}
 4. **Season × Day type** — all 8 combinations of {winter, spring, summer, autumn} × {weekday, weekend}
 
@@ -1094,7 +1064,7 @@ if st.session_state.pop("sa_run_all_triggered", False):
     _steps = [
         ("Pricing · model",     "sa_pricing_model_results",
          lambda cb: sweep_pricing_model(
-             {m: _get_price_model(m) for m in ("Gaussian bins", "GMM", "MDN")},
+             {m: _get_price_model(m) for m in ("Gaussian Bins", "GMM", "MDN")},
              N_rollouts, N_e, seed, cb)),
         ("Pricing · season",    "sa_pricing_season_results",
          lambda cb: sweep_pricing_season(_s_excl, N_rollouts, N_e, seed, cb)),
@@ -1165,26 +1135,26 @@ if st.session_state.pop("sa_run_all_triggered", False):
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
 tab_price, tab_phi, tab_beta, tab_T, tab_departure, tab_mobility = st.tabs(
-    ["Pricing Model", "Penalty φ", "Discount β", "Horizon T", "Departure Profile", "Mobility Model"]
+    ["Pricing Model", "Penalty", "Discount β", "Horizon T", "Departure Profile", "Mobility Model"]
 )
 
-# ─── Tab 1: Pricing model (Gaussian bins, real data) ──────────────────────────
+# ─── Tab 1: Pricing model (Gaussian Bins, real data) ──────────────────────────
 with tab_price:
     st.markdown(
         "Real-data pricing on ENTSO-E DK1 data. Four sub-sweeps vary one factor at a time; the "
-        "others are held at baseline (Gaussian bins · spring · weekday · crisis-excluded). "
+        "others are held at baseline (Gaussian Bins · spring · weekday · crisis-excluded). "
         "All use the Baseline mobility model."
     )
     sub_model, sub_season, sub_daytype, sub_crisis = st.tabs(
         ["Pricing model", "Season", "Weekday/Weekend", "Energy crisis"])
 
     with sub_model:
-        st.caption("Vary the price model (Gaussian bins · GMM · MDN) — held at spring · weekday · "
+        st.caption("Vary the price model (Gaussian Bins · GMM · MDN) — held at spring · weekday · "
                    "crisis-excluded. Each model is fitted on the same ENTSO-E data and drives its "
                    "own sampled price world. (MDN fitting trains a neural net — first run is slower.)")
         if st.button("Run pricing-model sweep", key="sa_run_pmodel"):
             st.session_state.pop("sa_pricing_model_results", None)
-            samplers = {m: _get_price_model(m) for m in ("Gaussian bins", "GMM", "MDN")}
+            samplers = {m: _get_price_model(m) for m in ("Gaussian Bins", "GMM", "MDN")}
             bar = st.progress(0.0, text="Starting…")
             with st.spinner("Running pricing-model sweep…"):
                 st.session_state["sa_pricing_model_results"] = sweep_pricing_model(
@@ -1246,7 +1216,7 @@ with tab_price:
         else:
             st.info("Click **Run energy-crisis sweep** to compute results.")
 
-# ─── Tab 2: Penalty φ ─────────────────────────────────────────────────────────
+# ─── Tab 2: Penalty ───────────────────────────────────────────────────────────
 with tab_phi:
     st.markdown(
         f"Sweeps the unserved-driving penalty φ ∈ {PHI_VALUES} €/h over a 24 h horizon.  "

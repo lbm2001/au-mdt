@@ -7,7 +7,7 @@ POLICY_ORDER = [
     "Price-Oriented",
     "Night Charging",
     "Always-Maximum",
-    "Minimum-Charge",
+    "Minimum Battery Level",
     "Always-Minimum",
 ]
 
@@ -19,6 +19,6 @@ POLICY_COLORS = {
     "Price-Oriented":     "#EE6677",
     "Night Charging":     "#AA3377",
     "Always-Maximum":   "#228833",
-    "Minimum-Charge":     "#EE7733",
+    "Minimum Battery Level": "#EE7733",
     "Always-Minimum":     "#BBBBBB",
 }

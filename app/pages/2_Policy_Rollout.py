@@ -112,7 +112,7 @@ single_rollouts = {
         low_threshold=low_threshold, high_threshold=high_threshold),
     "Night Charging": simulate_policy_rollout(
         night_charging_policy, scenario, float(e0), chi0_int, params),
-    "Minimum-Charge": simulate_policy_rollout(
+    "Minimum Battery Level": simulate_policy_rollout(
         minimum_soc_policy, scenario, float(e0), chi0_int, params,
         soc_threshold=soc_threshold),
     "Always-Minimum": simulate_policy_rollout(
@@ -170,7 +170,7 @@ if st.session_state.get("_nd_key") != _nd_key:
                 low_threshold=low_threshold, high_threshold=high_threshold))
             nd_rollouts["Night Charging"].append(simulate_policy_rollout(
                 night_charging_policy, sc, e0_i, nd_chi0_int, params))
-            nd_rollouts["Minimum-Charge"].append(simulate_policy_rollout(
+            nd_rollouts["Minimum Battery Level"].append(simulate_policy_rollout(
                 minimum_soc_policy, sc, e0_i, nd_chi0_int, params,
                 soc_threshold=soc_threshold))
             nd_rollouts["Always-Minimum"].append(simulate_policy_rollout(
@@ -256,8 +256,8 @@ def mean_trajectory_figure() -> go.Figure:
     """Scenario-averaged trajectories vs time: price and mobility (shared across policies)."""
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-        subplot_titles=("Mean price λ̄<sub>t</sub>",
-                        "Mean mobility — 0 parked, 1 driving"),
+        subplot_titles=("Mean price",
+                        "Mean mobility (0 parked, 1 driving)"),
     )
 
     def band(mean, half, color, name, row):

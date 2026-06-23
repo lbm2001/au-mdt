@@ -12,7 +12,7 @@ st.caption("Adjust all model parameters here, then click **Run Backward Inductio
 # ── Model selector ────────────────────────────────────────────────────────────
 
 def _on_model_change():
-    _sampler_keys = ["price_sampler_Gaussian bins", "price_sampler_GMM", "price_sampler_MDN"]
+    _sampler_keys = ["price_sampler_Gaussian Bins", "price_sampler_GMM", "price_sampler_MDN"]
     for key in ["V", "pi", "actions", "e_grid", "lam_grid", "params", "T"] + _sampler_keys:
         st.session_state.pop(key, None)
 
@@ -95,12 +95,12 @@ with col2:
     st.subheader("Electricity Price")
     price_source = st.radio(
         "Price source",
-        ["Gaussian (parametric)", "Gaussian bins", "GMM", "MDN"],
+        ["Gaussian (parametric)", "Gaussian Bins", "GMM", "MDN"],
         key="price_source",
         horizontal=True,
         help=(
             "**Gaussian (parametric)**: manual time-of-day mean prices. "
-            "**Gaussian bins / GMM**: per-(weekend, hour, season) bin fitted from ENTSO-E data. "
+            "**Gaussian Bins / GMM**: per-(weekend, hour, season) bin fitted from ENTSO-E data. "
             "**MDN**: single neural network conditioned on context, trained on all data jointly."
         ),
     )
@@ -302,7 +302,7 @@ if run_btn:
         )
 
         _sampler_classes = {
-            "Gaussian bins": GaussianBinnedSampler,
+            "Gaussian Bins": GaussianBinnedSampler,
             "GMM": GMMSampler,
             "MDN": MDNSampler,
         }

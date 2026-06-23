@@ -1,12 +1,2 @@
-from dataclasses import dataclass
-
-from models.params import SharedParams
-
-
-@dataclass
-class BaselineParams(SharedParams):
-    # ── Driving → Parked return probabilities (per minute) ────────────────────
-    p_dp_morning: float = 0.05   # 07:30 – 09:30
-    p_dp_lunch: float = 0.1     # 12:15 – 14:15
-    p_dp_evening: float = 0.05   # 16:30 – 18:30
-    p_dp_default: float = 0.1   # all other times
+# Thin shim — re-exports from ev_mdt.params.
+from ev_mdt.params import BaselineParams  # noqa: F401

@@ -32,11 +32,11 @@ HOURS = np.arange(T) / 60
 
 # ── Model-specific imports ────────────────────────────────────────────────────
 
-from models.model_utils import price_bin_probs
-from utils.viz import POLICY_COLORS    # shared canonical colour map
+from ev_mdt.models.common.model_utils import price_bin_probs
+from ev_mdt.plots.viz import POLICY_COLORS
 
 if is_negbin:
-    from models.negative_binomial_trips import (
+    from ev_mdt.models.negbin import (
         mean_price, transition_probs, p_pd,
         maximal_charging_policy, price_oriented_policy,
         night_charging_policy, minimum_soc_policy, always_minimum_policy,
@@ -44,7 +44,7 @@ if is_negbin:
         simulate_policy_rollout, generate_rollout_scenario,
     )
 else:
-    from models.baseline import (
+    from ev_mdt.models.baseline import (
         mean_price, transition_probs,
         maximal_charging_policy, price_oriented_policy,
         night_charging_policy, minimum_soc_policy, always_minimum_policy,

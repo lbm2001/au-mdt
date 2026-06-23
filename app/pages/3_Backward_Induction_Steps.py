@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from models.baseline import mean_price, transition_probs, consumption, price_bin_probs
+from ev_mdt.models.baseline import mean_price, transition_probs, consumption, price_bin_probs
 
 st.set_page_config(page_title="Backward Induction — EV Charging MDP", layout="wide")
 st.title("Backward Induction — Step-by-Step Verification")

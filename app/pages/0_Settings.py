@@ -31,10 +31,8 @@ is_negbin = "NegBin" in model
 
 # ── Defaults (single source of truth: the dataclass defaults) ────────────────
 
-from models.params import SharedParams as _SP
-from models.baseline.params import BaselineParams as _BP
-from models.negative_binomial_trips.params import NegBinParams as _NP
-from models.solver_config import N_e as _N_E, T_hours as _T_HOURS
+from ev_mdt.params import SharedParams as _SP, BaselineParams as _BP, NegBinParams as _NP
+from ev_mdt.params import N_e as _N_E, T_hours as _T_HOURS
 
 _sp, _bp, _np = _SP(), _BP(), _NP()
 _DEFAULTS = dict(
@@ -356,22 +354,23 @@ if run_btn:
                     st.session_state[_cache_key] = _sampler.fit(_df, _progress=_fit_progress)
                 _fit_status.update(label=f"{price_source} model ready.", state="complete", expanded=False)
 
-        from models.params import SharedParams as _SP
+        from ev_mdt.params import SharedParams as _SP
         _sp_tmp = _SP(**{k: v for k, v in common_kwargs.items() if k in _SP.__dataclass_fields__})
         _pbp_fn = make_price_bin_probs_fn(st.session_state[_cache_key], _sp_tmp, price_season, price_is_weekend)
 
     if is_negbin:
-        from models.negative_binomial_trips import NegBinParams
-        from models.negative_binomial_trips.backward_induction import backward_induction as _bi
+        from ev_mdt.params import NegBinParams
+        from ev_mdt.models.negbin.backward_induction import backward_induction as _bi
         params = NegBinParams(**common_kwargs, k=int(nb_k), q=float(nb_q),
                               lambda_k=float(nb_lambda_k) if nb_lambda_k is not None else None)
         mode_label = f"λ_k={nb_lambda_k:.1f}" if nb_lambda_k is not None else f"k={nb_k}"
         with st.spinner(f"Running backward induction (NegBin {mode_label}, q={nb_q:.2f}, T={T} min, N_e={N_e})…"):
             V, pi, actions, e_grid, lam_grid = _bi(params, price_bin_probs_fn=_pbp_fn, T=T, N_e=N_e, N_a=N_a)
     else:
-        from models.baseline import BaselineParams, transition_probs, consumption
-        from models.model_utils import price_bin_probs as _gaussian_pbp
-        from utils.backward_induction import backward_induction as _bi
+        from ev_mdt.params import BaselineParams
+        from ev_mdt.models.baseline.model import transition_probs
+        from ev_mdt.models.common.model_utils import consumption, price_bin_probs as _gaussian_pbp
+        from ev_mdt.models.baseline.backward_induction import backward_induction as _bi
         params = BaselineParams(
             **common_kwargs,
             p_dp_morning=p_dp_morning, p_dp_lunch=p_dp_lunch,

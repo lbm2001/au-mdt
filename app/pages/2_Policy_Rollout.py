@@ -32,17 +32,15 @@ is_negbin = st.session_state.get("solved_model", "").startswith("NegBin")
 # ── Model-specific imports ────────────────────────────────────────────────────
 
 if is_negbin:
-    from models.negative_binomial_trips import (
+    from ev_mdt.models.negbin import (
         mean_price,
         backward_induction_policy, maximal_charging_policy, price_oriented_policy,
         night_charging_policy, minimum_soc_policy, always_minimum_policy,
         dp_heuristic_policy,
-    )
-    from models.negative_binomial_trips import (
         generate_rollout_scenario, rollout_metrics, simulate_policy_rollout,
     )
 else:
-    from models.baseline import (
+    from ev_mdt.models.baseline import (
         mean_price,
         backward_induction_policy, maximal_charging_policy, price_oriented_policy,
         night_charging_policy, minimum_soc_policy, always_minimum_policy,
@@ -50,11 +48,8 @@ else:
         generate_rollout_scenario, rollout_metrics, simulate_policy_rollout,
     )
 
-from utils.viz import POLICY_COLORS, POLICY_ORDER    # shared canonical colours + order
-
-# Trip-duration comparison across the three mobility models (shared with the
-# Sensitivity figure-ZIP builder so both render the identical chart).
-from utils.trip_duration import compute_trip_durations, trip_duration_figure
+from ev_mdt.plots.viz import POLICY_COLORS, POLICY_ORDER
+from ev_mdt.plots.trip_duration import compute_trip_durations, trip_duration_figure
 
 # Named colours used for non-policy bands (price/mobility) → "r,g,b".
 _CSS_RGB = {"orange": "255,165,0", "lightgray": "211,211,211"}

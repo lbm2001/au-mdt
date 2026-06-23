@@ -107,7 +107,13 @@ def fig_heatmap_grid(results: list[dict], ncols: int = 1, time_bin_min: int = 1,
                          title_standoff=12, showticklabels=(row == rows), row=row, col=col)
         fig.update_yaxes(title_text="Battery (kWh)" if col == 1 else "",
                          title_standoff=16, row=row, col=col)
-    fig.update_layout(height=280 * rows + 70, margin=dict(l=70, r=60, t=55, b=50))
+    fig.update_layout(
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=280 * rows + 70, 
+        margin=dict(l=70, r=60, t=55, b=50)
+        )
     for ann in fig.layout.annotations:
         ann.yshift = 10
     return fig
@@ -143,7 +149,13 @@ def fig_charge_boundary_grid(results: list[dict]) -> go.Figure:
                     colorbar=dict(title="Hour", x=1.01)),
         showlegend=False, hoverinfo="skip",
     ), row=1, col=1)
-    fig.update_layout(height=350 * rows + 60, margin=dict(l=60, r=60, t=40, b=60))
+    fig.update_layout(
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=350 * rows + 60, 
+        margin=dict(l=60, r=60, t=40, b=60)
+    )
     return fig
 
 
@@ -172,9 +184,14 @@ def fig_cost_distribution(results: list[dict], log_y: bool = True,
     if log_y:
         yaxis["dtick"] = 1
     fig.update_layout(
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
         barmode="group", yaxis=yaxis, height=440,
         margin=dict(l=80, r=20, t=40, b=40),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        # Compact single-row legend: 7 policies fit one line at this font size.
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
+                    font=dict(size=11), itemsizing="constant"),
     )
     return fig
 
@@ -183,12 +200,11 @@ def fig_cost_distribution(results: list[dict], log_y: bool = True,
 # Swept value / Policy identifier columns). Used for display formatting.
 SUMMARY_METRIC_FORMATS = {
     "Mean cost (€)":             "{:.3f}",
+    "SEM cost (€)":              "{:.3f}",
     "Std cost (€)":              "{:.3f}",
-    "Median cost (€)":           "{:.3f}",
     "Mean penalty min":          "{:.1f}",
     "% scenarios with penalty":  "{:.1f}%",
     "Mean energy charged (kWh)": "{:.2f}",
-    "Mean final battery (kWh)":  "{:.2f}",
 }
 
 
@@ -201,18 +217,17 @@ def build_summary_df(results: list[dict]) -> pd.DataFrame:
             costs   = np.array([m["Total cost (€)"]      for m in mlist])
             pen     = np.array([m["Penalty minutes"]      for m in mlist])
             energy  = np.array([m["Energy charged (kWh)"] for m in mlist])
-            final_e = np.array([m["Final battery (kWh)"]  for m in mlist])
-            n = len(costs)
+            n  = len(costs)
+            sd = float(costs.std(ddof=1)) if n > 1 else 0.0
             rows.append({
                 "Swept value":               r["label"],
                 "Policy":                    policy,
                 "Mean cost (€)":             float(costs.mean()),
-                "Std cost (€)":              float(costs.std(ddof=1)) if n > 1 else 0.0,
-                "Median cost (€)":           float(np.median(costs)),
+                "SEM cost (€)":              sd / np.sqrt(n) if n > 0 else 0.0,
+                "Std cost (€)":              sd,
                 "Mean penalty min":          float(pen.mean()),
                 "% scenarios with penalty":  float((pen > 0).mean() * 100),
                 "Mean energy charged (kWh)": float(energy.mean()),
-                "Mean final battery (kWh)":  float(final_e.mean()),
             })
     return pd.DataFrame(rows)
 
@@ -233,6 +248,9 @@ def fig_baseline_cost(full: dict) -> go.Figure:
         error_y=dict(type="data", symmetric=False, array=errs, arrayminus=minus,
                      visible=True, thickness=1.2, width=4)))
     fig.update_layout(
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
         yaxis=dict(title="Mean total cost incl. penalty (€)  [log]", type="log", dtick=1),
         xaxis_title="Policy", height=460, margin=dict(l=40, r=20, t=20, b=110),
         showlegend=False,
@@ -242,30 +260,43 @@ def fig_baseline_cost(full: dict) -> go.Figure:
 
 
 def fig_baseline_trajectories(full: dict, scenarios: list, T: int, params) -> go.Figure:
-    """Scenario-averaged trajectories: price and mobility (±SEM bands)."""
-    hours, T_hours = np.arange(T) / 60, T // 60
+    """Scenario-averaged trajectories: price (hourly means) and mobility (per-minute), ±SEM bands."""
+    T_hours = T // 60
+    h_axis = np.arange(T_hours)       # integer hours — for the hourly-meaned price
+    m_axis = np.arange(T) / 60        # minute index mapped to hours — for mobility
     n = max(len(scenarios), 1)
     sem = lambda a: a.std(axis=0) / np.sqrt(n)
+
+    def _hourly(arr2d: np.ndarray) -> np.ndarray:
+        m, t = arr2d.shape
+        return arr2d.reshape(m, T_hours, t // T_hours).mean(axis=2)
+
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
                         subplot_titles=("Mean price", "Mean mobility (0 parked, 1 driving)"))
 
-    def band(mean, half, color, name, row, legend=False):
+    def band(x, mean, half, color, name, row, legend=False):
         fill = _rgba(color, 0.12)
-        fig.add_trace(go.Scatter(x=hours, y=mean + half, mode="lines", line=dict(width=0),
+        fig.add_trace(go.Scatter(x=x, y=mean + half, mode="lines", line=dict(width=0),
                                  showlegend=False, hoverinfo="skip", legendgroup=name), row=row, col=1)
-        fig.add_trace(go.Scatter(x=hours, y=mean - half, mode="lines", line=dict(width=0),
+        fig.add_trace(go.Scatter(x=x, y=mean - half, mode="lines", line=dict(width=0),
                                  fill="tonexty", fillcolor=fill, showlegend=False,
                                  hoverinfo="skip", legendgroup=name), row=row, col=1)
-        fig.add_trace(go.Scatter(x=hours, y=mean, mode="lines", line=dict(color=color, width=1.6),
+        fig.add_trace(go.Scatter(x=x, y=mean, mode="lines", line=dict(color=color, width=1.6),
                                  name=name, legendgroup=name, showlegend=legend), row=row, col=1)
 
-    P = np.array([sc["lam_path"] for sc in scenarios])
-    band(P.mean(0), sem(P), "lightgray", "λ̄<sub>t</sub>", row=1)
+    P = _hourly(np.array([sc["lam_path"] for sc in scenarios]))   # (N, T_hours)
+    band(h_axis, P.mean(0), sem(P), "lightgray", "λ̄<sub>t</sub>", row=1)
     Mob = np.array([(r["chi_traj"] > 0).astype(float) for r in full["Backward Induction"]])
-    band(Mob.mean(0), sem(Mob), "orange", "driving", row=2)
+    band(m_axis, Mob.mean(0), sem(Mob), "orange", "driving", row=2)
 
-    fig.update_layout(height=620, margin=dict(l=40, r=30, t=60, b=40),
-                      legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    fig.update_layout(
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=620, 
+        margin=dict(l=40, r=30, t=60, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02)
+    )
     fig.update_xaxes(range=[0, T_hours], dtick=max(T_hours // 8, 1))
     fig.update_xaxes(title_text="Hour (h)", row=2, col=1)
     fig.update_yaxes(title_text="€/kWh", row=1, col=1)
@@ -277,7 +308,12 @@ def figure_to_png(fig: go.Figure, width: int = 1400, scale: int = 3) -> bytes:
     """Render a Plotly figure to high-res PNG bytes (requires kaleido)."""
     import copy
     fig = copy.deepcopy(fig)
-    fig.update_layout(font=dict(size=16))
+    fig.update_layout(
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        font=dict(size=16)
+    )
     # Subplot titles are annotations — bump them separately
     for ann in fig.layout.annotations:
         if ann.font and ann.font.size:
@@ -290,7 +326,10 @@ def figure_to_png(fig: go.Figure, width: int = 1400, scale: int = 3) -> bytes:
     fig.update_xaxes(automargin=True, title_standoff=12)
     fig.update_yaxes(automargin=True, title_standoff=12)
     m = fig.layout.margin
-    fig.update_layout(margin=dict(
+    fig.update_layout(
+    template="plotly_white",
+    plot_bgcolor="white",
+    paper_bgcolor="white",margin=dict(
         l=max(m.l or 0, 100),
         r=max(m.r or 0, 40),
         t=max(m.t or 0, 50),

@@ -7,6 +7,7 @@ from ev_mdt.analysis.prices import (
 from ev_mdt.analysis.sensitivity import (
     run_all_sweeps,
     save_figures,
+    save_tables,
     sweep_penalty,
     sweep_beta,
     sweep_horizon,

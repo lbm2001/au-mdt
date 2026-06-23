@@ -192,10 +192,16 @@ def price_figures(
     _margin = dict(l=50, r=20, t=20, b=40)
 
     fig_mean.update_layout(
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
         height=480, hovermode="x unified", margin=_margin, legend=_legend,
         xaxis=_xaxis, yaxis=dict(title="Mean price (€/kWh)"),
     )
     fig_std.update_layout(
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
         height=380, hovermode="x unified", margin=_margin, legend=_legend,
         xaxis=_xaxis, yaxis=dict(title="Std (€/kWh)"),
     )

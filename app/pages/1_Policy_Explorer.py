@@ -105,6 +105,9 @@ def _policy_heatmap_figure(rates: np.ndarray, title: str, time_bin_minutes: int,
         hovertemplate="Hour: %{x:.2f}<br>Battery: %{y:.2f} kWh<br>Charge: %{z:.2f} kW<extra></extra>",
     ))
     fig.update_layout(
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
         #title=title,
         xaxis_title="Hour (h)",
         yaxis_title="Battery (kWh)",
@@ -155,6 +158,9 @@ def policy_price_map_figure(chi: int, t: int, title: str) -> go.Figure:
         hovertemplate="Price: %{x:.3f} €/kWh<br>Battery: %{y:.2f} kWh<br>Charge: %{z:.2f} kW<extra></extra>",
     ))
     fig.update_layout(
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
         xaxis_title="Price (€/kWh)",
         yaxis_title="Battery (kWh)",
         height=430,

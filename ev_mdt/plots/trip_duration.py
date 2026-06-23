@@ -71,6 +71,12 @@ def trip_duration_figure(durs: dict) -> go.Figure:
     fig.update_xaxes(title_text="Trip duration (min)", row=1, col=2)
     fig.update_yaxes(title_text="Density", row=1, col=1)
     fig.update_yaxes(title_text="P(duration > t)", type="log", row=1, col=2)
-    fig.update_layout(height=420, margin=dict(l=40, r=20, t=60, b=40),
-                      legend=dict(orientation="h", yanchor="bottom", y=1.06))
+    fig.update_layout(
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=420, 
+        margin=dict(l=40, r=20, t=60, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.06)
+    )
     return fig

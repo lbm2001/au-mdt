@@ -25,6 +25,7 @@ from ev_mdt.analysis.sensitivity import (
     sweep_horizon,
     sweep_departure_profiles,
     sweep_mobility_models,
+    save_tables,
     baseline_optimal_result,
     baseline_model_figures,
     PHI_VALUES,
@@ -40,6 +41,7 @@ from ev_mdt.plots.sensitivity import (
     fig_cost_distribution,
     build_summary_df,
     figure_to_png,
+    SUMMARY_METRIC_FORMATS,
 )
 from ev_mdt.plots.viz import SWEEP_AXIS_LABEL
 from ev_mdt.plots.trip_duration import compute_trip_durations, trip_duration_figure
@@ -49,7 +51,9 @@ from ev_mdt.pricing.entsoe import load_prices
 
 # ── Streamlit helpers ─────────────────────────────────────────────────────────
 
-FIGURES_DIR = Path(__file__).parent.parent.parent / "figures"
+_EXPORT_DIR = Path(__file__).parent.parent.parent / "export"
+FIGURES_DIR = _EXPORT_DIR / "figures_app"
+TABLES_DIR  = _EXPORT_DIR / "tables"
 
 
 def _get_gbins(mode: str) -> GaussianBinnedSampler:
@@ -235,7 +239,8 @@ def _show_results(results: list[dict], sweep_label: str):
 
     st.subheader("Summary table")
     df = build_summary_df(results)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(df.style.format(SUMMARY_METRIC_FORMATS),
+                 use_container_width=True, hide_index=True)
     st.download_button(
         "Download CSV", df.to_csv(index=False).encode(),
         f"sensitivity_{sweep_label.replace(' ', '_')}.csv", "text/csv",
@@ -324,6 +329,8 @@ if st.session_state.pop("sa_run_all_triggered", False):
     ]
     n = len(_steps)
 
+    _sweep_name_by_key = dict(_SWEEP_RESULT_KEYS)
+
     def _emit_export(export_id: str) -> None:
         labels_by_id = {item["id"]: item["label"] for item in _available_export_figures()}
         label = labels_by_id.get(export_id, export_id)
@@ -336,11 +343,21 @@ if st.session_state.pop("sa_run_all_triggered", False):
         except Exception as exc:
             st.session_state["sa_run_all_export_errors"].append(f"{label}: {exc}")
 
+    def _emit_table(key: str) -> None:
+        sweep_name = _sweep_name_by_key.get(key, key)
+        try:
+            out_path = TABLES_DIR / "sensitivity_figures" / sweep_name / "summary.csv"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            build_summary_df(st.session_state[key]).to_csv(out_path, index=False)
+        except Exception as exc:
+            st.session_state["sa_run_all_export_errors"].append(f"table {sweep_name}: {exc}")
+
     for i, (name, key, fn) in enumerate(_steps):
         st.session_state[key] = fn(
             lambda f, m, i=i, name=name: bar.progress((i + f) / n, text=f"{name}: {m}"))
         for export_id in _sweep_export_ids(key):
             _emit_export(export_id)
+        _emit_table(key)
 
     for export_id in [
         "baseline:Baseline:cost", "baseline:Baseline:optimal_policy",
@@ -351,13 +368,23 @@ if st.session_state.pop("sa_run_all_triggered", False):
     ]:
         _emit_export(export_id)
 
+    # Combined baseline/NegBin model summary table.
+    bar.progress(0.97, text="Writing baseline-model tables…")
+    try:
+        save_tables({}, out_dir=TABLES_DIR, N_rollouts=N_rollouts, seed=seed,
+                    N_e=N_e, include_baseline=True)
+    except Exception as exc:
+        st.session_state["sa_run_all_export_errors"].append(f"baseline tables: {exc}")
+
     bar.progress(1.0, text="Done.")
     bar.empty()
     errors = st.session_state.get("sa_run_all_export_errors", [])
+    _root = Path(__file__).parent.parent.parent
     if errors:
         st.warning("Run-all complete with export errors:\n" + "\n".join(f"- {e}" for e in errors))
     else:
-        st.success(f"Run-all complete. PNGs saved under `{FIGURES_DIR.relative_to(Path(__file__).parent.parent.parent)}/`.")
+        st.success(f"Run-all complete. Figures under `{FIGURES_DIR.relative_to(_root)}/`, "
+                   f"tables under `{TABLES_DIR.relative_to(_root)}/`.")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 

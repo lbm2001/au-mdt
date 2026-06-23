@@ -4,11 +4,12 @@ Usage
 -----
     python -m ev_mdt solve [--model BASELINE] [--N-e 500] [--hours 24] [--phi 1.0] ...
     python -m ev_mdt rollout --n 200 --seed 42 [same solve flags]
-    python -m ev_mdt sensitivity --sweep penalty
-    python -m ev_mdt sensitivity --sweep all [--N-rollouts 500] [--N-e 500] [--seed 42]
-                                              [--out-dir figures/]
+    python -m ev_mdt run --all [--N-rollouts 500] [--N-e 500] [--seed 42] [--out-dir export]
+    python -m ev_mdt run --sweep penalty        # single sweep, no baseline models
     python -m ev_mdt prices [--n-days 1000] [--season all] [--daytype all]
                             [--seed 42] [--out-dir figures/]
+
+`run --all` writes figures to <out-dir>/figures_app/ and summary tables to <out-dir>/tables/.
 """
 import argparse
 import sys
@@ -49,15 +50,29 @@ def cmd_rollout(args: argparse.Namespace) -> None:
     print(df.to_string(index=False))
 
 
-def cmd_sensitivity(args: argparse.Namespace) -> None:
+def cmd_run(args: argparse.Namespace) -> None:
+    """Run sweeps (and, with --all, the baseline/NegBin models) → export figures + tables."""
     import itertools
     import threading
     import time
+    from pathlib import Path
     import numpy as np
     from tqdm import tqdm
-    from ev_mdt.analysis.sensitivity import run_all_sweeps, save_figures, ALL_SWEEP_NAMES
+    from ev_mdt.analysis.sensitivity import (
+        run_all_sweeps, save_figures, save_tables, ALL_SWEEP_NAMES,
+    )
 
-    sweeps = ALL_SWEEP_NAMES if args.sweep == "all" else [args.sweep]
+    if args.all:
+        sweeps = list(ALL_SWEEP_NAMES)
+    elif args.sweep:
+        sweeps = [args.sweep]
+    else:
+        print("Nothing to do: pass --all (full export) or --sweep <name>.", file=sys.stderr)
+        sys.exit(1)
+
+    do_baseline = args.all
+    figures_dir = Path(args.out_dir) / "figures_app"
+    tables_dir  = Path(args.out_dir) / "tables"
 
     # ── W&B setup ─────────────────────────────────────────────────────────────
     wandb_run = None
@@ -115,9 +130,12 @@ def cmd_sensitivity(args: argparse.Namespace) -> None:
             hb_thread.join()
         inner.close()
 
-        saved = save_figures(results, out_dir=args.out_dir,
+        saved = save_figures(results, out_dir=figures_dir,
                              N_rollouts=args.N_rollouts, seed=args.seed, N_e=args.N_e,
-                             include_baseline=(i == 0))
+                             include_baseline=(do_baseline and i == 0))
+        saved += save_tables(results, out_dir=tables_dir,
+                             N_rollouts=args.N_rollouts, seed=args.seed, N_e=args.N_e,
+                             include_baseline=False)
         for p in saved:
             tqdm.write(f"  Saved: {p}")
 
@@ -139,10 +157,22 @@ def cmd_sensitivity(args: argparse.Namespace) -> None:
                         f"{prefix}/mean_energy_kwh":     energy.mean(),
                     })
             for p in saved:
-                wandb_run.log({f"figures/{sw}": _wb.Image(str(p))})
+                if p.suffix == ".png":
+                    wandb_run.log({f"figures/{sw}": _wb.Image(str(p))})
 
     outer.close()
-    print("\nAll sweeps complete.")
+
+    # Baseline/NegBin model tables (figures already emitted with the first sweep).
+    if do_baseline:
+        tqdm.write("Writing baseline-model tables…")
+        for p in save_tables({}, out_dir=tables_dir, N_rollouts=args.N_rollouts,
+                             seed=args.seed, N_e=args.N_e, include_baseline=True,
+                             _log=tqdm.write):
+            tqdm.write(f"  Saved: {p}")
+
+    print("\nRun complete.")
+    print(f"  Figures → {figures_dir}/")
+    print(f"  Tables  → {tables_dir}/")
     if wandb_run is not None:
         wandb_run.finish()
 
@@ -211,21 +241,24 @@ def main() -> None:
     p_rollout.add_argument("--n",    type=int, default=200, help="Number of rollout scenarios")
     p_rollout.add_argument("--seed", type=int, default=42,  help="Base random seed")
 
-    # sensitivity
+    # run (sweeps + baseline/NegBin models → figures + tables)
     from ev_mdt.analysis.sensitivity import ALL_SWEEP_NAMES
-    p_sens = sub.add_parser("sensitivity", help="Run sensitivity analysis sweeps")
-    p_sens.add_argument("--sweep", default="all",
-                        choices=["all"] + ALL_SWEEP_NAMES, metavar="SWEEP",
-                        help=f"Which sweep to run (or 'all'). Options: {', '.join(ALL_SWEEP_NAMES)}")
-    p_sens.add_argument("--N-rollouts",    type=int, default=500, metavar="N",
-                        help="Rollouts per swept value")
-    p_sens.add_argument("--N-e",           type=int, default=500, metavar="N",
-                        help="Battery grid points")
-    p_sens.add_argument("--seed",          type=int, default=42,  help="Base random seed")
-    p_sens.add_argument("--out-dir",       default="figures/",    help="Output directory for PNGs")
-    p_sens.add_argument("--wandb",         action="store_true",   help="Log results and figures to Weights & Biases")
-    p_sens.add_argument("--wandb-project", default="au-mdt",      help="W&B project name")
-    p_sens.add_argument("--wandb-run",     default="",            help="W&B run name (auto if omitted)")
+    p_run = sub.add_parser("run", help="Run sweeps + model rollouts, export figures and tables")
+    p_run.add_argument("--all", action="store_true",
+                       help="Run every sweep plus the baseline/NegBin models (full export)")
+    p_run.add_argument("--sweep", default=None,
+                       choices=ALL_SWEEP_NAMES, metavar="SWEEP",
+                       help=f"Run a single sweep (no baseline models). Options: {', '.join(ALL_SWEEP_NAMES)}")
+    p_run.add_argument("--N-rollouts",    type=int, default=500, metavar="N",
+                       help="Rollouts per swept value")
+    p_run.add_argument("--N-e",           type=int, default=500, metavar="N",
+                       help="Battery grid points")
+    p_run.add_argument("--seed",          type=int, default=42,  help="Base random seed")
+    p_run.add_argument("--out-dir",       default="export",
+                       help="Export base dir (figures → <dir>/figures_app, tables → <dir>/tables)")
+    p_run.add_argument("--wandb",         action="store_true",   help="Log results and figures to Weights & Biases")
+    p_run.add_argument("--wandb-project", default="au-mdt",      help="W&B project name")
+    p_run.add_argument("--wandb-run",     default="",            help="W&B run name (auto if omitted)")
 
     # prices
     p_prices = sub.add_parser("prices", help="Fit price models and simulate diurnal profiles")
@@ -243,8 +276,8 @@ def main() -> None:
         cmd_solve(args)
     elif args.command == "rollout":
         cmd_rollout(args)
-    elif args.command == "sensitivity":
-        cmd_sensitivity(args)
+    elif args.command == "run":
+        cmd_run(args)
     elif args.command == "prices":
         cmd_prices(args)
     else:

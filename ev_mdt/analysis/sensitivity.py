@@ -574,6 +574,7 @@ _HEATMAP_NCOLS = {
     "beta": 3,
     "pricing_season": 2,
     "mobility_model": 2,
+    "pricing_crisis": 3,
 }
 
 
@@ -636,5 +637,68 @@ def save_figures(
         p = bm_dir / "trip_duration_by_model.png"
         p.write_bytes(figure_to_png(trip_duration_figure(durs)))
         saved.append(p)
+
+    return saved
+
+
+# Display names for the baseline/NegBin models in the combined summary table.
+_BASELINE_TABLE_LABELS = {
+    BASELINE_MODEL:       "Baseline",
+    NEGBIN_FIXED_MODEL:   "NegBin (fixed k)",
+    NEGBIN_SAMPLED_MODEL: "NegBin (sampled k)",
+}
+
+
+def save_tables(
+    all_results: dict[str, list[dict]],
+    out_dir: str | Path = "export/tables",
+    N_rollouts: int = 500,
+    seed: int = 42,
+    N_e: int = 500,
+    include_baseline: bool = True,
+    _log: Callable | None = None,
+) -> list[Path]:
+    """Write the per-sweep and (optionally) baseline-model summary tables as CSV.
+
+    Mirrors save_figures' directory layout under out_dir:
+        sensitivity_figures/<sweep>/summary.csv   — one row per (swept value, policy)
+        baseline_models/summary.csv               — combined Baseline + NegBin models
+
+    Each table carries the shared 6-metric set (see build_summary_df). Returns saved paths.
+    """
+    from ev_mdt.plots.sensitivity import build_summary_df
+
+    out_dir = Path(out_dir)
+    saved: list[Path] = []
+
+    for sweep_name, results in all_results.items():
+        folder = _SWEEP_FOLDER.get(sweep_name, sweep_name)
+        dest = out_dir / "sensitivity_figures" / folder
+        dest.mkdir(parents=True, exist_ok=True)
+        p = dest / "summary.csv"
+        build_summary_df(results).to_csv(p, index=False)
+        saved.append(p)
+        if _log: _log(f"  Saved table: {p}")
+
+    if include_baseline:
+        bm_dir = out_dir / "baseline_models"
+        bm_dir.mkdir(parents=True, exist_ok=True)
+        model_results = []
+        for model_label in [BASELINE_MODEL, NEGBIN_FIXED_MODEL, NEGBIN_SAMPLED_MODEL]:
+            label = _BASELINE_TABLE_LABELS[model_label]
+            if _log: _log(f"  [{label}] solving + running {N_rollouts} rollouts…")
+            result = baseline_optimal_result(model_label, N_e)
+            params, T, pbp_fn = result["params"], result["T"], result["pbp_fn"]
+            scenarios = [make_scenario(params, seed + i, T) for i in range(N_rollouts)]
+            rollouts = run_rollouts(
+                result["pi"], result["actions"], result["e_grid"], params,
+                scenarios, rollout_fn(model_label), pbp_fn, desc=f"    [{label}] rollouts")
+            model_results.append({"rollouts": rollouts, "label": label})
+        import pandas as pd
+        df = pd.concat([build_summary_df([r]) for r in model_results], ignore_index=True)
+        p = bm_dir / "summary.csv"
+        df.to_csv(p, index=False)
+        saved.append(p)
+        if _log: _log(f"  Saved table: {p}")
 
     return saved

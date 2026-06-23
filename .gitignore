@@ -43,7 +43,10 @@ htmlcov/
 .streamlit/secrets.toml
 wandb/
 
-*figures/
+*figures*/
 
 # Cached ENTSO-E price data
 entsoe-data/
+
+# Exported figures and tables
+export/

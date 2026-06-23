@@ -75,25 +75,26 @@ python -m ev_mdt rollout --n 500 --seed 0
 python -m ev_mdt rollout --model "Negative Binomial trips (fixed k)" --n 200
 ```
 
-### `sensitivity` — run parameter sweeps
+### `run` — sweeps + model rollouts → export figures and tables
 
 ```bash
-python -m ev_mdt sensitivity [--sweep SWEEP] [--N-rollouts N] [--N-e N]
-                              [--seed SEED] [--out-dir DIR]
+python -m ev_mdt run --all [--N-rollouts N] [--N-e N] [--seed SEED] [--out-dir DIR]
+python -m ev_mdt run --sweep SWEEP ...        # single sweep, no baseline models
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--sweep` | `all` | Which sweep to run. One of: `pricing_model`, `pricing_season`, `pricing_daytype`, `pricing_crisis`, `penalty`, `beta`, `horizon`, `departure_profile`, `mobility_model`, or `all` |
+| `--all` | — | Run every sweep **plus** the baseline/NegBin models (full export) |
+| `--sweep` | — | Run a single sweep (no baseline models). One of: `pricing_model`, `pricing_season`, `pricing_daytype`, `pricing_crisis`, `penalty`, `beta`, `horizon`, `departure_profile`, `mobility_model` |
 | `--N-rollouts` | `500` | Rollouts per swept value |
 | `--N-e` | `500` | Battery grid points |
 | `--seed` | `42` | Random seed |
-| `--out-dir` | `figures/` | Output directory for exported PNGs |
+| `--out-dir` | `export` | Export base: figures → `<dir>/figures_app/`, summary tables (CSV) → `<dir>/tables/` |
 
 ```bash
-python -m ev_mdt sensitivity                          # all sweeps
-python -m ev_mdt sensitivity --sweep penalty
-python -m ev_mdt sensitivity --sweep mobility_model --N-rollouts 200 --out-dir out/
+python -m ev_mdt run --all                            # full figure + table export
+python -m ev_mdt run --sweep penalty
+python -m ev_mdt run --sweep mobility_model --N-rollouts 200 --out-dir out/
 ```
 
 ### `prices` — fit pricing models and plot diurnal profiles

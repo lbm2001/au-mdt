@@ -53,6 +53,7 @@ else:
 
 from ev_mdt.plots.viz import POLICY_COLORS, POLICY_ORDER, MODEL_COLORS
 from ev_mdt.plots.trip_duration import compute_trip_durations, trip_duration_figure
+from ev_mdt.plots.sensitivity import SUMMARY_METRIC_FORMATS
 
 # Named colours used for non-policy bands (price/mobility) → "r,g,b".
 _CSS_RGB = {"orange": "255,165,0", "lightgray": "211,211,211"}
@@ -204,31 +205,32 @@ def _nd_stats(rollout_list: list) -> dict:
     pen_mins = np.array([int(((r["chi_traj"] > 0) & (r["e_traj"] <= params.e_min)).sum())
                          for r in rollout_list])
     energy   = np.array([(r["u_traj"] * params.omega).sum() for r in rollout_list])
-    final_e  = np.array([r["final_e"] for r in rollout_list])
+    n  = len(costs)
+    sd = float(costs.std(ddof=1)) if n > 1 else 0.0
     return {
         "Mean cost (€)":             costs.mean(),
-        "Std cost (€)":              costs.std(),
-        "Median cost (€)":           float(np.median(costs)),
+        "SEM cost (€)":              sd / np.sqrt(n) if n > 0 else 0.0,
+        "Std cost (€)":              sd,
         "Mean penalty min":          pen_mins.mean(),
         "% scenarios with penalty":  float((pen_mins > 0).mean() * 100),
         "Mean energy charged (kWh)": energy.mean(),
-        "Mean final battery (kWh)":  final_e.mean(),
     }
 
 
 stats_df = pd.DataFrame({name: _nd_stats(rolls) for name, rolls in nd_rollouts.items()}).T
-st.dataframe(
-    stats_df.style.format({
-        "Mean cost (€)":             "{:.3f}",
-        "Std cost (€)":              "{:.3f}",
-        "Median cost (€)":           "{:.3f}",
-        "Mean penalty min":          "{:.1f}",
-        "% scenarios with penalty":  "{:.1f}%",
-        "Mean energy charged (kWh)": "{:.2f}",
-        "Mean final battery (kWh)":  "{:.2f}",
-    }),
-    use_container_width=True,
-)
+st.dataframe(stats_df.style.format(SUMMARY_METRIC_FORMATS), use_container_width=True)
+
+_TABLES_DIR = Path(__file__).parent.parent.parent / "export" / "tables"
+_tc1, _tc2 = st.columns(2)
+with _tc1:
+    st.download_button("Download CSV", stats_df.to_csv().encode(),
+                       "policy_rollout.csv", "text/csv")
+with _tc2:
+    if st.button("💾 Export → export/tables/policy_rollout.csv"):
+        _TABLES_DIR.mkdir(parents=True, exist_ok=True)
+        _out = _TABLES_DIR / "policy_rollout.csv"
+        stats_df.to_csv(_out)
+        st.success(f"Saved `{_out.relative_to(Path(__file__).parent.parent.parent)}`")
 
 
 def cost_bar_figure(error: str, log_y: bool) -> go.Figure:
@@ -250,7 +252,8 @@ def cost_bar_figure(error: str, log_y: bool) -> go.Figure:
                  type="log" if log_y else "linear")
     if log_y:
         yaxis["dtick"] = 1
-    fig.update_layout(yaxis=yaxis, xaxis_title="Policy", height=460,
+    fig.update_layout(template="plotly_white", plot_bgcolor="white", paper_bgcolor="white",
+                      yaxis=yaxis, xaxis_title="Policy", height=460,
                       margin=dict(l=40, r=20, t=20, b=110), showlegend=False)
     fig.update_xaxes(categoryorder="array", categoryarray=POLICY_ORDER)   # fixed canonical order
     return fig
@@ -320,7 +323,8 @@ def mean_trajectory_figure() -> go.Figure:
         band(m_axis, Mob.mean(0), sem(Mob), "orange", "driving", row=2)
         show_legend = False
 
-    fig.update_layout(height=560, hovermode="x unified",
+    fig.update_layout(template="plotly_white", plot_bgcolor="white", paper_bgcolor="white",
+                      height=560, hovermode="x unified",
                       margin=dict(l=50, r=30, t=50, b=40), showlegend=show_legend,
                       legend=dict(x=1.01, y=0.2, xanchor="left"))
     fig.update_xaxes(range=[0, T_hours], dtick=max(1, T_hours // 8))

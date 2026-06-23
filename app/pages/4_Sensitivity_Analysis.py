@@ -22,10 +22,10 @@ Four independent sweep dimensions (one at a time, others held at baseline):
 
 Policies compared
 -----------------
-  • Optimal (Backward induction) — solves the MDP exactly for each config
-  • Night charging               — charges only during 00:00–06:00
-  • DP heuristic                 — SoC-urgency rule using price CDF
-  • Maximal charging             — always charges at u_max
+  • Optimal (Backward Induction) — solves the MDP exactly for each config
+  • Night Charging               — charges only during 00:00–06:00
+  • DP-Heuristic                 — SoC-urgency rule using price CDF
+  • Always-Maximum             — always charges at u_max
 
 Note on pricing sweep: the DP-heuristic benchmark uses `price_bin_probs(t, params)`
 (Gaussian parametric) internally regardless of the sweep value.  This is a known
@@ -43,6 +43,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+import streamlit.components.v1 as components
 
 from models.baseline import (
     BaselineParams, transition_probs as _baseline_transition_probs,
@@ -59,23 +60,22 @@ from models.negative_binomial_trips.backward_induction import (
 )
 from models.model_utils import mean_price, price_bin_probs as _gaussian_pbp
 from utils.backward_induction import backward_induction as _baseline_run_bi
-from pricing_models.pricing import GaussianBinnedSampler, make_price_bin_probs_fn
+from pricing_models.pricing import (GaussianBinnedSampler, GMMSampler, MDNSampler,
+                                     make_price_bin_probs_fn)
 from pricing_models.entsoe_loader import load_prices
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-from utils.viz import POLICY_COLORS    # shared canonical colour map
-
-# Policies compared in this page (the canonical set), in legend order.
-POLICY_ORDER = ["Backward induction", "Night charging", "DP heuristic", "Maximal charging",
-                "Always minimum", "Price-oriented", "Minimum SoC"]
+from utils.viz import POLICY_COLORS, POLICY_ORDER    # shared canonical colours + order
+from utils.trip_duration import compute_trip_durations, trip_duration_figure
 
 # Distinct line colours for per-swept-value overlays (cycled if more values than colours).
 SWEEP_PALETTE = ["#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377",
                  "#BBBBBB", "#882255", "#44AA99", "#999933", "#DDCC77"]
 
-PHI_VALUES       = [0, 0.05, 1, 2, 5, 50, 100, 1000, 2000]
+PHI_VALUES       = [0, 0.05, 1, 50, 500, 5000]
+BETA_VALUES      = [0.9, 0.92, 0.94, 0.96, 0.98, 1.0]   # discount factor sweep
 HORIZON_HOURS    = [24, 48, 168]
 
 # Departure profiles: each overrides the four p_PD_* departure probabilities only
@@ -186,7 +186,7 @@ def _make_scenario(params, seed: int, horizon: int,
 def _run_rollouts(pi, actions, e_grid, params, scenarios: list, rollout_fn, pbp_fn) -> dict:
     """
     Run all four policies on each scenario using the model-specific rollout_fn.
-    The DP heuristic is fed the active world's price distribution (pbp_fn) so it
+    The DP-Heuristic is fed the active world's price distribution (pbp_fn) so it
     judges prices against the same distribution the world is drawn from, not the
     hard-coded Gaussian-parametric one.
     Returns {policy_name: [metrics_dict, ...]} for N_rollouts scenarios.
@@ -195,24 +195,24 @@ def _run_rollouts(pi, actions, e_grid, params, scenarios: list, rollout_fn, pbp_
 
     # (name, fn, extra policy kwargs) — thresholds default to baseline price/SoC values
     benchmarks = [
-        ("Night charging",   night_charging_policy,   {}),
-        ("DP heuristic",     dp_heuristic_policy,      {"price_bin_probs_fn": pbp_fn}),
-        ("Maximal charging", maximal_charging_policy,  {}),
-        ("Always minimum",   always_minimum_policy,    {}),
-        ("Price-oriented",   price_oriented_policy,
+        ("Night Charging",   night_charging_policy,   {}),
+        ("DP-Heuristic",     dp_heuristic_policy,      {"price_bin_probs_fn": pbp_fn}),
+        ("Always-Maximum", maximal_charging_policy,  {}),
+        ("Always-Minimum",   always_minimum_policy,    {}),
+        ("Price-Oriented",   price_oriented_policy,
          {"low_threshold": params.price_night, "high_threshold": params.price_evening}),
-        ("Minimum SoC",      minimum_soc_policy,       {"soc_threshold": params.e_max * 0.25}),
+        ("Minimum-Charge",      minimum_soc_policy,       {"soc_threshold": params.e_max * 0.25}),
     ]
 
     results: dict[str, list] = {p: [] for p in POLICY_ORDER}
     for sc in scenarios:
         e0 = float(sc["e0"])   # random initial SoC, shared by all policies in this scenario
-        # Backward induction (optimal)
+        # Backward Induction (optimal)
         ro = rollout_fn(
             backward_induction_policy, sc, e0, chi0, params,
             pi=pi, actions=actions, e_grid=e_grid,
         )
-        results["Backward induction"].append(rollout_metrics(ro, params))
+        results["Backward Induction"].append(rollout_metrics(ro, params))
 
         # Benchmark policies
         for name, fn, kw in benchmarks:
@@ -341,7 +341,24 @@ def sweep_pricing_daytype(sampler, N_rollouts: int, N_e: int, seed: int,
 def sweep_pricing_crisis(sampler_excl, sampler_incl, N_rollouts: int, N_e: int, seed: int,
                          progress_cb=None) -> list[dict]:
     """Gaussian bins: vary crisis inclusion, held at spring + weekday."""
-    items = [("Excl. crisis", sampler_excl), ("Incl. crisis", sampler_incl)]
+    items = [("Excluding crisis", sampler_excl), ("Including crisis", sampler_incl)]
+    results = []
+    for i, (label, sampler) in enumerate(items):
+        if progress_cb:
+            progress_cb(i / len(items), f"Solving {label}…")
+        results.append(_gbins_step(label, sampler, "spring", False, N_rollouts, N_e, seed))
+    if progress_cb:
+        progress_cb(1.0, "Done.")
+    return results
+
+
+def sweep_pricing_model(samplers: dict, N_rollouts: int, N_e: int, seed: int,
+                        progress_cb=None) -> list[dict]:
+    """Vary the price model (Gaussian bins / GMM / MDN), held at spring · weekday · crisis-excluded.
+
+    `samplers` maps a model label to a fitted sampler; each drives its own sampled price world.
+    """
+    items = list(samplers.items())
     results = []
     for i, (label, sampler) in enumerate(items):
         if progress_cb:
@@ -367,6 +384,29 @@ def sweep_penalty(
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         result = _run_sweep_step(
             model_label, f"φ={phi}", params, pbp_fn, T=24 * 60, N_e=N_e,
+            N_rollouts=N_rollouts, seed=seed,
+        )
+        results.append(result)
+    if progress_cb:
+        progress_cb(1.0, "Done.")
+    return results
+
+
+def sweep_beta(
+    model_label: str, N_rollouts: int, N_e: int, seed: int, progress_cb=None,
+) -> list[dict]:
+    """
+    Sweep the discount factor β ∈ BETA_VALUES over a 24 h horizon.  Gaussian parametric pricing.
+    Returns a list of sweep-step result dicts, one per β value.
+    """
+    results = []
+    for i, beta in enumerate(BETA_VALUES):
+        if progress_cb:
+            progress_cb(i / len(BETA_VALUES), f"Solving β = {beta:g}…")
+        params = _build_params(model_label, beta=float(beta))
+        pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
+        result = _run_sweep_step(
+            model_label, f"β={beta:g}", params, pbp_fn, T=24 * 60, N_e=N_e,
             N_rollouts=N_rollouts, seed=seed,
         )
         results.append(result)
@@ -428,28 +468,26 @@ def sweep_mobility_models(
     N_rollouts: int, N_e: int, seed: int, progress_cb=None,
 ) -> list[dict]:
     """
-    Compare the mobility models (Baseline · NegBin fixed-k · NegBin sampled-k) over a
-    24 h horizon.  Uses Gaussian parametric pricing.  All other params at baseline.
-    Returns a list of sweep-step result dicts, one per model.
+    Compare NegBin mobility models over a 24 h horizon: {fixed-k, Poisson-k} × {k=5, k=10}
+    (4 configs).  Gaussian parametric pricing.  All other params at baseline.
+    Returns a list of sweep-step result dicts, one per config.
     """
-    def _label(model, params):
-        if model == "Baseline":
-            return "Baseline"
-        if getattr(params, "lambda_k", None) is not None:   # Poisson-sampled k
-            return f"NegBin (Poisson k̄={params.lambda_k:g}, k_max={params.k})"
-        return f"NegBin (fixed k={params.k})"
-
+    FIXED, SAMPLED = "NegBin trips (fixed k)", "NegBin trips (sampled k)"
+    configs = [
+        (FIXED,   "NegBin fixed k=5",    NegBinParams(k=5)),
+        (FIXED,   "NegBin fixed k=10",   NegBinParams(k=10)),
+        (SAMPLED, "NegBin Poisson k=5",  NegBinParams(lambda_k=5.0,  k=_poisson_kmax(5.0))),
+        (SAMPLED, "NegBin Poisson k=10", NegBinParams(lambda_k=10.0, k=_poisson_kmax(10.0))),
+    ]
     results = []
-    for i, model in enumerate(MODEL_LABELS):
+    for i, (model, label, params) in enumerate(configs):
         if progress_cb:
-            progress_cb(i / len(MODEL_LABELS), f"Solving {model}…")
-        params = _build_params(model)
+            progress_cb(i / len(configs), f"Solving {label}…")
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
-        result = _run_sweep_step(
-            model, _label(model, params), params, pbp_fn, T=24 * 60, N_e=N_e,
+        results.append(_run_sweep_step(
+            model, label, params, pbp_fn, T=24 * 60, N_e=N_e,
             N_rollouts=N_rollouts, seed=seed,
-        )
-        results.append(result)
+        ))
     if progress_cb:
         progress_cb(1.0, "Done.")
     return results
@@ -464,14 +502,18 @@ def _grid_dims(n: int) -> tuple[int, int]:
 
 
 def fig_heatmap_grid(results: list[dict], ncols: int = 1, time_bin_min: int = 1,
-                     battery_bin_kwh: float = 0.5) -> go.Figure:
-    """Optimal-policy heatmaps (price-averaged). ncols=1 → one per row; ncols>1 → grid."""
+                     battery_bin_kwh: float = 0.5, show_titles: bool = True) -> go.Figure:
+    """Optimal-policy heatmaps (price-averaged). ncols=1 → one per row; ncols>1 → grid.
+
+    show_titles=False drops the per-panel labels (used for the single Baseline export).
+    """
     n    = len(results)
     rows = int(np.ceil(n / ncols))
     fig = make_subplots(
-        rows=rows, cols=ncols, subplot_titles=[r["label"] for r in results],
+        rows=rows, cols=ncols,
+        subplot_titles=[r["label"] for r in results] if show_titles else None,
         horizontal_spacing=0.08 if ncols > 1 else 0.0,
-        vertical_spacing=min(0.08, 0.8 / max(rows, 1)),
+        vertical_spacing=0.14 if rows > 1 else 0.0,   # room for each row's φ=… title
     )
     for idx, r in enumerate(results):
         row = idx // ncols + 1
@@ -491,84 +533,11 @@ def fig_heatmap_grid(results: list[dict], ncols: int = 1, time_bin_min: int = 1,
             hovertemplate="Hour: %{x:.2f} h<br>Battery: %{y:.2f} kWh<br>u*: %{z:.2f} kW<extra></extra>",
         ), row=row, col=col)
         fig.update_xaxes(title_text="Hour (h)" if row == rows else "", range=[0, T // 60],
-                         row=row, col=col)
+                         showticklabels=(row == rows), row=row, col=col)
         fig.update_yaxes(title_text="Battery (kWh)" if col == 1 else "", row=row, col=col)
-    fig.update_layout(height=280 * rows + 60, margin=dict(l=40, r=60, t=40, b=40))
-    return fig
-
-
-def fig_policy_price_grid(results: list[dict], hour: int) -> go.Figure:
-    """Battery × price decision map per swept value: u*(e, λ̂) at a fixed hour, parked state.
-
-    This is the view the (t, e) heatmap can't show — it keeps the price axis instead of
-    averaging it out, so the policy's price response (charge-vs-defer threshold) is visible.
-    """
-    n = len(results)
-    rows, cols = _grid_dims(n)
-    titles = [r["label"] for r in results]
-    fig = make_subplots(
-        rows=rows, cols=cols, subplot_titles=titles,
-        horizontal_spacing=0.06, vertical_spacing=0.12,
-    )
-    for idx, r in enumerate(results):
-        row = idx // cols + 1
-        col = idx % cols  + 1
-        t   = min(hour * 60, r["T"] - 1)
-        z   = r["actions"][r["pi"][t, 0, :, :]]   # (N_e, K) — parked state
-        fig.add_trace(go.Heatmap(
-            x=r["lam_grid"],
-            y=r["e_grid"],
-            z=z,
-            zmin=0, zmax=r["params"].u_max,
-            colorscale="RdYlBu_r",
-            showscale=(idx == 0),
-            colorbar=dict(title="u (kW)", x=1.01) if idx == 0 else None,
-            hovertemplate="Price: %{x:.3f} €/kWh<br>Battery: %{y:.1f} kWh<br>u*: %{z:.2f} kW<extra></extra>",
-        ), row=row, col=col)
-        fig.update_xaxes(title_text="Price (€/kWh)" if row == rows else "", row=row, col=col)
-        fig.update_yaxes(title_text="Battery (kWh)" if col == 1 else "", row=row, col=col)
-    fig.update_layout(height=350 * rows + 60, margin=dict(l=40, r=60, t=40, b=40))
-    return fig
-
-
-def _charge_threshold(pi, actions, lam_grid, T: int) -> np.ndarray:
-    """(T, N_e) highest price (€/kWh) at which the parked policy still charges, NaN if never."""
-    u        = actions[pi[:, 0, :, :]]                  # (T, N_e, K)
-    charging = u > 0
-    last_k   = (charging * (np.arange(len(lam_grid)) + 1)).max(axis=2) - 1   # (T, N_e)
-    return np.where(charging.any(axis=2),
-                    lam_grid[np.clip(last_k, 0, len(lam_grid) - 1)], np.nan)
-
-
-def fig_policy_threshold_grid(results: list[dict]) -> go.Figure:
-    """Charging price-threshold per swept value: charge while current price ≤ colour."""
-    import warnings
-    n = len(results)
-    rows, cols = _grid_dims(n)
-    fig = make_subplots(rows=rows, cols=cols, subplot_titles=[r["label"] for r in results],
-                        horizontal_spacing=0.06, vertical_spacing=0.12)
-    for idx, r in enumerate(results):
-        row = idx // cols + 1
-        col = idx % cols  + 1
-        T   = r["T"]
-        thr = _charge_threshold(r["pi"], r["actions"], r["lam_grid"], T)   # (T, N_e)
-        tb  = max(1, T // 48)
-        n_t = T // tb
-        with warnings.catch_warnings():           # all-NaN time bins are expected
-            warnings.simplefilter("ignore")
-            thr_b = np.nanmean(thr[:n_t * tb].reshape(n_t, tb, -1), axis=1)   # (n_t, N_e)
-        t_centers = (np.arange(n_t) + 0.5) * tb / 60
-        fig.add_trace(go.Heatmap(
-            x=t_centers, y=r["e_grid"], z=thr_b.T,
-            colorscale="Viridis",
-            showscale=(idx == 0),
-            colorbar=dict(title="€/kWh", x=1.01) if idx == 0 else None,
-            hovertemplate="Hour: %{x:.1f}<br>Battery: %{y:.1f} kWh<br>charge if price ≤ %{z:.3f} €/kWh<extra></extra>",
-        ), row=row, col=col)
-        fig.update_xaxes(title_text="Hour (h)" if row == rows else "", range=[0, T // 60],
-                         row=row, col=col)
-        fig.update_yaxes(title_text="Battery (kWh)" if col == 1 else "", row=row, col=col)
-    fig.update_layout(height=350 * rows + 60, margin=dict(l=40, r=60, t=40, b=40))
+    fig.update_layout(height=280 * rows + 70, margin=dict(l=40, r=60, t=55, b=40))
+    for ann in fig.layout.annotations:   # lift the per-panel titles off the plots a bit
+        ann.yshift = 10
     return fig
 
 
@@ -622,77 +591,6 @@ def fig_charge_boundary_grid(results: list[dict]) -> go.Figure:
     return fig
 
 
-def fig_breakeven_penalty(phi_results: list[dict], soc_fracs=(0.25, 0.5, 0.75)) -> go.Figure:
-    """Break-even penalty along a sampled price path (penalty sweep only).
-
-    Reuses the per-φ optimal policies already solved by the sweep.  At each minute of the
-    sampled price path, and for a few fixed battery levels, reports the smallest swept φ at
-    which the parked optimal policy would charge — i.e. how much unserved-driving penalty it
-    takes to justify charging *now*, given the current price and SoC.
-    """
-    rs = sorted(phi_results, key=lambda r: r["params"].phi)
-    if not rs or rs[0].get("sample_rollout") is None:
-        return go.Figure()
-    phis     = np.array([r["params"].phi for r in rs])
-    p0       = rs[0]["params"]
-    e_grid   = rs[0]["e_grid"]
-    T        = rs[0]["T"]
-    lam_traj = np.asarray(rs[0]["sample_rollout"]["lam_traj"])
-    k_t      = np.clip((lam_traj / (p0.lambda_max / p0.K)).astype(int), 0, p0.K - 1)   # (T,)
-    t_idx    = np.arange(T)
-    hours    = t_idx / 60
-
-    fig = go.Figure()
-    for i, frac in enumerate(soc_fracs):
-        e_idx   = int(np.argmin(np.abs(e_grid - frac * p0.e_max)))
-        charges = np.array([r["actions"][r["pi"][t_idx, 0, e_idx, k_t]] > 0 for r in rs])  # (n_φ, T)
-        any_c   = charges.any(axis=0)
-        phi_star = np.where(any_c, phis[np.argmax(charges, axis=0)], np.nan)
-        phi_star = np.where(phi_star > 0, phi_star, np.nan)   # guard log axis (φ=0 never charges)
-        fig.add_trace(go.Scatter(
-            x=hours, y=phi_star, mode="lines", name=f"SoC {int(frac * 100)}%",
-            line=dict(color=SWEEP_PALETTE[i], width=2, shape="hv"),
-            hovertemplate=f"Hour %{{x:.1f}}<br>need φ ≥ %{{y}} €/h<extra>SoC {int(frac*100)}%</extra>",
-        ))
-    fig.add_trace(go.Scatter(x=hours, y=lam_traj, mode="lines", name="price λ_t",
-                             line=dict(color="#bbbbbb", width=1), yaxis="y2", hoverinfo="skip"))
-    fig.update_layout(
-        xaxis_title="Hour (h)", height=440, margin=dict(l=55, r=55, t=30, b=40),
-        yaxis=dict(title="φ required to charge (€/h)", type="log"),
-        yaxis2=dict(title="price (€/kWh)", overlaying="y", side="right", showgrid=False),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-    )
-    return fig
-
-
-def fig_rollout_trajectories(results: list[dict]) -> go.Figure:
-    """One sample optimal-policy trajectory per swept value: price path (top) + battery SoC (bottom)."""
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.09, row_heights=[0.4, 0.6],
-        subplot_titles=("Sample price path (λ_t)", "Battery SoC under the optimal policy"),
-    )
-    for i, r in enumerate(results):
-        ro = r.get("sample_rollout")
-        if ro is None:
-            continue
-        color = SWEEP_PALETTE[i % len(SWEEP_PALETTE)]
-        hours = np.arange(len(ro["e_traj"])) / 60
-        fig.add_trace(go.Scatter(
-            x=hours, y=ro["lam_traj"], mode="lines", legendgroup=r["label"], showlegend=False,
-            line=dict(color=color, width=1, shape="hv"), name=r["label"],
-        ), row=1, col=1)
-        fig.add_trace(go.Scatter(
-            x=hours, y=ro["e_traj"], mode="lines", legendgroup=r["label"],
-            line=dict(color=color, width=2), name=r["label"],
-        ), row=2, col=1)
-    fig.update_layout(height=560, margin=dict(l=40, r=20, t=60, b=40),
-                      legend=dict(orientation="h", yanchor="bottom", y=1.05))
-    fig.update_yaxes(title_text="€/kWh", row=1, col=1)
-    fig.update_yaxes(title_text="Battery (kWh)", row=2, col=1)
-    fig.update_xaxes(title_text="Hour (h)", row=2, col=1)
-    return fig
-
-
 def fig_cost_distribution(results: list[dict], log_y: bool = True,
                           x_label: str = "Swept value", error: str = "sem") -> go.Figure:
     """Mean total cost (incl. penalty) over sampled rollouts, grouped bars per swept value.
@@ -703,12 +601,8 @@ def fig_cost_distribution(results: list[dict], log_y: bool = True,
     keeps low-cost policies readable when a high-variance benchmark dominates the scale.
     """
     labels = [r["label"] for r in results]
-    # Order policies ascending by overall mean cost (across swept values) → cheapest bar first.
-    overall = {p: float(np.mean([np.mean(_costs(r["rollouts"], p)) for r in results]))
-               for p in POLICY_ORDER}
-    ordered_policies = sorted(POLICY_ORDER, key=lambda p: overall[p])
     fig = go.Figure()
-    for policy in ordered_policies:
+    for policy in POLICY_ORDER:   # fixed canonical order → same order/colour in every figure
         means, errs = [], []
         for r in results:
             costs = _costs(r["rollouts"], policy)
@@ -729,7 +623,6 @@ def fig_cost_distribution(results: list[dict], log_y: bool = True,
         yaxis["dtick"] = 1   # one labelled tick per decade (10ⁿ) — drop the 2·/5· minor labels
     fig.update_layout(
         barmode="group",
-        xaxis_title=x_label,
         yaxis=yaxis,
         height=440,
         margin=dict(l=40, r=20, t=40, b=40),
@@ -771,6 +664,29 @@ def _get_gbins(exclude_crisis: bool) -> GaussianBinnedSampler:
     return st.session_state[key]
 
 
+_PRICE_MODEL_CLASSES = {
+    "Gaussian bins": GaussianBinnedSampler,
+    "GMM":           GMMSampler,
+    "MDN":           MDNSampler,
+}
+
+
+def _get_price_model(model_name: str):
+    """Fitted price sampler of the given type (crisis-excluded data, baseline context), cached."""
+    if model_name == "Gaussian bins":
+        return _get_gbins(exclude_crisis=True)   # reuse the already-cached bins fit
+    key = f"sa_pmodel_{model_name}"
+    if key not in st.session_state:
+        if "sa_price_df" not in st.session_state:
+            with st.spinner("Loading ENTSO-E price data…"):
+                st.session_state["sa_price_df"] = load_prices()
+        df = st.session_state["sa_price_df"]
+        df = df[~df["timestamp"].dt.year.isin(CRISIS_YEARS)]   # baseline: crisis-excluded
+        with st.spinner(f"Fitting {model_name} price model…"):
+            st.session_state[key] = _PRICE_MODEL_CLASSES[model_name]().fit(df)
+    return st.session_state[key]
+
+
 def _paper_config(filename: str) -> dict:
     """Plotly config so the modebar download button exports a clean, paper-ready vector SVG."""
     return {
@@ -786,129 +702,261 @@ def _chart(fig, filename: str):
 
 # (session-state key, folder name) for every sweep that can hold results.
 _SWEEP_RESULT_KEYS = [
+    ("sa_pricing_model_results",   "pricing_model"),
     ("sa_pricing_season_results",  "pricing_season"),
     ("sa_pricing_daytype_results", "pricing_daytype"),
     ("sa_pricing_crisis_results",  "pricing_crisis"),
     ("sa_phi_results",             "penalty"),
+    ("sa_beta_results",            "beta"),
     ("sa_horizon_results",         "horizon"),
     ("sa_departure_results",       "departure_profile"),
     ("sa_mobility_results",        "mobility_model"),
 ]
 
 
-def _build_figures_zip() -> tuple[bytes, int]:
-    """Render every computed sweep's figures to high-res PNG, bundled into a ZIP.
+# ── Per-model "baseline" figures (cost bar · optimal-policy heatmap · mean trajectory) ──
+# Filename prefix in the (flat) baseline_models/ folder for each mobility model.
+_MODEL_PREFIX = {
+    "Baseline":                 "baseline",
+    "NegBin trips (fixed k)":   "negbin",
+    "NegBin trips (sampled k)": "negbin_poisson",
+}
 
-    Returns (zip_bytes, n_figures).  One folder per sweep that has results.
-    """
-    import io, zipfile
-    buf, n = io.BytesIO(), 0
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for key, folder in _SWEEP_RESULT_KEYS:
-            results = st.session_state.get(key)
-            if not results:
-                continue
-            figs = {
-                "policy_heatmaps": fig_heatmap_grid(
-                    results, ncols={"sa_phi_results": 3, "sa_pricing_season_results": 2}.get(key, 1)),
-                "policy_vs_price": fig_policy_price_grid(results, 18),
-                "charge_border":   fig_charge_boundary_grid(results),
-                "price_threshold": fig_policy_threshold_grid(results),
-                "cost":            fig_cost_distribution(results),
-            }
-            if any(r.get("sample_rollout") for r in results):
-                figs["sample_rollout"] = fig_rollout_trajectories(results)
-            if key == "sa_phi_results":
-                figs["breakeven_penalty"] = fig_breakeven_penalty(results)
-            for name, fig in figs.items():
-                h = int(fig.layout.height or 500)
-                zf.writestr(f"{folder}/{name}.png",
-                            fig.to_image(format="png", width=1400, height=h, scale=2))
-                n += 1
-    return buf.getvalue(), n
+FIGURES_DIR = Path(__file__).parent.parent.parent / "figures"
 
 
-# ── Save / load snapshots ───────────────────────────────────────────────────────
-# Snapshots persist a fully-computed analysis to disk so plot tweaks (labels, axes,
-# colours) don't require re-solving.  The only non-picklable field in a result dict is
-# `pbp_fn` (a closure); it's used at render time only as pbp_fn(t) for t in range(T),
-# so we store a precomputed (T, K) weight table and rebuild the lookup on load.
+def _rgba(hex_color: str, alpha: float) -> str:
+    """rgba() string for a hex (#RRGGBB) or named colour, at the given opacity."""
+    named = {"orange": "255,165,0", "lightgray": "211,211,211"}
+    if hex_color.startswith("#"):
+        h = hex_color.lstrip("#")
+        return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{alpha})"
+    return f"rgba({named.get(hex_color, '128,128,128')},{alpha})"
 
-SAVED_DIR = Path(__file__).parent.parent.parent / "saved_analyses"
 
-
-def _serialize_results(results: list[dict]) -> list[dict]:
-    """Strip the unpicklable pbp_fn closure, replacing it with a (T, K) weight table."""
-    out = []
-    for r in results:
-        d = {k: v for k, v in r.items() if k != "pbp_fn"}
-        d["pbp_weights"] = np.stack([r["pbp_fn"](t) for t in range(r["T"])])
-        out.append(d)
+def _run_rollouts_full(pi, actions, e_grid, params, scenarios, rollout_fn, pbp_fn) -> dict:
+    """Like _run_rollouts but keeps each raw rollout (u_traj/chi_traj/cost_traj), not summary metrics."""
+    chi0 = 0
+    benchmarks = [
+        ("Night Charging",   night_charging_policy,   {}),
+        ("DP-Heuristic",     dp_heuristic_policy,      {"price_bin_probs_fn": pbp_fn}),
+        ("Always-Maximum", maximal_charging_policy,  {}),
+        ("Always-Minimum",   always_minimum_policy,    {}),
+        ("Price-Oriented",   price_oriented_policy,
+         {"low_threshold": params.price_night, "high_threshold": params.price_evening}),
+        ("Minimum-Charge",      minimum_soc_policy,       {"soc_threshold": params.e_max * 0.25}),
+    ]
+    out: dict[str, list] = {p: [] for p in POLICY_ORDER}
+    for sc in scenarios:
+        e0 = float(sc["e0"])
+        out["Backward Induction"].append(rollout_fn(
+            backward_induction_policy, sc, e0, chi0, params,
+            pi=pi, actions=actions, e_grid=e_grid))
+        for name, fn, kw in benchmarks:
+            out[name].append(rollout_fn(fn, sc, e0, chi0, params, **kw))
     return out
 
 
-def _deserialize_results(raw: list[dict]) -> list[dict]:
-    """Rebuild pbp_fn as a lookup over the stored (T, K) weight table."""
-    out = []
-    for d in raw:
-        r = {k: v for k, v in d.items() if k != "pbp_weights"}
-        w = d["pbp_weights"]
-        r["pbp_fn"] = lambda t, w=w: w[t]
-        out.append(r)
-    return out
+def _baseline_cost_fig(full: dict) -> go.Figure:
+    """Per-policy mean total cost (incl. penalty), log axis, ordered cheapest→dearest, ±SEM."""
+    names, means, errs = list(full), [], []
+    for name in names:
+        costs = np.array([r["cost_traj"].sum() for r in full[name]])
+        m  = len(costs)
+        sd = float(costs.std(ddof=1)) if m > 1 else 0.0
+        means.append(float(costs.mean()))
+        errs.append(sd / np.sqrt(m) if m > 0 else 0.0)
+    minus = [min(e, mu) for mu, e in zip(means, errs)]
+    fig = go.Figure(go.Bar(
+        x=names, y=means, marker_color=[POLICY_COLORS[n] for n in names],
+        error_y=dict(type="data", symmetric=False, array=errs, arrayminus=minus,
+                     visible=True, thickness=1.2, width=4)))
+    fig.update_layout(yaxis=dict(title="Mean total cost incl. penalty (€)  [log]", type="log", dtick=1),
+                      xaxis_title="Policy", height=460, margin=dict(l=40, r=20, t=20, b=110),
+                      showlegend=False)
+    fig.update_xaxes(categoryorder="array", categoryarray=POLICY_ORDER)   # fixed canonical order
+    return fig
 
 
-def _save_snapshot(name: str) -> Path:
-    """Pickle every computed sweep (gzip-compressed) under a timestamped file name."""
-    import gzip, pickle, datetime
-    bundle = {
-        "meta": {
-            "name":       name,
-            "saved_at":   datetime.datetime.now().isoformat(timespec="seconds"),
-            "N_rollouts": st.session_state.get("sa_N_rollouts"),
-            "N_e":        st.session_state.get("sa_N_e"),
-            "seed":       st.session_state.get("sa_seed"),
-            "sweeps":     [],
-        },
-        "sweeps": {},
+def _baseline_traj_fig(full: dict, scenarios: list, T: int, params) -> go.Figure:
+    """Scenario-averaged trajectories: price, mobility, per-policy charge rate (±SEM bands)."""
+    hours, T_hours = np.arange(T) / 60, T // 60
+    n = max(len(scenarios), 1)
+    sem = lambda a: a.std(axis=0) / np.sqrt(n)
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                        subplot_titles=("Mean price λ̄<sub>t</sub>",
+                                        "Mean mobility — 0 parked, 1 driving",
+                                        "Mean charge rate u per policy"))
+
+    def band(mean, half, color, name, row, legend=False):
+        fill = _rgba(color, 0.12)
+        fig.add_trace(go.Scatter(x=hours, y=mean + half, mode="lines", line=dict(width=0),
+                                 showlegend=False, hoverinfo="skip", legendgroup=name), row=row, col=1)
+        fig.add_trace(go.Scatter(x=hours, y=mean - half, mode="lines", line=dict(width=0),
+                                 fill="tonexty", fillcolor=fill, showlegend=False,
+                                 hoverinfo="skip", legendgroup=name), row=row, col=1)
+        fig.add_trace(go.Scatter(x=hours, y=mean, mode="lines", line=dict(color=color, width=1.6),
+                                 name=name, legendgroup=name, showlegend=legend), row=row, col=1)
+
+    P = np.array([sc["lam_path"] for sc in scenarios])
+    band(P.mean(0), sem(P), "lightgray", "λ̄<sub>t</sub>", row=1)
+    Mob = np.array([(r["chi_traj"] > 0).astype(float) for r in full["Backward Induction"]])
+    band(Mob.mean(0), sem(Mob), "orange", "driving", row=2)
+    for name, rolls in full.items():
+        U = np.array([r["u_traj"] for r in rolls])
+        band(U.mean(0), sem(U), POLICY_COLORS[name], name, row=3, legend=True)
+
+    fig.update_layout(height=900, margin=dict(l=40, r=30, t=60, b=40),
+                      legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    fig.update_xaxes(range=[0, T_hours], dtick=max(T_hours // 8, 1))
+    fig.update_xaxes(title_text="Hour (h)", row=3, col=1)
+    fig.update_yaxes(title_text="€/kWh", row=1, col=1)
+    fig.update_yaxes(title_text="Fraction driving", tickvals=[0, 0.5, 1], row=2, col=1)
+    fig.update_yaxes(title_text="u (kW)", range=[-0.2, params.u_max + 0.5], row=3, col=1)
+    return fig
+
+
+def _baseline_model_figs(result: dict, N_rollouts: int, seed: int) -> dict:
+    """The three per-model figures: cost bar, optimal-policy heatmap, mean trajectory."""
+    model, params, T, pbp_fn = result["model"], result["params"], result["T"], result["pbp_fn"]
+    scenarios = [_make_scenario(params, seed + i, T) for i in range(N_rollouts)]  # Gaussian parametric
+    full = _run_rollouts_full(result["pi"], result["actions"], result["e_grid"],
+                              params, scenarios, _rollout_fn(model), pbp_fn)
+    return {
+        "baseline_cost":           _baseline_cost_fig(full),
+        "baseline_optimal_policy": fig_heatmap_grid([result], show_titles=False),
+        "baseline_trajectories":   _baseline_traj_fig(full, scenarios, T, params),
     }
-    for key, _folder in _SWEEP_RESULT_KEYS:
+
+
+def _export_baseline_result(model: str, N_e: int) -> dict:
+    """Solve one canonical baseline-export model for single-figure export."""
+    T = 24 * 60
+    params = _build_params(model)
+    pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
+    pi, actions, e_grid, lam_grid = _solve(model, params, pbp_fn, T, N_e)
+    return {"model": model, "label": model, "params": params, "pbp_fn": pbp_fn,
+            "pi": pi, "actions": actions, "e_grid": e_grid, "lam_grid": lam_grid, "T": T}
+
+
+def _figure_png_bytes(fig: go.Figure) -> bytes:
+    """Render one export figure to high-res PNG bytes."""
+    h = int(fig.layout.height or 500)
+    return fig.to_image(format="png", width=1400, height=h, scale=2)
+
+
+def _sweep_export_ids(key: str) -> list[str]:
+    """Export figure IDs for one computed sweep."""
+    return [f"sweep:{key}:{name}" for name in ("policy_heatmaps", "charge_border", "cost")]
+
+
+def _auto_download_png(filename: str, data: bytes, token: str) -> None:
+    """Ask the browser to download one PNG immediately, with no extra user click.
+
+    Browsers may block repeated automatic downloads until the user allows them for the app.
+    The sidebar also keeps fallback download buttons for completed run-all exports.
+    """
+    import base64
+    import html
+    import re
+
+    element_id = "sa_dl_" + re.sub(r"[^A-Za-z0-9_-]", "_", token)
+    safe_filename = html.escape(filename, quote=True)
+    b64 = base64.b64encode(data).decode("ascii")
+    components.html(
+        f"""
+        <a id="{element_id}" download="{safe_filename}" href="data:image/png;base64,{b64}"></a>
+        <script>
+        const link = document.getElementById("{element_id}");
+        if (link) link.click();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def _available_export_figures() -> list[dict]:
+    """Figures that can currently be rendered one at a time for download."""
+    items = [
+        {"id": "baseline:Baseline:cost", "path": "baseline_models/baseline_cost.png",
+         "label": "baseline_models / baseline_cost"},
+        {"id": "baseline:Baseline:optimal_policy", "path": "baseline_models/baseline_optimal_policy.png",
+         "label": "baseline_models / baseline_optimal_policy"},
+        {"id": "baseline:Baseline:trajectories", "path": "baseline_models/baseline_trajectories.png",
+         "label": "baseline_models / baseline_trajectories"},
+        {"id": "baseline:NegBin trips (fixed k):trajectories", "path": "baseline_models/negbin_trajectories.png",
+         "label": "baseline_models / negbin_trajectories"},
+        {"id": "baseline:NegBin trips (sampled k):trajectories", "path": "baseline_models/negbin_poisson_trajectories.png",
+         "label": "baseline_models / negbin_poisson_trajectories"},
+        {"id": "trip_duration", "path": "baseline_models/trip_duration_by_model.png",
+         "label": "baseline_models / trip_duration_by_model"},
+    ]
+    for key, folder in _SWEEP_RESULT_KEYS:
+        if not st.session_state.get(key):
+            continue
+        for name in ("policy_heatmaps", "charge_border", "cost"):
+            items.append({
+                "id": f"sweep:{key}:{name}",
+                "path": f"sensitivity_figures/{folder}/{name}.png",
+                "label": f"sensitivity_figures / {folder} / {name}",
+            })
+    return items
+
+
+def _render_export_figure(export_id: str) -> tuple[str, bytes]:
+    """Render the selected export figure and return (relative export path, png bytes)."""
+    if export_id == "trip_duration":
+        path = "baseline_models/trip_duration_by_model.png"
+        return path, _figure_png_bytes(trip_duration_figure(compute_trip_durations()))
+
+    kind, *parts = export_id.split(":")
+    if kind == "baseline":
+        model, figure_name = parts
+        result = _export_baseline_result(model, int(st.session_state.get("sa_N_e", 500)))
+        if figure_name == "optimal_policy":
+            fig = fig_heatmap_grid([result], show_titles=False)
+        else:
+            figs = _baseline_model_figs(
+                result,
+                int(st.session_state.get("sa_N_rollouts", 200)),
+                int(st.session_state.get("sa_seed", 42)),
+            )
+            fig = figs[f"baseline_{figure_name}"]
+        prefix = _MODEL_PREFIX[model]
+        path = (f"baseline_models/{prefix}_{figure_name}.png"
+                if model != "Baseline" else f"baseline_models/baseline_{figure_name}.png")
+        return path, _figure_png_bytes(fig)
+
+    if kind == "sweep":
+        key, figure_name = parts
         results = st.session_state.get(key)
-        if results:
-            bundle["sweeps"][key] = _serialize_results(results)
-            bundle["meta"]["sweeps"].append(key)
+        if not results:
+            raise ValueError("Selected sweep has no results.")
+        folder = dict(_SWEEP_RESULT_KEYS)[key]
+        if figure_name == "policy_heatmaps":
+            ncols = {"sa_phi_results": 3, "sa_beta_results": 3, "sa_pricing_season_results": 2,
+                     "sa_mobility_results": 2}.get(key, 1)
+            fig = fig_heatmap_grid(results, ncols=ncols)
+        elif figure_name == "charge_border":
+            fig = fig_charge_boundary_grid(results)
+        elif figure_name == "cost":
+            fig = fig_cost_distribution(results)
+        else:
+            raise ValueError(f"Unknown export figure: {figure_name}")
+        path = f"sensitivity_figures/{folder}/{figure_name}.png"
+        return path, _figure_png_bytes(fig)
 
-    SAVED_DIR.mkdir(exist_ok=True)
-    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name) or "snapshot"
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = SAVED_DIR / f"{safe}_{stamp}.pkl.gz"
-    with gzip.open(path, "wb") as f:
-        pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
-    return path
-
-
-def _list_snapshots() -> list[Path]:
-    """Saved snapshot files, newest first."""
-    if not SAVED_DIR.exists():
-        return []
-    return sorted(SAVED_DIR.glob("*.pkl.gz"), key=lambda p: p.stat().st_mtime, reverse=True)
-
-
-def _load_snapshot(path: Path) -> dict:
-    """Read a snapshot and restore every sweep into session_state. Returns its meta dict."""
-    import gzip, pickle
-    with gzip.open(path, "rb") as f:
-        bundle = pickle.load(f)
-    for key, raw in bundle["sweeps"].items():
-        st.session_state[key] = _deserialize_results(raw)
-    return bundle["meta"]
+    raise ValueError(f"Unknown export id: {export_id}")
 
 
 SWEEP_AXIS_LABEL = {
+    "pricing_model":     "Pricing model",
     "pricing_season":    "Season",
     "pricing_daytype":   "Day type",
     "pricing_crisis":    "Energy-crisis data",
     "penalty":           "Penalty φ (€/h)",
+    "beta":              "Discount factor β",
     "horizon":           "Horizon T (h)",
     "departure_profile": "Departure profile",
     "mobility_model":    "Mobility model",
@@ -922,16 +970,8 @@ def _show_results(results: list[dict], sweep_label: str):
         st.caption("Mobility model: **varies by panel**" if len(models) > 1
                    else f"Mobility model: **{next(iter(models))}**")
     st.subheader("Policy heatmaps")
-    _heatmap_ncols = {"penalty": 3, "pricing_season": 2}.get(sweep_label, 1)
+    _heatmap_ncols = {"penalty": 3, "beta": 3, "pricing_season": 2, "mobility_model": 2}.get(sweep_label, 1)
     _chart(fig_heatmap_grid(results, ncols=_heatmap_ncols), f"{sweep_label}_policy_heatmaps")
-
-    st.subheader("Optimal policy vs price")
-    st.caption(
-        "u*(battery × price) at the selected hour — keeps the price axis instead of averaging "
-        "it out, so the charge-vs-defer price response is visible (it's flat in the heatmap above)."
-    )
-    ppmap_hour = st.slider("Hour of day", 0, 23, 12, key=f"sa_ppmap_hour_{sweep_label}")
-    _chart(fig_policy_price_grid(results, ppmap_hour), f"{sweep_label}_policy_vs_price")
 
     st.subheader("Charge / no-charge border (all hours)")
     st.caption(
@@ -940,21 +980,6 @@ def _show_results(results: list[dict], sweep_label: str):
         "so you can see the border move across the day without picking a single hour."
     )
     _chart(fig_charge_boundary_grid(results), f"{sweep_label}_charge_border")
-
-    st.subheader("Charging price threshold")
-    st.caption(
-        "Colour = the highest price at which the parked policy still charges (charge while "
-        "price ≤ colour). Collapses the price response to one surface; blank = never charges."
-    )
-    _chart(fig_policy_threshold_grid(results), f"{sweep_label}_price_threshold")
-
-    if any(r.get("sample_rollout") for r in results):
-        st.subheader("Sample rollout (optimal policy)")
-        st.caption(
-            "One simulated 24 h+ trajectory per swept value — the price path it faced (top) and "
-            "the resulting battery SoC under the optimal policy (bottom). Shows what the policy does."
-        )
-        _chart(fig_rollout_trajectories(results), f"{sweep_label}_sample_rollout")
 
     st.subheader("Mean cost")
     st.caption("Mean total cost per sampled trip — **including the unserved-driving penalty** — "
@@ -996,7 +1021,7 @@ battery e_max = 40 kWh · η_c = 0.95 · u_max = 11 kW · φ = 1000 €/h · K =
 ENTSO-E data **excluding** the 2021–23 crisis; the data-driven models (bins/GMM/MDN) train on **all**
 years. Negative wholesale prices (~2.6% of hours) are floored to 0.
 
-**Policies compared:** Optimal (Backward induction) · Night charging · DP heuristic · Maximal charging · Always minimum
+**Policies compared:** Optimal (Backward Induction) · Night Charging · DP-Heuristic · Always-Maximum · Always-Minimum
 
 **Mobility model** (sidebar — applies to every sweep):
 - **Baseline** — trip ~ Geom(p_DP); 2-state chain; default E[T] ≈ 11 min.
@@ -1014,7 +1039,7 @@ years. Negative wholesale prices (~2.6% of hours) are floored to 0.
 
 > **Reading the Pricing tab:** each pricing model is solved *and* evaluated in its **own** price
 > world. Compare policies *within* a column (which policy wins, optimality gap, feasibility) — not
-> absolute costs *across* columns. The DP heuristic uses each world's own price distribution.
+> absolute costs *across* columns. The DP-Heuristic uses each world's own price distribution.
 > NegBin models have more mobility states → slower solves; lower **N_e** if needed.
 > Re-run a single sweep with its **Run** button.
     """)
@@ -1033,66 +1058,44 @@ with st.sidebar:
     if st.button("▶ Run all sweeps", type="primary", use_container_width=True, key="sa_run_all"):
         st.session_state["sa_run_all_triggered"] = True
         st.rerun()
-    st.caption("Computes every sweep once; results persist across tabs.")
+    run_all_auto_export = st.checkbox(
+        "Also auto-download export figures during run-all",
+        value=True,
+        key="sa_run_all_auto_export",
+    )
+    st.caption("Computes every sweep once; results persist across tabs. Each sweep's export PNGs "
+               "are saved under `figures/` as soon as that sweep completes. Auto-download also "
+               "asks the browser to download each PNG.")
 
-    if st.button("📦 Build figure ZIP", use_container_width=True, key="sa_build_zip"):
-        with st.spinner("Rendering all figures to PNG…"):
-            data, n_figs = _build_figures_zip()
-        if n_figs == 0:
-            st.warning("No results yet — run a sweep first.")
-        else:
-            st.session_state["sa_fig_zip"] = data
-            st.session_state["sa_fig_zip_n"] = n_figs
-    if "sa_fig_zip" in st.session_state:
-        st.download_button(
-            f"⬇ Download {st.session_state['sa_fig_zip_n']} figures (ZIP)",
-            st.session_state["sa_fig_zip"], "sensitivity_figures.zip",
-            "application/zip", use_container_width=True, key="sa_dl_zip",
-        )
-
-    st.divider()
-    st.header("Saved analyses")
-    st.caption("Snapshot computed results to disk, then reload them later — so tweaking "
-               "plot labels/axes doesn't require re-solving.")
-
-    # Save: bundle every computed sweep under a user-supplied name.
-    _computed = [k for k, _ in _SWEEP_RESULT_KEYS if st.session_state.get(k)]
-    snap_name = st.text_input("Snapshot name", value="analysis", key="sa_snap_name")
-    if st.button("💾 Save current results", use_container_width=True, key="sa_save_snap",
-                 disabled=not _computed):
-        path = _save_snapshot(snap_name)
-        st.success(f"Saved {len(_computed)} sweep(s) → {path.name}")
-    if not _computed:
-        st.caption("No results computed yet — run a sweep first.")
-
-    # Load: pick an existing snapshot and restore it into session_state.
-    snaps = _list_snapshots()
-    if snaps:
-        labels = {p.name: p for p in snaps}
-        chosen = st.selectbox("Load snapshot", list(labels), key="sa_load_pick")
-        lc1, lc2 = st.columns(2)
-        with lc1:
-            if st.button("📂 Load", use_container_width=True, key="sa_load_snap"):
-                meta = _load_snapshot(labels[chosen])
-                st.session_state["sa_loaded_meta"] = meta
-                st.rerun()
-        with lc2:
-            if st.button("🗑 Delete", use_container_width=True, key="sa_del_snap"):
-                labels[chosen].unlink()
-                st.rerun()
-        if "sa_loaded_meta" in st.session_state:
-            m = st.session_state["sa_loaded_meta"]
-            st.caption(f"Loaded **{m.get('name')}** — {len(m.get('sweeps', []))} sweep(s), "
-                       f"N_rollouts={m.get('N_rollouts')}, N_e={m.get('N_e')}, "
-                       f"seed={m.get('seed')} · saved {m.get('saved_at')}")
+    if st.session_state.get("sa_run_all_exports"):
+        with st.expander("Completed run-all exports", expanded=False):
+            for i, item in enumerate(st.session_state["sa_run_all_exports"]):
+                st.download_button(
+                    f"⬇ {item.get('path', item['label'])}",
+                    item["data"],
+                    item["filename"],
+                    "image/png",
+                    use_container_width=True,
+                    key=f"sa_run_all_export_dl_{i}_{item['filename']}",
+                )
+    if st.session_state.get("sa_run_all_export_errors"):
+        with st.expander("Run-all export errors", expanded=False):
+            for err in st.session_state["sa_run_all_export_errors"]:
+                st.caption(err)
 
 # ── Run-all orchestration ─────────────────────────────────────────────────────
 
 if st.session_state.pop("sa_run_all_triggered", False):
     bar = st.progress(0.0, text="Starting…")
+    st.session_state["sa_run_all_exports"] = []
+    st.session_state["sa_run_all_export_errors"] = []
     _s_excl = _get_gbins(exclude_crisis=True)
     _s_incl = _get_gbins(exclude_crisis=False)
     _steps = [
+        ("Pricing · model",     "sa_pricing_model_results",
+         lambda cb: sweep_pricing_model(
+             {m: _get_price_model(m) for m in ("Gaussian bins", "GMM", "MDN")},
+             N_rollouts, N_e, seed, cb)),
         ("Pricing · season",    "sa_pricing_season_results",
          lambda cb: sweep_pricing_season(_s_excl, N_rollouts, N_e, seed, cb)),
         ("Pricing · day-type",  "sa_pricing_daytype_results",
@@ -1101,6 +1104,8 @@ if st.session_state.pop("sa_run_all_triggered", False):
          lambda cb: sweep_pricing_crisis(_s_excl, _s_incl, N_rollouts, N_e, seed, cb)),
         ("Penalty",             "sa_phi_results",
          lambda cb: sweep_penalty(BASELINE_MODEL, N_rollouts, N_e, seed, cb)),
+        ("Discount β",          "sa_beta_results",
+         lambda cb: sweep_beta(BASELINE_MODEL, N_rollouts, N_e, seed, cb)),
         ("Horizon",             "sa_horizon_results",
          lambda cb: sweep_horizon(BASELINE_MODEL, N_rollouts, N_e, seed, cb)),
         ("Departure",           "sa_departure_results",
@@ -1109,30 +1114,87 @@ if st.session_state.pop("sa_run_all_triggered", False):
          lambda cb: sweep_mobility_models(N_rollouts, N_e, seed, cb)),
     ]
     n = len(_steps)
+
+    def _emit_export(export_id: str, seq: int) -> int:
+        labels_by_id = {item["id"]: item["label"] for item in _available_export_figures()}
+        label = labels_by_id.get(export_id, export_id)
+        bar.progress(min((i + 0.9) / n, 1.0), text=f"Rendering export: {label}")
+        try:
+            rel_path, data = _render_export_figure(export_id)
+            out_path = FIGURES_DIR / rel_path
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(data)
+        except Exception as exc:
+            st.session_state["sa_run_all_export_errors"].append(f"{label}: {exc}")
+            return seq
+        st.session_state["sa_run_all_exports"].append({
+            "label": label,
+            "filename": rel_path.replace("/", "__"),
+            "path": str(out_path.relative_to(Path(__file__).parent.parent.parent)),
+            "data": data,
+        })
+        if run_all_auto_export:
+            _auto_download_png(rel_path.replace("/", "__"), data, f"run_all_{seq}_{rel_path}")
+        return seq + 1
+
+    export_seq = 0
     for i, (name, key, fn) in enumerate(_steps):
         st.session_state[key] = fn(
             lambda f, m, i=i, name=name: bar.progress((i + f) / n, text=f"{name}: {m}"))
-    bar.progress(1.0, text="Rendering figure ZIP…")
-    data, n_figs = _build_figures_zip()
-    st.session_state["sa_fig_zip"]   = data
-    st.session_state["sa_fig_zip_n"] = n_figs
+        for export_id in _sweep_export_ids(key):
+            export_seq = _emit_export(export_id, export_seq)
+
+    for export_id in [
+        "baseline:Baseline:cost",
+        "baseline:Baseline:optimal_policy",
+        "baseline:Baseline:trajectories",
+        "baseline:NegBin trips (fixed k):trajectories",
+        "baseline:NegBin trips (sampled k):trajectories",
+        "trip_duration",
+    ]:
+        export_seq = _emit_export(export_id, export_seq)
+
+    bar.progress(1.0, text="Done.")
     bar.empty()
-    st.rerun()
+    st.success(
+        f"Run-all complete. Saved {len(st.session_state['sa_run_all_exports'])} export PNG(s) "
+        f"under `{FIGURES_DIR.relative_to(Path(__file__).parent.parent.parent)}/`. "
+        "If the browser blocked automatic downloads, use the completed-export buttons in the sidebar."
+    )
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_price, tab_phi, tab_T, tab_departure, tab_mobility = st.tabs(
-    ["Pricing Model", "Penalty φ", "Horizon T", "Departure Profile", "Mobility Model"]
+tab_price, tab_phi, tab_beta, tab_T, tab_departure, tab_mobility = st.tabs(
+    ["Pricing Model", "Penalty φ", "Discount β", "Horizon T", "Departure Profile", "Mobility Model"]
 )
 
 # ─── Tab 1: Pricing model (Gaussian bins, real data) ──────────────────────────
 with tab_price:
     st.markdown(
-        "Real-data pricing via the **Gaussian-bins** model. Three sub-sweeps vary the price "
-        "context one factor at a time; the others are held at baseline (spring · weekday · "
-        "crisis-excluded). All use the Baseline mobility model."
+        "Real-data pricing on ENTSO-E DK1 data. Four sub-sweeps vary one factor at a time; the "
+        "others are held at baseline (Gaussian bins · spring · weekday · crisis-excluded). "
+        "All use the Baseline mobility model."
     )
-    sub_season, sub_daytype, sub_crisis = st.tabs(["Season", "Weekday/Weekend", "Energy crisis"])
+    sub_model, sub_season, sub_daytype, sub_crisis = st.tabs(
+        ["Pricing model", "Season", "Weekday/Weekend", "Energy crisis"])
+
+    with sub_model:
+        st.caption("Vary the price model (Gaussian bins · GMM · MDN) — held at spring · weekday · "
+                   "crisis-excluded. Each model is fitted on the same ENTSO-E data and drives its "
+                   "own sampled price world. (MDN fitting trains a neural net — first run is slower.)")
+        if st.button("Run pricing-model sweep", key="sa_run_pmodel"):
+            st.session_state.pop("sa_pricing_model_results", None)
+            samplers = {m: _get_price_model(m) for m in ("Gaussian bins", "GMM", "MDN")}
+            bar = st.progress(0.0, text="Starting…")
+            with st.spinner("Running pricing-model sweep…"):
+                st.session_state["sa_pricing_model_results"] = sweep_pricing_model(
+                    samplers, N_rollouts, N_e, seed,
+                    progress_cb=lambda f, m: bar.progress(f, text=m))
+            bar.empty(); st.rerun()
+        if "sa_pricing_model_results" in st.session_state:
+            _show_results(st.session_state["sa_pricing_model_results"], "pricing_model")
+        else:
+            st.info("Click **Run pricing-model sweep** to compute results.")
 
     with sub_season:
         st.caption("Vary season — held at weekday, crisis-excluded.")
@@ -1205,18 +1267,35 @@ with tab_phi:
 
     if "sa_phi_results" in st.session_state:
         _show_results(st.session_state["sa_phi_results"], "penalty")
-        st.subheader("Break-even penalty along a trajectory")
-        st.caption(
-            "Along one sampled price path, the smallest φ at which the optimal policy would "
-            "charge *now* — evaluated at fixed SoC levels. Low = charging pays off even with a "
-            "tiny penalty (low SoC / pre-departure); high = needs a large penalty to bother."
-        )
-        _chart(fig_breakeven_penalty(st.session_state["sa_phi_results"]),
-               "penalty_breakeven")
     else:
         st.info("Click **Run penalty sweep** to compute results.")
 
-# ─── Tab 3: Horizon T ─────────────────────────────────────────────────────────
+# ─── Tab 3: Discount factor β ─────────────────────────────────────────────────
+with tab_beta:
+    st.markdown(
+        f"Sweeps the discount factor β ∈ {BETA_VALUES} over a 24 h horizon.  "
+        "Uses Gaussian parametric pricing.  All other params at baseline.  "
+        "(Horizon T is its own sweep in the **Horizon T** tab.)"
+    )
+    if st.button("Run discount-β sweep", key="sa_run_beta"):
+        st.session_state.pop("sa_beta_results", None)
+
+        bar = st.progress(0.0, text="Starting…")
+        with st.spinner("Running discount-β sweep…"):
+            results = sweep_beta(
+                model_label=BASELINE_MODEL, N_rollouts=N_rollouts, N_e=N_e, seed=seed,
+                progress_cb=lambda frac, msg: bar.progress(frac, text=msg),
+            )
+        st.session_state["sa_beta_results"] = results
+        bar.empty()
+        st.rerun()
+
+    if "sa_beta_results" in st.session_state:
+        _show_results(st.session_state["sa_beta_results"], "beta")
+    else:
+        st.info("Click **Run discount-β sweep** to compute results.")
+
+# ─── Tab 4: Horizon T ─────────────────────────────────────────────────────────
 with tab_T:
     st.markdown(
         f"Compares horizon lengths T ∈ {HORIZON_HOURS} h.  "
@@ -1271,9 +1350,10 @@ with tab_departure:
 # ─── Tab 6: Mobility model ────────────────────────────────────────────────────
 with tab_mobility:
     st.markdown(
-        f"Compares the mobility models {MODEL_LABELS} over a 24 h horizon.  "
-        "Uses Gaussian parametric pricing; all other params at baseline — so the differences "
-        "isolate the effect of the *trip-duration / departure dynamics* of each model."
+        "Compares NegBin mobility models over a 24 h horizon: **{fixed-k, Poisson-k} × {k=5, k=10}** "
+        "(4 configs).  Uses Gaussian parametric pricing; all other params at baseline — so the "
+        "differences isolate the effect of the *trip-duration dynamics* (larger k → longer trips).  "
+        "The Baseline (binomial) model is shown in the figure-export's `baseline_models/` instead."
     )
     if st.button("Run mobility-model sweep", key="sa_run_mobility"):
         st.session_state.pop("sa_mobility_results", None)

@@ -12,7 +12,7 @@ class SharedParams:
     # ── Charging / cost ───────────────────────────────────────────────────────
     eta_c: float = 0.95
     phi: float = 1000.0
-    beta: float = 0.999
+    beta: float = 1.0
 
     # ── Vehicle dynamics ──────────────────────────────────────────────────────
     v: float = 50.0

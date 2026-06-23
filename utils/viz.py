@@ -1,12 +1,24 @@
-"""Shared plotting constants so colours/labels stay consistent across all app pages."""
+"""Shared plotting constants so colours/labels/order stay consistent across all app pages."""
 
-# Canonical policy → colour map (single source of truth for every page).
+# Canonical policy order — the SAME order in every cost bar chart / legend.
+POLICY_ORDER = [
+    "Backward Induction",
+    "DP-Heuristic",
+    "Price-Oriented",
+    "Night Charging",
+    "Always-Maximum",
+    "Minimum-Charge",
+    "Always-Minimum",
+]
+
+# Canonical policy → colour map (single source of truth; same colour everywhere).
+# Keys follow POLICY_ORDER; each policy keeps its colour across all figures.
 POLICY_COLORS = {
-    "Backward induction": "#4477AA",
-    "DP heuristic":       "#009988",
-    "Maximal charging":   "#228833",
-    "Price-oriented":     "#EE6677",
-    "Night charging":     "#AA3377",
-    "Minimum SoC":        "#EE7733",
-    "Always minimum":     "#BBBBBB",
+    "Backward Induction": "#4477AA",
+    "DP-Heuristic":       "#009988",
+    "Price-Oriented":     "#EE6677",
+    "Night Charging":     "#AA3377",
+    "Always-Maximum":   "#228833",
+    "Minimum-Charge":     "#EE7733",
+    "Always-Minimum":     "#BBBBBB",
 }

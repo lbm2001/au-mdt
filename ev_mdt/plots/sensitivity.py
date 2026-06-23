@@ -18,10 +18,6 @@ def _costs(rollout_results: dict, policy: str) -> np.ndarray:
     return np.array([m["Total cost (€)"] for m in rollout_results[policy]])
 
 
-def _mean_u(rollout_results: dict, policy: str) -> float:
-    return float(np.mean([m["Mean charge rate while parked (kW)"] for m in rollout_results[policy]]))
-
-
 def _opt_rates_averaged(pi, actions, params, pbp_fn, T: int) -> np.ndarray:
     """u*(t, e) averaged over price bins for parked state (chi=0)."""
     desired = actions[pi[:, 0, :, :]]                              # (T, N_e, K)
@@ -183,18 +179,40 @@ def fig_cost_distribution(results: list[dict], log_y: bool = True,
     return fig
 
 
+# Metric columns shared with the Policy-Rollout table (excluding the
+# Swept value / Policy identifier columns). Used for display formatting.
+SUMMARY_METRIC_FORMATS = {
+    "Mean cost (€)":             "{:.3f}",
+    "Std cost (€)":              "{:.3f}",
+    "Median cost (€)":           "{:.3f}",
+    "Mean penalty min":          "{:.1f}",
+    "% scenarios with penalty":  "{:.1f}%",
+    "Mean energy charged (kWh)": "{:.2f}",
+    "Mean final battery (kWh)":  "{:.2f}",
+}
+
+
 def build_summary_df(results: list[dict]) -> pd.DataFrame:
-    """One row per (swept_value, policy) with key metrics."""
+    """One row per (swept_value, policy) with the same metrics as the Policy-Rollout table."""
     rows = []
     for r in results:
         for policy in POLICY_ORDER:
-            costs = _costs(r["rollouts"], policy)
+            mlist   = r["rollouts"][policy]
+            costs   = np.array([m["Total cost (€)"]      for m in mlist])
+            pen     = np.array([m["Penalty minutes"]      for m in mlist])
+            energy  = np.array([m["Energy charged (kWh)"] for m in mlist])
+            final_e = np.array([m["Final battery (kWh)"]  for m in mlist])
+            n = len(costs)
             rows.append({
-                "Swept value":         r["label"],
-                "Policy":              policy,
-                "Mean cost (€)":       round(float(np.mean(costs)), 4),
-                "Std cost (€)":        round(float(np.std(costs, ddof=1)), 4),
-                "Mean u parked (kW)":  round(_mean_u(r["rollouts"], policy), 3),
+                "Swept value":               r["label"],
+                "Policy":                    policy,
+                "Mean cost (€)":             float(costs.mean()),
+                "Std cost (€)":              float(costs.std(ddof=1)) if n > 1 else 0.0,
+                "Median cost (€)":           float(np.median(costs)),
+                "Mean penalty min":          float(pen.mean()),
+                "% scenarios with penalty":  float((pen > 0).mean() * 100),
+                "Mean energy charged (kWh)": float(energy.mean()),
+                "Mean final battery (kWh)":  float(final_e.mean()),
             })
     return pd.DataFrame(rows)
 

@@ -288,11 +288,14 @@ def sweep_pricing_daytype(sampler, N_rollouts: int, N_e: int, seed: int,
     return results
 
 
-def sweep_pricing_crisis(sampler_excl, sampler_incl, N_rollouts: int, N_e: int, seed: int,
+def sweep_pricing_crisis(sampler_excl, sampler_incl, sampler_crisis,
+                          N_rollouts: int, N_e: int, seed: int,
                           progress_cb: Callable | None = None,
                           _log: Callable | None = None) -> list[dict]:
     """Gaussian Bins: vary crisis inclusion, held at spring + weekday."""
-    items = [("Excluding crisis", sampler_excl), ("Including crisis", sampler_incl)]
+    items = [("Excluding crisis", sampler_excl),
+             ("Including crisis", sampler_incl),
+             ("Crisis only",      sampler_crisis)]
     results = []
     for i, (label, sampler) in enumerate(items):
         if progress_cb: progress_cb(i / len(items), f"Solving {label}…")
@@ -479,16 +482,31 @@ def run_all_sweeps(
 
     needs_pricing = any(s.startswith("pricing") for s in sweeps)
 
-    sampler_excl = sampler_incl = None
+    def _fit_progress(label: str) -> Callable | None:
+        """Route a sampler's _progress(fraction, msg) into the live heartbeat line.
+
+        Updates in place (no new line per epoch/bin); only active when a
+        progress_cb is present, since the coarse _log markers already cover the
+        no-callback case.
+        """
+        if progress_cb is None:
+            return None
+        return lambda _frac, msg: progress_cb(0.0, f"{label}: {msg}")
+
+    sampler_excl = sampler_incl = sampler_crisis = None
     df = df_excl = None
     if needs_pricing:
         if _log: _log("Loading price data…")
         df = load_prices(_log=_log)
         df_excl = df[~df["timestamp"].dt.year.isin(CRISIS_YEARS)]
         if _log: _log("Fitting Gaussian Bins sampler (crisis-excluded)…")
-        sampler_excl = GaussianBinnedSampler().fit(df_excl)
+        sampler_excl = GaussianBinnedSampler().fit(df_excl, _progress=_fit_progress("Gaussian Bins (excl. crisis)"))
         if _log: _log("Fitting Gaussian Bins sampler (crisis-included)…")
-        sampler_incl = GaussianBinnedSampler().fit(df)
+        sampler_incl = GaussianBinnedSampler().fit(df, _progress=_fit_progress("Gaussian Bins (incl. crisis)"))
+        if _log: _log("Fitting Gaussian Bins sampler (crisis-only)…")
+        sampler_crisis = GaussianBinnedSampler().fit(
+            df[df["timestamp"].dt.year.isin(CRISIS_YEARS)],
+            _progress=_fit_progress("Gaussian Bins (crisis only)"))
 
     all_results: dict[str, list[dict]] = {}
     n = len(sweeps)
@@ -506,9 +524,9 @@ def run_all_sweeps(
             from ev_mdt.pricing.samplers import GMMSampler, MDNSampler
             # Reuse the crisis-excluded data + Gaussian Bins fit from setup.
             if _log: _log("Fitting GMM sampler…")
-            sampler_gmm = GMMSampler().fit(df_excl)
+            sampler_gmm = GMMSampler().fit(df_excl, _progress=_fit_progress("GMM"))
             if _log: _log("Fitting MDN sampler (neural net — this can take a while)…")
-            sampler_mdn = MDNSampler().fit(df_excl)
+            sampler_mdn = MDNSampler().fit(df_excl, _progress=_fit_progress("MDN"))
             samplers = {
                 "Gaussian Bins": sampler_excl,
                 "GMM":           sampler_gmm,
@@ -520,7 +538,7 @@ def run_all_sweeps(
         elif sweep == "pricing_daytype":
             all_results[sweep] = sweep_pricing_daytype(sampler_excl, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "pricing_crisis":
-            all_results[sweep] = sweep_pricing_crisis(sampler_excl, sampler_incl, N_rollouts, N_e, seed, cb, _log)
+            all_results[sweep] = sweep_pricing_crisis(sampler_excl, sampler_incl, sampler_crisis, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "penalty":
             all_results[sweep] = sweep_penalty(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "beta":

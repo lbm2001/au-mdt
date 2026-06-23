@@ -52,17 +52,25 @@ from ev_mdt.pricing.entsoe import load_prices
 FIGURES_DIR = Path(__file__).parent.parent.parent / "figures"
 
 
-def _get_gbins(exclude_crisis: bool) -> GaussianBinnedSampler:
-    """Fitted Gaussian-bins sampler, cached per crisis setting."""
-    key = "sa_gbins_excl" if exclude_crisis else "sa_gbins_incl"
+def _get_gbins(mode: str) -> GaussianBinnedSampler:
+    """Fitted Gaussian-bins sampler, cached per crisis setting.
+
+    mode: "excl" (all years except 2021–23), "incl" (all years),
+          "only" (2021–23 crisis years only).
+    """
+    key = {"excl": "sa_gbins_excl", "incl": "sa_gbins_incl", "only": "sa_gbins_only"}[mode]
     if key not in st.session_state:
         if "sa_price_df" not in st.session_state:
             with st.spinner("Loading ENTSO-E price data…"):
                 st.session_state["sa_price_df"] = load_prices()
         df = st.session_state["sa_price_df"]
-        if exclude_crisis:
-            df = df[~df["timestamp"].dt.year.isin(CRISIS_YEARS)]
-        with st.spinner(f"Fitting Gaussian-bins price model ({'excl.' if exclude_crisis else 'incl.'} crisis)…"):
+        is_crisis = df["timestamp"].dt.year.isin(CRISIS_YEARS)
+        if mode == "excl":
+            df = df[~is_crisis]
+        elif mode == "only":
+            df = df[is_crisis]
+        label = {"excl": "excl. crisis", "incl": "incl. crisis", "only": "crisis only"}[mode]
+        with st.spinner(f"Fitting Gaussian-bins price model ({label})…"):
             st.session_state[key] = GaussianBinnedSampler().fit(df)
     return st.session_state[key]
 
@@ -73,7 +81,7 @@ _PRICE_MODEL_CLASSES = {"Gaussian Bins": GaussianBinnedSampler, "GMM": GMMSample
 def _get_price_model(model_name: str):
     """Fitted price sampler of the given type (crisis-excluded data), cached."""
     if model_name == "Gaussian Bins":
-        return _get_gbins(exclude_crisis=True)
+        return _get_gbins("excl")
     key = f"sa_pmodel_{model_name}"
     if key not in st.session_state:
         if "sa_price_df" not in st.session_state:
@@ -197,7 +205,8 @@ def _show_results(results: list[dict], sweep_label: str):
         st.caption("Mobility model: **varies by panel**" if len(models) > 1
                    else f"Mobility model: **{next(iter(models))}**")
 
-    _heatmap_ncols = {"penalty": 3, "beta": 3, "pricing_season": 2, "mobility_model": 2}.get(sweep_label, 1)
+    _heatmap_ncols = {"penalty": 3, "beta": 3, "pricing_season": 2, "mobility_model": 2,
+                      "pricing_crisis": 3}.get(sweep_label, 1)
     st.subheader("Policy heatmaps")
     _chart(fig_heatmap_grid(results, ncols=_heatmap_ncols), f"{sweep_label}_policy_heatmaps")
 
@@ -288,8 +297,9 @@ with st.sidebar:
 if st.session_state.pop("sa_run_all_triggered", False):
     bar = st.progress(0.0, text="Starting…")
     st.session_state["sa_run_all_export_errors"] = []
-    _s_excl = _get_gbins(exclude_crisis=True)
-    _s_incl = _get_gbins(exclude_crisis=False)
+    _s_excl   = _get_gbins("excl")
+    _s_incl   = _get_gbins("incl")
+    _s_crisis = _get_gbins("only")
     _steps = [
         ("Pricing · model",    "sa_pricing_model_results",
          lambda cb: sweep_pricing_model(
@@ -300,7 +310,7 @@ if st.session_state.pop("sa_run_all_triggered", False):
         ("Pricing · day-type", "sa_pricing_daytype_results",
          lambda cb: sweep_pricing_daytype(_s_excl, N_rollouts, N_e, seed, cb)),
         ("Pricing · crisis",   "sa_pricing_crisis_results",
-         lambda cb: sweep_pricing_crisis(_s_excl, _s_incl, N_rollouts, N_e, seed, cb)),
+         lambda cb: sweep_pricing_crisis(_s_excl, _s_incl, _s_crisis, N_rollouts, N_e, seed, cb)),
         ("Penalty",            "sa_phi_results",
          lambda cb: sweep_penalty(BASELINE_MODEL, N_rollouts, N_e, seed, cb)),
         ("Discount β",         "sa_beta_results",
@@ -390,7 +400,7 @@ with tab_price:
             bar = st.progress(0.0, text="Starting…")
             with st.spinner("Running season sweep…"):
                 st.session_state["sa_pricing_season_results"] = sweep_pricing_season(
-                    _get_gbins(True), N_rollouts, N_e, seed,
+                    _get_gbins("excl"), N_rollouts, N_e, seed,
                     progress_cb=lambda f, m: bar.progress(f, text=m))
             bar.empty(); st.rerun()
         if "sa_pricing_season_results" in st.session_state:
@@ -405,7 +415,7 @@ with tab_price:
             bar = st.progress(0.0, text="Starting…")
             with st.spinner("Running weekday/weekend sweep…"):
                 st.session_state["sa_pricing_daytype_results"] = sweep_pricing_daytype(
-                    _get_gbins(True), N_rollouts, N_e, seed,
+                    _get_gbins("excl"), N_rollouts, N_e, seed,
                     progress_cb=lambda f, m: bar.progress(f, text=m))
             bar.empty(); st.rerun()
         if "sa_pricing_daytype_results" in st.session_state:
@@ -414,14 +424,16 @@ with tab_price:
             st.info("Click **Run weekday/weekend sweep** to compute results.")
 
     with sub_crisis:
-        st.caption("Vary whether the 2021–23 crisis years are included in the fitted price "
-                   "data — held at spring, weekday.")
+        st.caption("Compare price models fitted on three slices of ENTSO-E data — all years "
+                   "**excluding** 2021–23, **including** them, and the 2021–23 crisis years "
+                   "**only** — held at spring, weekday.")
         if st.button("Run energy-crisis sweep", key="sa_run_pcrisis"):
             st.session_state.pop("sa_pricing_crisis_results", None)
             bar = st.progress(0.0, text="Starting…")
             with st.spinner("Running energy-crisis sweep…"):
                 st.session_state["sa_pricing_crisis_results"] = sweep_pricing_crisis(
-                    _get_gbins(True), _get_gbins(False), N_rollouts, N_e, seed,
+                    _get_gbins("excl"), _get_gbins("incl"), _get_gbins("only"),
+                    N_rollouts, N_e, seed,
                     progress_cb=lambda f, m: bar.progress(f, text=m))
             bar.empty(); st.rerun()
         if "sa_pricing_crisis_results" in st.session_state:

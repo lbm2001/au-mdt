@@ -1,11 +1,14 @@
 """Load and preprocess ENTSO-E day-ahead price data straight from the live API."""
 
 import os
+from pathlib import Path
 
 import pandas as pd
 
 _DEFAULT_START   = "2015-01-01"  # ENTSO-E DK1 day-ahead history starts here
 _DEFAULT_COUNTRY = "DK_1"        # West Denmark bidding zone (entsoe-py area code)
+# On-disk cache: <repo root>/entsoe-data/<country_code>.parquet
+_DEFAULT_CACHE_DIR = Path(__file__).resolve().parents[2] / "entsoe-data"
 
 
 def load_prices(
@@ -15,6 +18,8 @@ def load_prices(
     start: "str | pd.Timestamp" = _DEFAULT_START,
     end: "str | pd.Timestamp | None" = None,
     country_code: str = _DEFAULT_COUNTRY,
+    cache: bool = True,
+    cache_dir: "str | Path | None" = None,
 ) -> pd.DataFrame:
     """
     Fetch the full ENTSO-E day-ahead price history from the API and return a
@@ -29,6 +34,14 @@ def load_prices(
 
     _log: optional callable(message: str) called after each yearly chunk.
 
+    Caching
+    -------
+    If ``cache`` is True (default), the preprocessed DataFrame is stored as
+    ``<cache_dir>/<country_code>.parquet`` (``cache_dir`` defaults to
+    ``<repo root>/entsoe-data``).  On a subsequent call, if that file exists it
+    is loaded directly and the API is not contacted at all — so no API key is
+    required once the cache is populated.  Delete the file to force a refresh.
+
     Columns
     -------
     timestamp       : UTC-naive CET/CEST datetime (start of interval)
@@ -41,6 +54,16 @@ def load_prices(
     month           : month (1–12)
     season          : 'spring' | 'summer' | 'autumn' | 'winter'
     """
+    cache_path = Path(cache_dir or _DEFAULT_CACHE_DIR) / f"{country_code}.parquet"
+    if cache and cache_path.exists():
+        if _log is not None:
+            _log(f"Cache: loading {country_code} prices from {cache_path}…")
+        df = pd.read_parquet(cache_path)
+        if _log is not None:
+            y0, y1 = df["timestamp"].dt.year.min(), df["timestamp"].dt.year.max()
+            _log(f"Cache: loaded {len(df):,} samples ({y0}–{y1})")
+        return df
+
     key = _resolve_api_key(api_key)
     if not key:
         raise RuntimeError(
@@ -63,7 +86,11 @@ def load_prices(
         y1 = df["timestamp"].dt.year.max()
         _log(f"API: loaded {len(df):,} samples ({y0}–{y1})")
 
-    return df
+    if cache:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(cache_path, index=False)
+        if _log is not None:
+            _log(f"Cache: saved {len(df):,} samples → {cache_path}")
 
     return df
 

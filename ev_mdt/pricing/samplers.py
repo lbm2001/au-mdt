@@ -207,7 +207,7 @@ class MDNSampler(AbstractSampler):
         lr: float = 1e-3,
     ) -> None:
         self.n_components = n_components
-        self.hidden_dims  = hidden_dims or [128, 128]
+        self.hidden_dims  = hidden_dims or [64, 64]
         self.epochs       = epochs
         self.batch_size   = batch_size
         self.lr           = lr
@@ -321,7 +321,7 @@ class _MDNNet:
         layers: list[nn.Module] = []
         prev = in_dim
         for h in hidden_dims:
-            layers += [nn.Linear(prev, h), nn.ELU()]
+            layers += [nn.Linear(prev, h), nn.Tanh()]
             prev = h
         self._trunk = nn.Sequential(*layers)
         self._pi_head    = nn.Linear(prev, K)

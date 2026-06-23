@@ -108,9 +108,10 @@ def fig_heatmap_grid(results: list[dict], ncols: int = 1, time_bin_min: int = 1,
             hovertemplate="Hour: %{x:.2f} h<br>Battery: %{y:.2f} kWh<br>u*: %{z:.2f} kW<extra></extra>",
         ), row=row, col=col)
         fig.update_xaxes(title_text="Hour (h)" if row == rows else "", range=[0, T // 60],
-                         showticklabels=(row == rows), row=row, col=col)
-        fig.update_yaxes(title_text="Battery (kWh)" if col == 1 else "", row=row, col=col)
-    fig.update_layout(height=280 * rows + 70, margin=dict(l=40, r=60, t=55, b=40))
+                         title_standoff=12, showticklabels=(row == rows), row=row, col=col)
+        fig.update_yaxes(title_text="Battery (kWh)" if col == 1 else "",
+                         title_standoff=16, row=row, col=col)
+    fig.update_layout(height=280 * rows + 70, margin=dict(l=70, r=60, t=55, b=50))
     for ann in fig.layout.annotations:
         ann.yshift = 10
     return fig
@@ -176,7 +177,7 @@ def fig_cost_distribution(results: list[dict], log_y: bool = True,
         yaxis["dtick"] = 1
     fig.update_layout(
         barmode="group", yaxis=yaxis, height=440,
-        margin=dict(l=40, r=20, t=40, b=40),
+        margin=dict(l=80, r=20, t=40, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
     )
     return fig

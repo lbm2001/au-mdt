@@ -43,7 +43,6 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
-import streamlit.components.v1 as components
 
 from models.baseline import (
     BaselineParams, transition_probs as _baseline_transition_probs,
@@ -1028,36 +1027,13 @@ with st.sidebar:
     if st.button("▶ Run all sweeps", type="primary", use_container_width=True, key="sa_run_all"):
         st.session_state["sa_run_all_triggered"] = True
         st.rerun()
-    run_all_auto_export = st.checkbox(
-        "Also auto-download export figures during run-all",
-        value=True,
-        key="sa_run_all_auto_export",
-    )
-    st.caption("Computes every sweep once; results persist across tabs. Each sweep's export PNGs "
-               "are saved under `figures/` as soon as that sweep completes. Auto-download also "
-               "asks the browser to download each PNG.")
-
-    if st.session_state.get("sa_run_all_exports"):
-        with st.expander("Completed run-all exports", expanded=False):
-            for i, item in enumerate(st.session_state["sa_run_all_exports"]):
-                st.download_button(
-                    f"⬇ {item.get('path', item['label'])}",
-                    item["data"],
-                    item["filename"],
-                    "image/png",
-                    use_container_width=True,
-                    key=f"sa_run_all_export_dl_{i}_{item['filename']}",
-                )
-    if st.session_state.get("sa_run_all_export_errors"):
-        with st.expander("Run-all export errors", expanded=False):
-            for err in st.session_state["sa_run_all_export_errors"]:
-                st.caption(err)
+    st.caption("Computes every sweep once; results persist across tabs. Export PNGs are saved "
+               "under `figures/` as each sweep completes.")
 
 # ── Run-all orchestration ─────────────────────────────────────────────────────
 
 if st.session_state.pop("sa_run_all_triggered", False):
     bar = st.progress(0.0, text="Starting…")
-    st.session_state["sa_run_all_exports"] = []
     st.session_state["sa_run_all_export_errors"] = []
     _s_excl = _get_gbins(exclude_crisis=True)
     _s_incl = _get_gbins(exclude_crisis=False)
@@ -1085,7 +1061,7 @@ if st.session_state.pop("sa_run_all_triggered", False):
     ]
     n = len(_steps)
 
-    def _emit_export(export_id: str, seq: int) -> int:
+    def _emit_export(export_id: str) -> None:
         labels_by_id = {item["id"]: item["label"] for item in _available_export_figures()}
         label = labels_by_id.get(export_id, export_id)
         bar.progress(min((i + 0.9) / n, 1.0), text=f"Rendering export: {label}")
@@ -1096,23 +1072,12 @@ if st.session_state.pop("sa_run_all_triggered", False):
             out_path.write_bytes(data)
         except Exception as exc:
             st.session_state["sa_run_all_export_errors"].append(f"{label}: {exc}")
-            return seq
-        st.session_state["sa_run_all_exports"].append({
-            "label": label,
-            "filename": rel_path.replace("/", "__"),
-            "path": str(out_path.relative_to(Path(__file__).parent.parent.parent)),
-            "data": data,
-        })
-        if run_all_auto_export:
-            _auto_download_png(rel_path.replace("/", "__"), data, f"run_all_{seq}_{rel_path}")
-        return seq + 1
 
-    export_seq = 0
     for i, (name, key, fn) in enumerate(_steps):
         st.session_state[key] = fn(
             lambda f, m, i=i, name=name: bar.progress((i + f) / n, text=f"{name}: {m}"))
         for export_id in _sweep_export_ids(key):
-            export_seq = _emit_export(export_id, export_seq)
+            _emit_export(export_id)
 
     for export_id in [
         "baseline:Baseline:cost",
@@ -1122,15 +1087,15 @@ if st.session_state.pop("sa_run_all_triggered", False):
         "baseline:NegBin trips (sampled k):trajectories",
         "trip_duration",
     ]:
-        export_seq = _emit_export(export_id, export_seq)
+        _emit_export(export_id)
 
     bar.progress(1.0, text="Done.")
     bar.empty()
-    st.success(
-        f"Run-all complete. Saved {len(st.session_state['sa_run_all_exports'])} export PNG(s) "
-        f"under `{FIGURES_DIR.relative_to(Path(__file__).parent.parent.parent)}/`. "
-        "If the browser blocked automatic downloads, use the completed-export buttons in the sidebar."
-    )
+    errors = st.session_state.get("sa_run_all_export_errors", [])
+    if errors:
+        st.warning("Run-all complete with export errors:\n" + "\n".join(f"- {e}" for e in errors))
+    else:
+        st.success(f"Run-all complete. PNGs saved under `{FIGURES_DIR.relative_to(Path(__file__).parent.parent.parent)}/`.")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 

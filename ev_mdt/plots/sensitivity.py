@@ -254,5 +254,14 @@ def fig_baseline_trajectories(full: dict, scenarios: list, T: int, params) -> go
 
 def figure_to_png(fig: go.Figure, width: int = 1400, scale: int = 2) -> bytes:
     """Render a Plotly figure to high-res PNG bytes (requires kaleido)."""
+    import copy
+    fig = copy.deepcopy(fig)
+    fig.update_layout(font=dict(size=16))
+    # Subplot titles are annotations — bump them separately
+    for ann in fig.layout.annotations:
+        if ann.font and ann.font.size:
+            ann.font.size = max(ann.font.size, 18)
+        else:
+            ann.update(font=dict(size=18))
     h = int(fig.layout.height or 500)
     return fig.to_image(format="png", width=width, height=h, scale=scale)

@@ -1,58 +1,14 @@
 """Load and preprocess ENTSO-E day-ahead price data straight from the live API."""
 
 import os
-from pathlib import Path
 
 import pandas as pd
-
-_DATA_DIR = Path(__file__).parent.parent / "data" / "entsoe"  # legacy CSV archive (no longer read)
 
 _DEFAULT_START   = "2015-01-01"  # ENTSO-E DK1 day-ahead history starts here
 _DEFAULT_COUNTRY = "DK_1"        # West Denmark bidding zone (entsoe-py area code)
 
-# MTU column is like "01/01/2015 00:00:00 - 01/01/2015 01:00:00"
-_MTU_COL   = "MTU (CET/CEST)"
-_PRICE_COL = "Day-ahead Price (EUR/MWh)"
-
-
-# ── CSV parsing (legacy archive only — kept for offline reuse) ─────────────────
-
-def _parse_file(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path, thousands=None)
-    # Some DST-transition rows have " (CET)" or " (CEST)" appended — strip it.
-    start_str = (
-        df[_MTU_COL]
-        .str.split(" - ").str[0]
-        .str.replace(r"\s*\(CES?T\)$", "", regex=True)
-    )
-    df["timestamp"] = pd.to_datetime(start_str, format="%d/%m/%Y %H:%M:%S")
-    df["price_eur_mwh"] = pd.to_numeric(df[_PRICE_COL], errors="coerce")
-    return df[["timestamp", "price_eur_mwh"]].dropna()
-
-def load_prices_dir(
-    data_dir: Path | None = None,
-) -> pd.DataFrame:
-    if data_dir is None:
-        data_dir = _DATA_DIR
-
-    files = sorted(Path(data_dir).glob("*.csv"))
-
-    if not files:
-        raise RuntimeError(f"No CSV files found in {data_dir}")
-
-    dfs = [_parse_file(f) for f in files]
-
-    df = (
-        pd.concat(dfs, ignore_index=True)
-        .drop_duplicates("timestamp")
-        .sort_values("timestamp")
-        .reset_index(drop=True)
-    )
-
-    return _add_features(df)
 
 def load_prices(
-    data_dir: Path | None = None,
     api_key: str | None = None,
     _log=None,
     *,
@@ -71,9 +27,6 @@ def load_prices(
       2. The ``ENTSOE_API_KEY`` environment variable
       3. ``[entsoe] api_key`` in .streamlit/secrets.toml
 
-    The legacy ``data_dir`` argument is accepted but ignored — prices are no
-    longer read from CSV (the archived CSVs live in data/entsoe_archive/).
-
     _log: optional callable(message: str) called after each yearly chunk.
 
     Columns
@@ -90,9 +43,10 @@ def load_prices(
     """
     key = _resolve_api_key(api_key)
     if not key:
-        if _log is not None:
-            _log("No ENTSO-E API key found — falling back to archived CSV data.")
-        return load_prices_dir(data_dir)
+        raise RuntimeError(
+            "No ENTSO-E API key configured. Set ENTSOE_API_KEY, pass api_key=…, "
+            "or add [entsoe] api_key to .streamlit/secrets.toml."
+        )
 
     if end is None:
         end = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)

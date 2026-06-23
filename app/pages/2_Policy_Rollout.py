@@ -269,31 +269,38 @@ st.plotly_chart(cost_bar_figure(nd_err.lower(), nd_cost_axis == "Log"), use_cont
 
 
 def mean_trajectory_figure() -> go.Figure:
-    """Scenario-averaged trajectories vs time: price and mobility (shared across policies)."""
+    """Scenario-averaged trajectories: price (hourly means) and mobility (per-minute, same hour axis)."""
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-        subplot_titles=("Mean price",
-                        "Mean mobility (0 parked, 1 driving)"),
+        subplot_titles=("Mean price", "Mean mobility (0 parked, 1 driving)"),
     )
+    h_axis = np.arange(T_hours)       # integer hours — shared x-axis
+    m_axis = np.arange(T) / 60       # minute index mapped to hours (0 … T_hours)
 
-    def band(mean, half, color, name, row, showlegend=False):
+    def _hourly(arr2d: np.ndarray) -> np.ndarray:
+        n, t = arr2d.shape
+        return arr2d.reshape(n, T_hours, t // T_hours).mean(axis=2)
+
+    def band(x, mean, half, color, name, row, showlegend=False):
         fill = _rgba(color, 0.12)
-        fig.add_trace(go.Scatter(x=hours, y=mean + half, mode="lines", line=dict(width=0),
+        fig.add_trace(go.Scatter(x=x, y=mean + half, mode="lines", line=dict(width=0),
                                  showlegend=False, hoverinfo="skip", legendgroup=name),
                       row=row, col=1)
-        fig.add_trace(go.Scatter(x=hours, y=mean - half, mode="lines", line=dict(width=0),
+        fig.add_trace(go.Scatter(x=x, y=mean - half, mode="lines", line=dict(width=0),
                                  fill="tonexty", fillcolor=fill, showlegend=False,
                                  hoverinfo="skip", legendgroup=name), row=row, col=1)
-        fig.add_trace(go.Scatter(x=hours, y=mean, mode="lines", line=dict(color=color, width=1.6),
-                                 name=name, legendgroup=name, showlegend=showlegend), row=row, col=1)
+        fig.add_trace(go.Scatter(x=x, y=mean, mode="lines",
+                                 line=dict(color=color, width=1.6),
+                                 name=name, legendgroup=name, showlegend=showlegend),
+                      row=row, col=1)
 
-    P = np.array([sc["lam_path"] for sc in nd_scenarios])                       # (N, T)
+    P_min = np.array([sc["lam_path"] for sc in nd_scenarios])   # (N, T)
+    P     = _hourly(P_min)                                        # (N, T_hours)
     n_scen = max(P.shape[0], 1)
-    sem = lambda a: a.std(axis=0) / np.sqrt(n_scen)    # ±1 standard error of the mean
-    band(P.mean(0), sem(P), "lightgray", "λ̄<sub>t</sub>", row=1)
+    sem = lambda a: a.std(axis=0) / np.sqrt(n_scen)
+    band(h_axis, P.mean(0), sem(P), "lightgray", "λ̄<sub>t</sub>", row=1)
 
     if is_negbin and nd_mob_other is not None:
-        # Two mobility lines: one per NegBin variant
         label_cur   = "Negative Binomial (Poisson k)" if is_poisson_k else "Negative Binomial (fixed k)"
         label_other = "Negative Binomial (fixed k)"   if is_poisson_k else "Negative Binomial (Poisson k)"
         color_cur   = MODEL_COLORS[label_cur]
@@ -301,22 +308,22 @@ def mean_trajectory_figure() -> go.Figure:
 
         Mob_cur = np.array([(r["chi_traj"] > 0).astype(float)
                             for r in nd_rollouts["Backward Induction"]])
-        band(Mob_cur.mean(0), sem(Mob_cur), color_cur, label_cur, row=2, showlegend=True)
+        band(m_axis, Mob_cur.mean(0), sem(Mob_cur), color_cur, label_cur, row=2, showlegend=True)
 
         Mob_oth = np.array([(chi > 0).astype(float) for chi in nd_mob_other])
-        band(Mob_oth.mean(0), sem(Mob_oth), color_other, label_other, row=2, showlegend=True)
+        band(m_axis, Mob_oth.mean(0), sem(Mob_oth), color_other, label_other, row=2, showlegend=True)
 
         show_legend = True
     else:
         Mob = np.array([(r["chi_traj"] > 0).astype(float)
                         for r in nd_rollouts["Backward Induction"]])
-        band(Mob.mean(0), sem(Mob), "orange", "driving", row=2)
+        band(m_axis, Mob.mean(0), sem(Mob), "orange", "driving", row=2)
         show_legend = False
 
     fig.update_layout(height=560, hovermode="x unified",
                       margin=dict(l=50, r=30, t=50, b=40), showlegend=show_legend,
                       legend=dict(x=1.01, y=0.2, xanchor="left"))
-    fig.update_xaxes(range=[0, T_hours], dtick=T_hours // 8)
+    fig.update_xaxes(range=[0, T_hours], dtick=max(1, T_hours // 8))
     fig.update_xaxes(title_text="Hour (h)", row=2, col=1)
     fig.update_yaxes(title_text="€/kWh", row=1, col=1)
     fig.update_yaxes(title_text="Fraction driving", tickvals=[0, 0.5, 1], row=2, col=1)

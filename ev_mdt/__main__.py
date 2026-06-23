@@ -7,14 +7,16 @@ Usage
     python -m ev_mdt sensitivity --sweep penalty
     python -m ev_mdt sensitivity --sweep all [--N-rollouts 500] [--N-e 500] [--seed 42]
                                               [--out-dir figures/]
+    python -m ev_mdt prices [--n-days 1000] [--season all] [--daytype all]
+                            [--seed 42] [--out-dir figures/]
 """
 import argparse
 import sys
 
 
 def _add_solve_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--model",   default="Baseline",
-                        choices=["Baseline", "NegBin trips (fixed k)", "NegBin trips (sampled k)"],
+    from ev_mdt.params import MODEL_LABELS
+    parser.add_argument("--model", default="Baseline", choices=MODEL_LABELS,
                         help="Mobility model")
     parser.add_argument("--N-e",    type=int,   default=500,  metavar="N",  help="Battery grid points")
     parser.add_argument("--hours",  type=int,   default=24,   metavar="H",  help="Horizon in hours")
@@ -48,31 +50,85 @@ def cmd_rollout(args: argparse.Namespace) -> None:
 
 
 def cmd_sensitivity(args: argparse.Namespace) -> None:
+    from tqdm import tqdm
     from ev_mdt.analysis.sensitivity import run_all_sweeps, save_figures, ALL_SWEEP_NAMES
 
     sweeps = ALL_SWEEP_NAMES if args.sweep == "all" else [args.sweep]
 
-    n_total = len(sweeps)
-    def progress(f: float, msg: str) -> None:
-        pct = int(f * 100)
-        bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
-        print(f"\r  [{bar}] {pct:3d}%  {msg:<50}", end="", flush=True)
+    outer = tqdm(sweeps, desc="Sweeps", unit="sweep", position=0)
+    for i, sw in enumerate(outer):
+        outer.set_description(f"Sweep: {sw}")
+        inner = tqdm(total=100, desc="  progress", unit="%", position=1,
+                     leave=False, bar_format="{l_bar}{bar}| {n:.0f}%  {postfix}")
 
-    for i, sw in enumerate(sweeps):
-        print(f"\n[{i+1}/{n_total}] Sweep: {sw}")
-        def cb(f, m, _sw=sw): progress(f, m)
+        def cb(f: float, msg: str, _bar: tqdm = inner) -> None:
+            _bar.n = int(f * 100)
+            _bar.set_postfix_str(msg[:50])
+            _bar.refresh()
+
         results = run_all_sweeps(
             N_rollouts=args.N_rollouts, N_e=args.N_e, seed=args.seed,
             sweeps=[sw], progress_cb=cb,
         )
-        print()
+        inner.close()
+
         saved = save_figures(results, out_dir=args.out_dir,
                              N_rollouts=args.N_rollouts, seed=args.seed, N_e=args.N_e,
                              include_baseline=(i == 0))
         for p in saved:
-            print(f"  Saved: {p}")
+            tqdm.write(f"  Saved: {p}")
 
-    print(f"\nAll sweeps complete.")
+    outer.close()
+    print("\nAll sweeps complete.")
+
+
+def cmd_prices(args: argparse.Namespace) -> None:
+    from pathlib import Path
+    from tqdm import tqdm
+    from ev_mdt.pricing.entsoe import load_prices
+    from ev_mdt.analysis.prices import fit_samplers, simulate_price_paths, price_figures
+
+    print("Loading ENTSO-E price data…", flush=True)
+    df = load_prices(_log=tqdm.write)
+    tqdm.write(f"Loaded {len(df):,} measurements "
+               f"({df['timestamp'].dt.year.min()}–{df['timestamp'].dt.year.max()})\n")
+
+    fit_bar = tqdm(total=100, desc="Fitting samplers", unit="%",
+                   bar_format="{l_bar}{bar}| {n:.0f}%  {postfix}")
+
+    def fit_progress(model: str, frac: float, msg: str) -> None:
+        fit_bar.n = int(frac * 100)
+        fit_bar.set_postfix_str(f"{model}: {msg[:40]}")
+        fit_bar.refresh()
+
+    samplers = fit_samplers(df, progress_cb=fit_progress)
+    fit_bar.n = 100
+    fit_bar.refresh()
+    fit_bar.close()
+
+    season  = None if args.season == "all" else args.season
+    daytype = args.daytype
+
+    print(f"\nSimulating {args.n_days} days "
+          f"(season={args.season}, daytype={daytype}, seed={args.seed})…", flush=True)
+    results = simulate_price_paths(samplers, n_days=args.n_days,
+                                   season=season, daytype=daytype, seed=args.seed)
+    for name, prices in results.items():
+        print(f"  {name:<30}  mean = {prices.mean():.4f} €/kWh")
+
+    out_dir = Path(args.out_dir) / "price_explorer"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        from ev_mdt.plots.sensitivity import figure_to_png
+        save_bar = tqdm(["mean_profile", "std_profile"], desc="Saving figures", unit="fig")
+        fig_mean, fig_std = price_figures(results)
+        for name, fig in zip(save_bar, [fig_mean, fig_std]):
+            save_bar.set_postfix_str(name)
+            (out_dir / f"{name}.png").write_bytes(figure_to_png(fig))
+        save_bar.close()
+        print(f"Saved figures to {out_dir}/")
+    except Exception as e:
+        print(f"\nCould not save figures (kaleido missing?): {e}")
 
 
 def main() -> None:
@@ -103,6 +159,16 @@ def main() -> None:
     p_sens.add_argument("--seed",       type=int, default=42,  help="Base random seed")
     p_sens.add_argument("--out-dir",    default="figures/",    help="Output directory for PNGs")
 
+    # prices
+    p_prices = sub.add_parser("prices", help="Fit price models and simulate diurnal profiles")
+    p_prices.add_argument("--n-days",  type=int,   default=1000, help="Simulated days")
+    p_prices.add_argument("--season",  default="all",
+                          choices=["all", "spring", "summer", "autumn", "winter"])
+    p_prices.add_argument("--daytype", default="all",
+                          choices=["all", "weekday", "weekend"])
+    p_prices.add_argument("--seed",    type=int,   default=42,   help="Random seed")
+    p_prices.add_argument("--out-dir", default="figures/",       help="Output directory for PNGs")
+
     args = parser.parse_args()
 
     if args.command == "solve":
@@ -111,6 +177,8 @@ def main() -> None:
         cmd_rollout(args)
     elif args.command == "sensitivity":
         cmd_sensitivity(args)
+    elif args.command == "prices":
+        cmd_prices(args)
     else:
         parser.print_help()
         sys.exit(1)

@@ -266,5 +266,17 @@ def figure_to_png(fig: go.Figure, width: int = 1400, scale: int = 3) -> bytes:
             ann.font.size = max(ann.font.size, 18)
         else:
             ann.update(font=dict(size=18))
+    # The per-figure margins were tuned for the default font; at 16pt the axis
+    # titles/ticks no longer fit. Let Plotly reserve space automatically and
+    # enforce generous minimum margins so nothing is clipped.
+    fig.update_xaxes(automargin=True, title_standoff=12)
+    fig.update_yaxes(automargin=True, title_standoff=12)
+    m = fig.layout.margin
+    fig.update_layout(margin=dict(
+        l=max(m.l or 0, 100),
+        r=max(m.r or 0, 40),
+        t=max(m.t or 0, 50),
+        b=max(m.b or 0, 80),
+    ))
     h = int(fig.layout.height or 500)
     return fig.to_image(format="png", width=width, height=h, scale=scale)

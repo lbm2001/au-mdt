@@ -148,8 +148,12 @@ def make_scenario(params, seed: int, horizon: int,
             "phase_draws": phase_draws, "e0": e0}
 
 
-def run_rollouts(pi, actions, e_grid, params, scenarios: list, _rollout_fn, pbp_fn) -> dict:
-    """Run all policies on each scenario. Returns {policy_name: [metrics_dict, ...]}."""
+def run_rollouts(pi, actions, e_grid, params, scenarios: list, _rollout_fn, pbp_fn,
+                 desc: str | None = None) -> dict:
+    """Run all policies on each scenario. Returns {policy_name: [metrics_dict, ...]}.
+
+    If ``desc`` is given, shows a per-rollout progress bar (x/N) under the sweep bars.
+    """
     chi0 = 0
     benchmarks = [
         ("Night Charging",        night_charging_policy,   {}),
@@ -161,6 +165,11 @@ def run_rollouts(pi, actions, e_grid, params, scenarios: list, _rollout_fn, pbp_
         ("Minimum Battery Level", minimum_soc_policy,      {"soc_threshold": params.e_max * 0.25}),
     ]
     results: dict[str, list] = {p: [] for p in POLICY_ORDER}
+    bar = None
+    if desc is not None:
+        from tqdm import tqdm
+        bar = tqdm(total=len(scenarios), desc=desc, unit="rollout",
+                   position=2, leave=False)
     for sc in scenarios:
         e0 = float(sc["e0"])
         ro = _rollout_fn(
@@ -171,6 +180,10 @@ def run_rollouts(pi, actions, e_grid, params, scenarios: list, _rollout_fn, pbp_
         for name, fn, kw in benchmarks:
             ro = _rollout_fn(fn, sc, e0, chi0, params, **kw)
             results[name].append(rollout_metrics(ro, params))
+        if bar is not None:
+            bar.update(1)
+    if bar is not None:
+        bar.close()
     return results
 
 
@@ -199,15 +212,19 @@ def run_rollouts_full(pi, actions, e_grid, params, scenarios, _rollout_fn, pbp_f
 
 def _run_sweep_step(model_label: str, label: str, params, pbp_fn,
                     T: int, N_e: int, N_rollouts: int, seed: int,
-                    sampler=None, season: str = "winter", is_weekend: bool = False) -> dict:
+                    sampler=None, season: str = "winter", is_weekend: bool = False,
+                    _log: Callable | None = None) -> dict:
     """Solve + run rollouts for one sweep configuration."""
+    if _log: _log(f"  [{label}] solving (T={T//60}h, N_e={N_e})…")
     pi, actions, e_grid, lam_grid = solve(model_label, params, pbp_fn, T, N_e)
+    if _log: _log(f"  [{label}] running {N_rollouts} rollouts…")
     scenarios = [
         make_scenario(params, seed + i, T, sampler=sampler, season=season, is_weekend=is_weekend)
         for i in range(N_rollouts)
     ]
     _rf = rollout_fn(model_label)
-    rollouts = run_rollouts(pi, actions, e_grid, params, scenarios, _rf, pbp_fn)
+    rollouts = run_rollouts(pi, actions, e_grid, params, scenarios, _rf, pbp_fn,
+                            desc=f"    [{label}] rollouts")
     sample_rollout = _rf(
         backward_induction_policy, scenarios[0], float(scenarios[0]["e0"]), 0, params,
         pi=pi, actions=actions, e_grid=e_grid,
@@ -228,13 +245,13 @@ def _run_sweep_step(model_label: str, label: str, params, pbp_fn,
 
 
 def _gbins_step(label: str, sampler, season: str, is_weekend: bool,
-                N_rollouts: int, N_e: int, seed: int) -> dict:
+                N_rollouts: int, N_e: int, seed: int, _log=None) -> dict:
     params = build_params(BASELINE_MODEL)
     pbp_fn = _make_gbins_pbp(sampler, params, season, is_weekend)
     return _run_sweep_step(
         BASELINE_MODEL, label, params, pbp_fn, T=24 * 60, N_e=N_e,
         N_rollouts=N_rollouts, seed=seed,
-        sampler=sampler, season=season, is_weekend=is_weekend,
+        sampler=sampler, season=season, is_weekend=is_weekend, _log=_log,
     )
 
 
@@ -246,137 +263,130 @@ def _make_gbins_pbp(sampler, params, season, is_weekend):
 # ── Public sweep functions ─────────────────────────────────────────────────────
 
 def sweep_pricing_season(sampler, N_rollouts: int, N_e: int, seed: int,
-                          progress_cb: Callable | None = None) -> list[dict]:
+                          progress_cb: Callable | None = None,
+                          _log: Callable | None = None) -> list[dict]:
     """Gaussian Bins (crisis-excluded): vary season, held at weekday."""
     seasons = ["winter", "spring", "summer", "autumn"]
     results = []
     for i, s in enumerate(seasons):
-        if progress_cb:
-            progress_cb(i / len(seasons), f"Solving {s}…")
-        results.append(_gbins_step(s.capitalize(), sampler, s, False, N_rollouts, N_e, seed))
-    if progress_cb:
-        progress_cb(1.0, "Done.")
+        if progress_cb: progress_cb(i / len(seasons), f"Solving {s}…")
+        results.append(_gbins_step(s.capitalize(), sampler, s, False, N_rollouts, N_e, seed, _log))
+    if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
 def sweep_pricing_daytype(sampler, N_rollouts: int, N_e: int, seed: int,
-                           progress_cb: Callable | None = None) -> list[dict]:
+                           progress_cb: Callable | None = None,
+                           _log: Callable | None = None) -> list[dict]:
     """Gaussian Bins (crisis-excluded): vary weekday/weekend, held at spring."""
     combos = [("Weekday", False), ("Weekend", True)]
     results = []
     for i, (label, we) in enumerate(combos):
-        if progress_cb:
-            progress_cb(i / len(combos), f"Solving {label}…")
-        results.append(_gbins_step(label, sampler, "spring", we, N_rollouts, N_e, seed))
-    if progress_cb:
-        progress_cb(1.0, "Done.")
+        if progress_cb: progress_cb(i / len(combos), f"Solving {label}…")
+        results.append(_gbins_step(label, sampler, "spring", we, N_rollouts, N_e, seed, _log))
+    if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
 def sweep_pricing_crisis(sampler_excl, sampler_incl, N_rollouts: int, N_e: int, seed: int,
-                          progress_cb: Callable | None = None) -> list[dict]:
+                          progress_cb: Callable | None = None,
+                          _log: Callable | None = None) -> list[dict]:
     """Gaussian Bins: vary crisis inclusion, held at spring + weekday."""
     items = [("Excluding crisis", sampler_excl), ("Including crisis", sampler_incl)]
     results = []
     for i, (label, sampler) in enumerate(items):
-        if progress_cb:
-            progress_cb(i / len(items), f"Solving {label}…")
-        results.append(_gbins_step(label, sampler, "spring", False, N_rollouts, N_e, seed))
-    if progress_cb:
-        progress_cb(1.0, "Done.")
+        if progress_cb: progress_cb(i / len(items), f"Solving {label}…")
+        results.append(_gbins_step(label, sampler, "spring", False, N_rollouts, N_e, seed, _log))
+    if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
 def sweep_pricing_model(samplers: dict, N_rollouts: int, N_e: int, seed: int,
-                         progress_cb: Callable | None = None) -> list[dict]:
+                         progress_cb: Callable | None = None,
+                         _log: Callable | None = None) -> list[dict]:
     """Vary the price model (Gaussian Bins / GMM / MDN), held at spring · weekday · crisis-excluded."""
     items = list(samplers.items())
     results = []
     for i, (label, sampler) in enumerate(items):
-        if progress_cb:
-            progress_cb(i / len(items), f"Solving {label}…")
-        results.append(_gbins_step(label, sampler, "spring", False, N_rollouts, N_e, seed))
-    if progress_cb:
-        progress_cb(1.0, "Done.")
+        if progress_cb: progress_cb(i / len(items), f"Solving {label}…")
+        results.append(_gbins_step(label, sampler, "spring", False, N_rollouts, N_e, seed, _log))
+    if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
 def sweep_penalty(model_label: str, N_rollouts: int, N_e: int, seed: int,
-                   progress_cb: Callable | None = None) -> list[dict]:
+                   progress_cb: Callable | None = None,
+                   _log: Callable | None = None) -> list[dict]:
     """Sweep φ ∈ PHI_VALUES. Uses Gaussian parametric pricing."""
     results = []
     for i, phi in enumerate(PHI_VALUES):
-        if progress_cb:
-            progress_cb(i / len(PHI_VALUES), f"Solving φ = {phi} €/h…")
+        if progress_cb: progress_cb(i / len(PHI_VALUES), f"Solving φ = {phi} €/h…")
         params = build_params(model_label, phi=float(phi))
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         results.append(_run_sweep_step(
             model_label, f"{phi} €/h", params, pbp_fn, T=24 * 60, N_e=N_e,
-            N_rollouts=N_rollouts, seed=seed,
+            N_rollouts=N_rollouts, seed=seed, _log=_log,
         ))
-    if progress_cb:
-        progress_cb(1.0, "Done.")
+    if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
 def sweep_beta(model_label: str, N_rollouts: int, N_e: int, seed: int,
-               progress_cb: Callable | None = None) -> list[dict]:
+               progress_cb: Callable | None = None,
+               _log: Callable | None = None) -> list[dict]:
     """Sweep the discount factor β ∈ BETA_VALUES over a 24 h horizon."""
     results = []
     for i, beta in enumerate(BETA_VALUES):
-        if progress_cb:
-            progress_cb(i / len(BETA_VALUES), f"Solving β = {beta:g}…")
+        if progress_cb: progress_cb(i / len(BETA_VALUES), f"Solving β = {beta:g}…")
         params = build_params(model_label, beta=float(beta))
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         results.append(_run_sweep_step(
             model_label, f"β={beta:g}", params, pbp_fn, T=24 * 60, N_e=N_e,
-            N_rollouts=N_rollouts, seed=seed,
+            N_rollouts=N_rollouts, seed=seed, _log=_log,
         ))
-    if progress_cb:
-        progress_cb(1.0, "Done.")
+    if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
 def sweep_horizon(model_label: str, N_rollouts: int, N_e: int, seed: int,
-                   progress_cb: Callable | None = None) -> list[dict]:
+                   progress_cb: Callable | None = None,
+                   _log: Callable | None = None) -> list[dict]:
     """Compare T ∈ {24h, 48h, 168h}. Uses Gaussian parametric pricing."""
     results = []
     for i, T_h in enumerate(HORIZON_HOURS):
-        if progress_cb:
-            progress_cb(i / len(HORIZON_HOURS), f"Solving T = {T_h} h…")
+        if progress_cb: progress_cb(i / len(HORIZON_HOURS), f"Solving T = {T_h} h…")
         params = build_params(model_label)
         T      = T_h * 60
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         results.append(_run_sweep_step(
             model_label, f"{T_h} h", params, pbp_fn, T=T, N_e=N_e,
-            N_rollouts=N_rollouts, seed=seed,
+            N_rollouts=N_rollouts, seed=seed, _log=_log,
         ))
-    if progress_cb:
-        progress_cb(1.0, "Done.")
+    if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
 def sweep_departure_profiles(model_label: str, N_rollouts: int, N_e: int, seed: int,
-                               progress_cb: Callable | None = None) -> list[dict]:
+                               progress_cb: Callable | None = None,
+                               _log: Callable | None = None) -> list[dict]:
     """Compare departure profiles (p_PD_* overrides) over a 24 h horizon."""
     results = []
     profiles = list(DEPARTURE_PROFILES.items())
     for i, (label, overrides) in enumerate(profiles):
-        if progress_cb:
-            progress_cb(i / len(profiles), f"Solving {label}…")
+        if progress_cb: progress_cb(i / len(profiles), f"Solving {label}…")
         params = build_params(model_label, **overrides)
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         results.append(_run_sweep_step(
             model_label, label, params, pbp_fn, T=24 * 60, N_e=N_e,
-            N_rollouts=N_rollouts, seed=seed,
+            N_rollouts=N_rollouts, seed=seed, _log=_log,
         ))
-    if progress_cb:
-        progress_cb(1.0, "Done.")
+    if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
 def sweep_mobility_models(N_rollouts: int, N_e: int, seed: int,
-                           progress_cb: Callable | None = None) -> list[dict]:
+                           progress_cb: Callable | None = None,
+                           _log: Callable | None = None) -> list[dict]:
     """Compare NegBin mobility models: {fixed-k, Poisson-k} × {k=5, k=10} (4 configs)."""
     configs = [
         (NEGBIN_FIXED_MODEL,   "NegBin fixed k=5",    NegBinParams(k=5)),
@@ -386,15 +396,13 @@ def sweep_mobility_models(N_rollouts: int, N_e: int, seed: int,
     ]
     results = []
     for i, (model, label, params) in enumerate(configs):
-        if progress_cb:
-            progress_cb(i / len(configs), f"Solving {label}…")
+        if progress_cb: progress_cb(i / len(configs), f"Solving {label}…")
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         results.append(_run_sweep_step(
             model, label, params, pbp_fn, T=24 * 60, N_e=N_e,
-            N_rollouts=N_rollouts, seed=seed,
+            N_rollouts=N_rollouts, seed=seed, _log=_log,
         ))
-    if progress_cb:
-        progress_cb(1.0, "Done.")
+    if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
@@ -450,6 +458,7 @@ def run_all_sweeps(
     seed: int = 42,
     sweeps: list[str] | None = None,
     progress_cb: Callable | None = None,
+    _log: Callable | None = None,
 ) -> dict[str, list[dict]]:
     """Run selected (or all) sweeps and return a mapping sweep_name -> results list.
 
@@ -472,8 +481,11 @@ def run_all_sweeps(
 
     sampler_excl = sampler_incl = None
     if needs_pricing:
+        if _log: _log("Loading price data…")
         df = load_prices()
+        if _log: _log("Fitting Gaussian Bins sampler (crisis-excluded)…")
         sampler_excl = GaussianBinnedSampler().fit(df[~df["timestamp"].dt.year.isin(CRISIS_YEARS)])
+        if _log: _log("Fitting Gaussian Bins sampler (crisis-included)…")
         sampler_incl = GaussianBinnedSampler().fit(df)
 
     all_results: dict[str, list[dict]] = {}
@@ -490,30 +502,37 @@ def run_all_sweeps(
         cb = _cb(i, sweep)
         if sweep == "pricing_model":
             from ev_mdt.pricing.samplers import GMMSampler, MDNSampler
+            if _log: _log("Loading price data…")
             df = load_prices()
             df_excl = df[~df["timestamp"].dt.year.isin(CRISIS_YEARS)]
+            if _log: _log("Fitting Gaussian Bins sampler…")
+            sampler_gbins = GaussianBinnedSampler().fit(df_excl)
+            if _log: _log("Fitting GMM sampler…")
+            sampler_gmm = GMMSampler().fit(df_excl)
+            if _log: _log("Fitting MDN sampler (neural net — this can take a while)…")
+            sampler_mdn = MDNSampler().fit(df_excl)
             samplers = {
-                "Gaussian Bins": GaussianBinnedSampler().fit(df_excl),
-                "GMM":           GMMSampler().fit(df_excl),
-                "MDN":           MDNSampler().fit(df_excl),
+                "Gaussian Bins": sampler_gbins,
+                "GMM":           sampler_gmm,
+                "MDN":           sampler_mdn,
             }
-            all_results[sweep] = sweep_pricing_model(samplers, N_rollouts, N_e, seed, cb)
+            all_results[sweep] = sweep_pricing_model(samplers, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "pricing_season":
-            all_results[sweep] = sweep_pricing_season(sampler_excl, N_rollouts, N_e, seed, cb)
+            all_results[sweep] = sweep_pricing_season(sampler_excl, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "pricing_daytype":
-            all_results[sweep] = sweep_pricing_daytype(sampler_excl, N_rollouts, N_e, seed, cb)
+            all_results[sweep] = sweep_pricing_daytype(sampler_excl, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "pricing_crisis":
-            all_results[sweep] = sweep_pricing_crisis(sampler_excl, sampler_incl, N_rollouts, N_e, seed, cb)
+            all_results[sweep] = sweep_pricing_crisis(sampler_excl, sampler_incl, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "penalty":
-            all_results[sweep] = sweep_penalty(BASELINE_MODEL, N_rollouts, N_e, seed, cb)
+            all_results[sweep] = sweep_penalty(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "beta":
-            all_results[sweep] = sweep_beta(BASELINE_MODEL, N_rollouts, N_e, seed, cb)
+            all_results[sweep] = sweep_beta(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "horizon":
-            all_results[sweep] = sweep_horizon(BASELINE_MODEL, N_rollouts, N_e, seed, cb)
+            all_results[sweep] = sweep_horizon(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "departure_profile":
-            all_results[sweep] = sweep_departure_profiles(BASELINE_MODEL, N_rollouts, N_e, seed, cb)
+            all_results[sweep] = sweep_departure_profiles(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "mobility_model":
-            all_results[sweep] = sweep_mobility_models(N_rollouts, N_e, seed, cb)
+            all_results[sweep] = sweep_mobility_models(N_rollouts, N_e, seed, cb, _log)
         else:
             raise ValueError(f"Unknown sweep: {sweep!r}. Valid: {ALL_SWEEP_NAMES}")
 

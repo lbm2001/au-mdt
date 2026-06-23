@@ -50,10 +50,34 @@ def cmd_rollout(args: argparse.Namespace) -> None:
 
 
 def cmd_sensitivity(args: argparse.Namespace) -> None:
+    import itertools
+    import threading
+    import time
+    import numpy as np
     from tqdm import tqdm
     from ev_mdt.analysis.sensitivity import run_all_sweeps, save_figures, ALL_SWEEP_NAMES
 
     sweeps = ALL_SWEEP_NAMES if args.sweep == "all" else [args.sweep]
+
+    # ── W&B setup ─────────────────────────────────────────────────────────────
+    wandb_run = None
+    if args.wandb:
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run or None,
+                config={
+                    "sweeps":     sweeps,
+                    "N_rollouts": args.N_rollouts,
+                    "N_e":        args.N_e,
+                    "seed":       args.seed,
+                },
+            )
+            tqdm.write(f"W&B run: {wandb_run.url}")
+        except ImportError:
+            tqdm.write("wandb not installed — run `uv add wandb`. Continuing without logging.")
+            wandb_run = None
 
     outer = tqdm(sweeps, desc="Sweeps", unit="sweep", position=0)
     for i, sw in enumerate(outer):
@@ -61,15 +85,34 @@ def cmd_sensitivity(args: argparse.Namespace) -> None:
         inner = tqdm(total=100, desc="  progress", unit="%", position=1,
                      leave=False, bar_format="{l_bar}{bar}| {n:.0f}%  {postfix}")
 
+        # Shared state updated by progress_cb; the heartbeat thread renders it so
+        # the bar keeps animating (spinner + elapsed) even while solve() blocks.
+        hb = {"msg": "starting…", "since": time.monotonic()}
+
         def cb(f: float, msg: str, _bar: tqdm = inner) -> None:
             _bar.n = int(f * 100)
-            _bar.set_postfix_str(msg[:50])
-            _bar.refresh()
+            hb["msg"] = msg[:50]
+            hb["since"] = time.monotonic()
 
-        results = run_all_sweeps(
-            N_rollouts=args.N_rollouts, N_e=args.N_e, seed=args.seed,
-            sweeps=[sw], progress_cb=cb,
-        )
+        stop = threading.Event()
+
+        def heartbeat(_bar: tqdm = inner) -> None:
+            spinner = itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+            while not stop.wait(0.25):
+                elapsed = time.monotonic() - hb["since"]
+                _bar.set_postfix_str(f"{next(spinner)} {hb['msg']} ({elapsed:4.0f}s)")
+                _bar.refresh()
+
+        hb_thread = threading.Thread(target=heartbeat, daemon=True)
+        hb_thread.start()
+        try:
+            results = run_all_sweeps(
+                N_rollouts=args.N_rollouts, N_e=args.N_e, seed=args.seed,
+                sweeps=[sw], progress_cb=cb, _log=tqdm.write,
+            )
+        finally:
+            stop.set()
+            hb_thread.join()
         inner.close()
 
         saved = save_figures(results, out_dir=args.out_dir,
@@ -78,8 +121,30 @@ def cmd_sensitivity(args: argparse.Namespace) -> None:
         for p in saved:
             tqdm.write(f"  Saved: {p}")
 
+        # ── W&B logging ───────────────────────────────────────────────────────
+        if wandb_run is not None:
+            import wandb as _wb
+            for step_results in results.get(sw, []):
+                label    = step_results["label"]
+                rollouts = step_results["rollouts"]
+                for policy, metrics_list in rollouts.items():
+                    costs   = np.array([m["Total cost (€)"]  for m in metrics_list])
+                    pen     = np.array([m["Penalty minutes"]  for m in metrics_list])
+                    energy  = np.array([m["Energy charged (kWh)"] for m in metrics_list])
+                    prefix  = f"{sw}/{label}/{policy}"
+                    wandb_run.log({
+                        f"{prefix}/mean_cost":           costs.mean(),
+                        f"{prefix}/sem_cost":            costs.std() / len(costs) ** 0.5,
+                        f"{prefix}/mean_penalty_min":    pen.mean(),
+                        f"{prefix}/mean_energy_kwh":     energy.mean(),
+                    })
+            for p in saved:
+                wandb_run.log({f"figures/{sw}": _wb.Image(str(p))})
+
     outer.close()
     print("\nAll sweeps complete.")
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 def cmd_prices(args: argparse.Namespace) -> None:
@@ -152,12 +217,15 @@ def main() -> None:
     p_sens.add_argument("--sweep", default="all",
                         choices=["all"] + ALL_SWEEP_NAMES, metavar="SWEEP",
                         help=f"Which sweep to run (or 'all'). Options: {', '.join(ALL_SWEEP_NAMES)}")
-    p_sens.add_argument("--N-rollouts", type=int, default=500, metavar="N",
+    p_sens.add_argument("--N-rollouts",    type=int, default=500, metavar="N",
                         help="Rollouts per swept value")
-    p_sens.add_argument("--N-e",        type=int, default=500, metavar="N",
+    p_sens.add_argument("--N-e",           type=int, default=500, metavar="N",
                         help="Battery grid points")
-    p_sens.add_argument("--seed",       type=int, default=42,  help="Base random seed")
-    p_sens.add_argument("--out-dir",    default="figures/",    help="Output directory for PNGs")
+    p_sens.add_argument("--seed",          type=int, default=42,  help="Base random seed")
+    p_sens.add_argument("--out-dir",       default="figures/",    help="Output directory for PNGs")
+    p_sens.add_argument("--wandb",         action="store_true",   help="Log results and figures to Weights & Biases")
+    p_sens.add_argument("--wandb-project", default="au-mdt",      help="W&B project name")
+    p_sens.add_argument("--wandb-run",     default="",            help="W&B run name (auto if omitted)")
 
     # prices
     p_prices = sub.add_parser("prices", help="Fit price models and simulate diurnal profiles")

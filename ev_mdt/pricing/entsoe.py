@@ -30,7 +30,7 @@ def _parse_file(path: Path) -> pd.DataFrame:
     return df[["timestamp", "price_eur_mwh"]].dropna()
 
 def load_prices_dir(
-    data_dir: Path | None = "/Users/lukasmueller/git/github/au-mdt/data/entsoe",
+    data_dir: Path | None = None,
 ) -> pd.DataFrame:
     if data_dir is None:
         data_dir = _DATA_DIR
@@ -88,13 +88,11 @@ def load_prices(
     month           : month (1–12)
     season          : 'spring' | 'summer' | 'autumn' | 'winter'
     """
-    return load_prices_dir()
     key = _resolve_api_key(api_key)
     if not key:
-        raise RuntimeError(
-            "No ENTSO-E API key configured. Set ENTSOE_API_KEY, pass api_key=…, "
-            "or add [entsoe] api_key to .streamlit/secrets.toml."
-        )
+        if _log is not None:
+            _log("No ENTSO-E API key found — falling back to archived CSV data.")
+        return load_prices_dir(data_dir)
 
     if end is None:
         end = pd.Timestamp.now().normalize() + pd.Timedelta(days=1)
@@ -110,6 +108,8 @@ def load_prices(
         y0 = df["timestamp"].dt.year.min()
         y1 = df["timestamp"].dt.year.max()
         _log(f"API: loaded {len(df):,} samples ({y0}–{y1})")
+
+    return df
 
     return df
 

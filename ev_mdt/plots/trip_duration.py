@@ -12,12 +12,7 @@ from plotly.subplots import make_subplots
 from ev_mdt.params import BaselineParams, NegBinParams
 from ev_mdt.models.baseline.rollout import _next_state as _ns_base
 from ev_mdt.models.negbin.rollout import _next_state as _ns_nb
-
-MOBILITY_COLORS = {
-    "Baseline":                           "#4477AA",
-    "NegBin (fixed k=5)":                 "#EE6677",
-    "NegBin (Poisson k=5, k_max=13)":    "#228833",
-}
+from ev_mdt.plots.viz import MODEL_COLORS
 
 
 def _kmax(lam: float, q: float = 0.999) -> int:
@@ -34,8 +29,8 @@ def compute_trip_durations(n_scen: int = 10000, horizon: int = 1440, seed: int =
     """Driving-spell lengths (minutes) per mobility model, from simulated mobility only."""
     specs = {
         "Baseline":                       (BaselineParams(),                          _ns_base),
-        "NegBin (fixed k=5)":             (NegBinParams(),                            _ns_nb),
-        "NegBin (Poisson k=5, k_max=13)": (NegBinParams(lambda_k=5.0, k=_kmax(5.0)), _ns_nb),
+        "Negative Binomial (fixed k)":   (NegBinParams(),                            _ns_nb),
+        "Negative Binomial (Poisson k)": (NegBinParams(lambda_k=5.0, k=_kmax(5.0)), _ns_nb),
     }
     out = {}
     for name, (p, next_state) in specs.items():
@@ -63,7 +58,7 @@ def trip_duration_figure(durs: dict) -> go.Figure:
     tgrid = np.arange(0, cap + 1)
     fig = make_subplots(rows=1, cols=2)
     for name, d in durs.items():
-        col = MOBILITY_COLORS.get(name, "#888888")
+        col = MODEL_COLORS.get(name, "#888888")
         dens, _ = np.histogram(d, bins=edges, density=True)
         fig.add_trace(go.Scatter(x=ctr, y=dens, mode="lines",
                                  line=dict(color=col, width=2, shape="spline"),

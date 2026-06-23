@@ -11,8 +11,8 @@ Import hierarchy:
 from dataclasses import dataclass
 
 BASELINE_MODEL = "Baseline"
-NEGBIN_FIXED_MODEL = "NegBin trips (fixed k)"
-NEGBIN_SAMPLED_MODEL = "NegBin trips (sampled k)"
+NEGBIN_FIXED_MODEL = "Negative Binomial trips (fixed k)"
+NEGBIN_SAMPLED_MODEL = "Negative Binomial trips (sampled k)"
 MODEL_LABELS = [BASELINE_MODEL, NEGBIN_FIXED_MODEL, NEGBIN_SAMPLED_MODEL]
 
 

@@ -11,10 +11,10 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from pricing_models.entsoe_loader import load_prices
-from pricing_models.pricing import MDNSampler
+from ev_mdt.pricing.entsoe import load_prices
+from ev_mdt.pricing.samplers import MDNSampler
 
 
 def parse_args():

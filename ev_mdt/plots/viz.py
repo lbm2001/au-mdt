@@ -20,6 +20,12 @@ POLICY_COLORS = {
     "Always-Minimum":       "#BBBBBB",
 }
 
+MODEL_COLORS = {
+    "Baseline":                        "#4477AA",
+    "Negative Binomial (fixed k)":     "#EE6677",
+    "Negative Binomial (Poisson k)":   "#228833",
+}
+
 SWEEP_PALETTE = [
     "#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE",
     "#AA3377", "#BBBBBB", "#882255", "#44AA99", "#999933", "#DDCC77",

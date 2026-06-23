@@ -1,4 +1,4 @@
-from ev_mdt.plots.viz import POLICY_COLORS, POLICY_ORDER, SWEEP_PALETTE, SWEEP_AXIS_LABEL
+from ev_mdt.plots.viz import POLICY_COLORS, POLICY_ORDER, SWEEP_PALETTE, SWEEP_AXIS_LABEL, MODEL_COLORS
 from ev_mdt.plots.sensitivity import (
     fig_heatmap_grid,
     fig_charge_boundary_grid,

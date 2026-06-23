@@ -2,14 +2,15 @@ import unittest
 
 import numpy as np
 
-from models.baseline import BaselineParams
-from models.baseline.policies import (
+from ev_mdt.params import BaselineParams
+from ev_mdt.models.common.policies import (
     actual_charge_rate,
     backward_induction_policy,
     maximal_charging_policy,
     price_oriented_policy,
 )
-from models.baseline.rollout import rollout_metrics, simulate_policy_rollout
+from ev_mdt.models.baseline.rollout import simulate_policy_rollout
+from ev_mdt.models.common.rollout_utils import rollout_metrics
 
 
 class BaselinePolicyTests(unittest.TestCase):

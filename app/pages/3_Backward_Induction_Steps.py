@@ -18,10 +18,11 @@ if "pi" not in st.session_state:
     st.warning("No solution found. Please go to **Settings** and click **Run Backward Induction** first.")
     st.stop()
 
-if st.session_state.get("solved_model", "").startswith("NegBin"):
+from ev_mdt.params import BASELINE_MODEL as _BASELINE_MODEL
+if st.session_state.get("solved_model", "") != _BASELINE_MODEL:
     st.info(
         "Step-by-step verification is only available for the **Baseline** model. "
-        "The NegBin model uses a (k+1)×(k+1) transition matrix; "
+        "The Negative Binomial model uses a (k+1)×(k+1) transition matrix; "
         "switch to Baseline in **Settings** to use this page."
     )
     st.stop()

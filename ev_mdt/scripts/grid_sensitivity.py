@@ -9,17 +9,17 @@ scenarios. Prints a table suitable for copy-pasting into the LaTeX template.
 import sys
 import time
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from models.baseline import (
-    BaselineParams, transition_probs, consumption, price_bin_probs,
+from ev_mdt.params import BaselineParams
+from ev_mdt.models.baseline import (
+    transition_probs, consumption, price_bin_probs,
+    backward_induction_policy, generate_rollout_scenario, simulate_policy_rollout,
 )
-from models.baseline.policies import backward_induction_policy
-from models.baseline.rollout import generate_rollout_scenario, simulate_policy_rollout
 
 # ── Config ────────────────────────────────────────────────────────────────────
 

@@ -27,7 +27,10 @@ params   = st.session_state["params"]
 T        = st.session_state["T"]
 T_hours  = T // 60
 
-is_negbin = st.session_state.get("solved_model", "").startswith("NegBin")
+from ev_mdt.params import BASELINE_MODEL, NEGBIN_FIXED_MODEL, NEGBIN_SAMPLED_MODEL
+_solved_model = st.session_state.get("solved_model", "")
+is_negbin    = _solved_model != BASELINE_MODEL
+is_poisson_k = _solved_model == NEGBIN_SAMPLED_MODEL
 
 # ── Model-specific imports ────────────────────────────────────────────────────
 
@@ -48,7 +51,7 @@ else:
         generate_rollout_scenario, rollout_metrics, simulate_policy_rollout,
     )
 
-from ev_mdt.plots.viz import POLICY_COLORS, POLICY_ORDER
+from ev_mdt.plots.viz import POLICY_COLORS, POLICY_ORDER, MODEL_COLORS
 from ev_mdt.plots.trip_duration import compute_trip_durations, trip_duration_figure
 
 # Named colours used for non-policy bands (price/mobility) → "r,g,b".
@@ -150,9 +153,9 @@ if st.session_state.get("_nd_key") != _nd_key:
             generate_rollout_scenario(params, int(rng_nd.integers(0, 1_000_000)), horizon=T)
             for _ in range(n_days)
         ]
+        nd_e0s = [float(rng_nd.uniform(params.e_min, params.e_max)) for _ in range(n_days)]
         nd_rollouts = {name: [] for name in POLICY_COLORS}
-        for sc in nd_scenarios:
-            e0_i = float(rng_nd.uniform(params.e_min, params.e_max))   # random SoC per scenario
+        for sc, e0_i in zip(nd_scenarios, nd_e0s):
             nd_rollouts["Backward Induction"].append(simulate_policy_rollout(
                 backward_induction_policy, sc, e0_i, nd_chi0_int, params,
                 pi=pi, actions=actions, e_grid=e_grid))
@@ -170,12 +173,30 @@ if st.session_state.get("_nd_key") != _nd_key:
                 soc_threshold=soc_threshold))
             nd_rollouts["Always-Minimum"].append(simulate_policy_rollout(
                 always_minimum_policy, sc, e0_i, nd_chi0_int, params))
+
+        # Mobility rollouts for the "other" NegBin variant (same scenarios, different k model)
+        nd_mob_other = None
+        if is_negbin:
+            import dataclasses as _dc
+            from ev_mdt.models.negbin.rollout import simulate_policy_rollout as _nb_sim
+            from ev_mdt.models.negbin import always_minimum_policy as _nb_min
+            if is_poisson_k:
+                _other = _dc.replace(params, k=max(1, round(params.lambda_k)), lambda_k=None)
+            else:
+                _other = _dc.replace(params, lambda_k=float(params.k))
+            nd_mob_other = [
+                _nb_sim(_nb_min, sc, e0_i, nd_chi0_int, _other)["chi_traj"]
+                for sc, e0_i in zip(nd_scenarios, nd_e0s)
+            ]
+
     st.session_state["_nd_rollouts"]  = nd_rollouts
     st.session_state["_nd_scenarios"] = nd_scenarios
+    st.session_state["_nd_mob_other"] = nd_mob_other
     st.session_state["_nd_key"]       = _nd_key
 
 nd_rollouts  = st.session_state["_nd_rollouts"]
 nd_scenarios = st.session_state["_nd_scenarios"]
+nd_mob_other = st.session_state["_nd_mob_other"]
 
 
 def _nd_stats(rollout_list: list) -> dict:
@@ -255,7 +276,7 @@ def mean_trajectory_figure() -> go.Figure:
                         "Mean mobility (0 parked, 1 driving)"),
     )
 
-    def band(mean, half, color, name, row):
+    def band(mean, half, color, name, row, showlegend=False):
         fill = _rgba(color, 0.12)
         fig.add_trace(go.Scatter(x=hours, y=mean + half, mode="lines", line=dict(width=0),
                                  showlegend=False, hoverinfo="skip", legendgroup=name),
@@ -264,19 +285,37 @@ def mean_trajectory_figure() -> go.Figure:
                                  fill="tonexty", fillcolor=fill, showlegend=False,
                                  hoverinfo="skip", legendgroup=name), row=row, col=1)
         fig.add_trace(go.Scatter(x=hours, y=mean, mode="lines", line=dict(color=color, width=1.6),
-                                 name=name, legendgroup=name, showlegend=False), row=row, col=1)
+                                 name=name, legendgroup=name, showlegend=showlegend), row=row, col=1)
 
     P = np.array([sc["lam_path"] for sc in nd_scenarios])                       # (N, T)
     n_scen = max(P.shape[0], 1)
     sem = lambda a: a.std(axis=0) / np.sqrt(n_scen)    # ±1 standard error of the mean
     band(P.mean(0), sem(P), "lightgray", "λ̄<sub>t</sub>", row=1)
-    # mobility is policy-independent → take it from any policy's rollouts
-    Mob = np.array([(r["chi_traj"] > 0).astype(float)
-                    for r in nd_rollouts["Backward Induction"]])               # (N, T)
-    band(Mob.mean(0), sem(Mob), "orange", "driving", row=2)
+
+    if is_negbin and nd_mob_other is not None:
+        # Two mobility lines: one per NegBin variant
+        label_cur   = "Negative Binomial (Poisson k)" if is_poisson_k else "Negative Binomial (fixed k)"
+        label_other = "Negative Binomial (fixed k)"   if is_poisson_k else "Negative Binomial (Poisson k)"
+        color_cur   = MODEL_COLORS[label_cur]
+        color_other = MODEL_COLORS[label_other]
+
+        Mob_cur = np.array([(r["chi_traj"] > 0).astype(float)
+                            for r in nd_rollouts["Backward Induction"]])
+        band(Mob_cur.mean(0), sem(Mob_cur), color_cur, label_cur, row=2, showlegend=True)
+
+        Mob_oth = np.array([(chi > 0).astype(float) for chi in nd_mob_other])
+        band(Mob_oth.mean(0), sem(Mob_oth), color_other, label_other, row=2, showlegend=True)
+
+        show_legend = True
+    else:
+        Mob = np.array([(r["chi_traj"] > 0).astype(float)
+                        for r in nd_rollouts["Backward Induction"]])
+        band(Mob.mean(0), sem(Mob), "orange", "driving", row=2)
+        show_legend = False
 
     fig.update_layout(height=560, hovermode="x unified",
-                      margin=dict(l=50, r=30, t=50, b=40), showlegend=False)
+                      margin=dict(l=50, r=30, t=50, b=40), showlegend=show_legend,
+                      legend=dict(x=1.01, y=0.2, xanchor="left"))
     fig.update_xaxes(range=[0, T_hours], dtick=T_hours // 8)
     fig.update_xaxes(title_text="Hour (h)", row=2, col=1)
     fig.update_yaxes(title_text="€/kWh", row=1, col=1)
@@ -295,7 +334,7 @@ st.divider()
 
 st.subheader("Trip-duration distribution by mobility model")
 st.caption("Samples each mobility model's trips (default params; independent of the solved "
-           "policy). Baseline → geometric (decaying); NegBin → peaked; Poisson-k → wider.")
+           "policy). Baseline → geometric (decaying); Negative Binomial → peaked; Poisson-k → wider.")
 
 
 _compute_trip_durations = st.cache_data(show_spinner="Sampling trip durations…")(compute_trip_durations)

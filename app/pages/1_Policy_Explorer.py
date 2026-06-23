@@ -26,7 +26,8 @@ params   = st.session_state["params"]
 T        = st.session_state["T"]
 T_hours  = T // 60
 
-is_negbin = st.session_state.get("solved_model", "").startswith("NegBin")
+from ev_mdt.params import BASELINE_MODEL
+is_negbin = st.session_state.get("solved_model", "") != BASELINE_MODEL
 
 HOURS = np.arange(T) / 60
 

@@ -108,9 +108,9 @@ _SWEEP_RESULT_KEYS = [
 ]
 
 _MODEL_PREFIX = {
-    "Baseline":                 "baseline",
-    "NegBin trips (fixed k)":   "negbin",
-    "NegBin trips (sampled k)": "negbin_poisson",
+    "Baseline":                              "baseline",
+    "Negative Binomial trips (fixed k)":    "negbin",
+    "Negative Binomial trips (sampled k)":  "negbin_poisson",
 }
 
 
@@ -122,10 +122,10 @@ def _available_export_figures() -> list[dict]:
          "label": "baseline_models / baseline_optimal_policy"},
         {"id": "baseline:Baseline:trajectories",    "path": "baseline_models/baseline_trajectories.png",
          "label": "baseline_models / baseline_trajectories"},
-        {"id": "baseline:NegBin trips (fixed k):trajectories",
+        {"id": "baseline:Negative Binomial trips (fixed k):trajectories",
          "path": "baseline_models/negbin_trajectories.png",
          "label": "baseline_models / negbin_trajectories"},
-        {"id": "baseline:NegBin trips (sampled k):trajectories",
+        {"id": "baseline:Negative Binomial trips (sampled k):trajectories",
          "path": "baseline_models/negbin_poisson_trajectories.png",
          "label": "baseline_models / negbin_poisson_trajectories"},
         {"id": "trip_duration", "path": "baseline_models/trip_duration_by_model.png",
@@ -250,8 +250,8 @@ years. Negative wholesale prices (~2.6% of hours) are floored to 0.
 
 **Mobility model** (sidebar — applies to every sweep):
 - **Baseline** — trip ~ Geom(p_DP); 2-state chain; default E[T] ≈ 11 min.
-- **NegBin (fixed k)** — trip ~ NegBin(k, q); k-phase chain; default E[T] = k/q = 25 min.
-- **NegBin (sampled k)** — k ~ Poisson(λ_k) drawn at each trip start; default E[T] ≈ 25 min.
+- **Negative Binomial (fixed k)** — trip ~ NB(k, q); k-phase chain; default E[T] = k/q = 25 min.
+- **Negative Binomial (sampled k)** — k ~ Poisson(λ_k) drawn at each trip start; default E[T] ≈ 25 min.
 
 > Default trip durations differ across models, so switching the model is **not** a controlled
 > comparison — read each model's sweeps on their own.
@@ -265,7 +265,7 @@ years. Negative wholesale prices (~2.6% of hours) are floored to 0.
 > **Reading the Pricing tab:** each pricing model is solved *and* evaluated in its **own** price
 > world. Compare policies *within* a column (which policy wins, optimality gap, feasibility) — not
 > absolute costs *across* columns. The DP-Heuristic uses each world's own price distribution.
-> NegBin models have more mobility states → slower solves; lower **N_e** if needed.
+> Negative Binomial models have more mobility states → slower solves; lower **N_e** if needed.
 > Re-run a single sweep with its **Run** button.
     """)
 
@@ -335,8 +335,8 @@ if st.session_state.pop("sa_run_all_triggered", False):
     for export_id in [
         "baseline:Baseline:cost", "baseline:Baseline:optimal_policy",
         "baseline:Baseline:trajectories",
-        "baseline:NegBin trips (fixed k):trajectories",
-        "baseline:NegBin trips (sampled k):trajectories",
+        "baseline:Negative Binomial trips (fixed k):trajectories",
+        "baseline:Negative Binomial trips (sampled k):trajectories",
         "trip_duration",
     ]:
         _emit_export(export_id)
@@ -473,7 +473,7 @@ with tab_T:
     st.markdown(
         f"Compares horizon lengths T ∈ {HORIZON_HOURS} h.  "
         "Uses Gaussian parametric pricing.  All other params at baseline.  "
-        "Note: the 168 h solve is the slow one — and NegBin models add mobility "
+        "Note: the 168 h solve is the slow one — and Negative Binomial models add mobility "
         "states on top, so lower **N_e** (sidebar) if it drags."
     )
     if st.button("Run horizon sweep", key="sa_run_T"):
@@ -513,7 +513,7 @@ with tab_departure:
 # ─── Tab 6: Mobility model ────────────────────────────────────────────────────
 with tab_mobility:
     st.markdown(
-        "Compares NegBin mobility models over a 24 h horizon: **{fixed-k, Poisson-k} × {k=5, k=10}** "
+        "Compares Negative Binomial mobility models over a 24 h horizon: **{fixed-k, Poisson-k} × {k=5, k=10}** "
         "(4 configs).  Uses Gaussian parametric pricing; all other params at baseline — so the "
         "differences isolate the effect of the *trip-duration dynamics* (larger k → longer trips).  "
         "The Baseline (binomial) model is shown in the figure-export's `baseline_models/` instead."

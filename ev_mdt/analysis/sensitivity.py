@@ -480,11 +480,13 @@ def run_all_sweeps(
     needs_pricing = any(s.startswith("pricing") for s in sweeps)
 
     sampler_excl = sampler_incl = None
+    df = df_excl = None
     if needs_pricing:
         if _log: _log("Loading price data…")
-        df = load_prices()
+        df = load_prices(_log=_log)
+        df_excl = df[~df["timestamp"].dt.year.isin(CRISIS_YEARS)]
         if _log: _log("Fitting Gaussian Bins sampler (crisis-excluded)…")
-        sampler_excl = GaussianBinnedSampler().fit(df[~df["timestamp"].dt.year.isin(CRISIS_YEARS)])
+        sampler_excl = GaussianBinnedSampler().fit(df_excl)
         if _log: _log("Fitting Gaussian Bins sampler (crisis-included)…")
         sampler_incl = GaussianBinnedSampler().fit(df)
 
@@ -502,17 +504,13 @@ def run_all_sweeps(
         cb = _cb(i, sweep)
         if sweep == "pricing_model":
             from ev_mdt.pricing.samplers import GMMSampler, MDNSampler
-            if _log: _log("Loading price data…")
-            df = load_prices()
-            df_excl = df[~df["timestamp"].dt.year.isin(CRISIS_YEARS)]
-            if _log: _log("Fitting Gaussian Bins sampler…")
-            sampler_gbins = GaussianBinnedSampler().fit(df_excl)
+            # Reuse the crisis-excluded data + Gaussian Bins fit from setup.
             if _log: _log("Fitting GMM sampler…")
             sampler_gmm = GMMSampler().fit(df_excl)
             if _log: _log("Fitting MDN sampler (neural net — this can take a while)…")
             sampler_mdn = MDNSampler().fit(df_excl)
             samplers = {
-                "Gaussian Bins": sampler_gbins,
+                "Gaussian Bins": sampler_excl,
                 "GMM":           sampler_gmm,
                 "MDN":           sampler_mdn,
             }

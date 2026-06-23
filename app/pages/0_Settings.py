@@ -170,16 +170,7 @@ with col3:
             nb_lambda_k = st.slider("Mean phases λ_k",
                                     0.5, 20.0, float(_DEFAULTS["nb_k"]), 0.5, key="nb_lambda_k",
                                     help="Mean of Poisson distribution for k. E[T] = λ_k / q.")
-            import math as _math
-            # k_max = 99.9th percentile of Poisson(lambda_k); start CDF from k=0
-            _pmf_r = _math.exp(-nb_lambda_k)
-            _cdf   = _pmf_r
-            nb_k   = 0
-            while _cdf < 0.999:
-                nb_k  += 1
-                _pmf_r *= nb_lambda_k / nb_k
-                _cdf   += _pmf_r
-            nb_k = max(nb_k, 1)
+            nb_k = _NP.k_max_for_lambda(nb_lambda_k)
             st.caption(f"λ_k = {nb_lambda_k:.1f},  k_max = {nb_k},  "
                        f"E[T] = {nb_lambda_k:.1f}/{nb_q:.2f} = **{nb_lambda_k / nb_q:.1f} min**")
         else:
@@ -196,66 +187,6 @@ with col3:
         p_dp_evening = st.slider("Evening  (16:30–18:30 h)", 0.0, 1.0, _DEFAULTS["p_dp_evening"], 0.01, key="p_dp_evening")
         p_dp_default = st.slider("Default",                  0.0, 1.0, _DEFAULTS["p_dp_default"], 0.01, key="p_dp_default")
 
-# ── Summary statistics (steady-state approximation) ───────────────────────────
-st.subheader("Expected statistics")
-
-# Day-weighted average p_PD: three 2-hour peak windows + 18 h default
-_w_peak = 120 / 1440          # each 2-hour window / 24 h
-_w_def  = 1080 / 1440         # remaining 18 h
-_avg_p_pd = (_w_peak * (p_pd_morning + p_pd_lunch + p_pd_evening)
-             + _w_def * p_pd_default)
-
-if is_negbin:
-    # E[k]: use lambda_k when Poisson-sampled, fixed k otherwise
-    _exp_k      = float(nb_lambda_k) if nb_lambda_k is not None else float(nb_k)
-    _E_trip     = _exp_k / nb_q          # E[T] = E[k] / q
-    # Var[T] for fixed k: k(1-q)/q²; for Poisson k: (λ_k + λ_k(1-q)) / q² = λ_k(2-q)/q²
-    if nb_lambda_k is None:
-        _std_trip = (float(nb_k) * (1 - nb_q)) ** 0.5 / nb_q
-    else:
-        _std_trip = (nb_lambda_k * (2 - nb_q)) ** 0.5 / nb_q
-    _avg_p_dp   = None
-else:
-    _avg_p_dp   = (_w_peak * (p_dp_morning + p_dp_lunch + p_dp_evening)
-                   + _w_def * p_dp_default)
-    _E_trip     = (1.0 / _avg_p_dp) if _avg_p_dp > 0 else float("inf")
-    _std_trip   = _E_trip  # Geom: std = sqrt(1-p)/p ≈ 1/p for small p
-
-# Steady-state: π_D / π_P = avg_p_pd * E_trip  (flow balance)
-if _avg_p_pd > 0 and _E_trip < 1e9:
-    _rate_ratio = _avg_p_pd * _E_trip   # π_D / π_P
-    _pi_d = _rate_ratio / (1 + _rate_ratio)
-else:
-    _pi_d = 0.0
-_pi_p = 1.0 - _pi_d
-_trips_per_day = _pi_p * 1440 * _avg_p_pd
-
-_E_dist   = v * (_E_trip / 60)   # km  (v in km/h, E_trip in min)
-_E_energy = mu * _E_dist          # kWh
-
-_sc = st.columns(5)
-with _sc[0]:
-    st.metric("Avg p_PD (per min)", f"{_avg_p_pd:.4f}",
-              help="Day-weighted average parked→driving probability.")
-with _sc[1]:
-    st.metric("E[trip duration]", f"{_E_trip:.1f} min",
-              delta=f"σ = {_std_trip:.1f} min", delta_color="off",
-              help="Expected trip length. For Baseline: 1/avg_p_DP. For Negative Binomial: E[k]/q.")
-with _sc[2]:
-    if _avg_p_dp is not None:
-        st.metric("Avg p_DP (per min)", f"{_avg_p_dp:.4f}",
-                  help="Day-weighted average driving→parked probability (Baseline only).")
-    else:
-        st.metric("Phase prob q", f"{nb_q:.2f}",
-                  help="Per-phase transition probability; E[T] = E[k]/q.")
-with _sc[3]:
-    st.metric("% time driving", f"{_pi_d * 100:.1f} %",
-              delta=f"{_trips_per_day:.1f} trips/day", delta_color="off",
-              help="Steady-state fraction of time in driving state.")
-with _sc[4]:
-    st.metric("E[energy / trip]", f"{_E_energy:.2f} kWh",
-              delta=f"{_E_dist:.1f} km", delta_color="off",
-              help="Expected distance and energy consumed per trip, given v and μ.")
 
 st.divider()
 

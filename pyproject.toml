@@ -1,7 +1,7 @@
 [project]
 name = "ev-mdt"
 version = "0.1.0"
-description = "EV Charging Markov Decision Process optimizer"
+description = "Optimal EV Charging under Stochastic Departure Times and Prices"
 requires-python = ">=3.13"
 dependencies = [
     "entsoe-py>=0.8.0",

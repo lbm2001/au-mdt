@@ -135,8 +135,10 @@ def fig_charge_boundary_grid(results: list[dict]) -> go.Figure:
                 showlegend=False,
                 hovertemplate=f"Hour {h:02d}:00<br>Price %{{x:.3f}} €/kWh<br>charge if battery ≤ %{{y:.1f}} kWh<extra></extra>",
             ), row=row, col=col)
-        fig.update_xaxes(title_text="Price (€/kWh)" if row == rows else "", row=row, col=col)
+        fig.update_xaxes(title_text="Price (€/kWh)" if row == rows else "",
+                         title_standoff=12, row=row, col=col)
         fig.update_yaxes(title_text="Battery (kWh)" if col == 1 else "",
+                         title_standoff=12,
                          range=[0, r["params"].e_max], row=row, col=col)
     fig.add_trace(go.Scatter(
         x=[None], y=[None], mode="markers",
@@ -144,7 +146,7 @@ def fig_charge_boundary_grid(results: list[dict]) -> go.Figure:
                     colorbar=dict(title="Hour", x=1.01)),
         showlegend=False, hoverinfo="skip",
     ), row=1, col=1)
-    fig.update_layout(height=350 * rows + 60, margin=dict(l=40, r=60, t=40, b=40))
+    fig.update_layout(height=350 * rows + 60, margin=dict(l=60, r=60, t=40, b=60))
     return fig
 
 
@@ -252,7 +254,7 @@ def fig_baseline_trajectories(full: dict, scenarios: list, T: int, params) -> go
     return fig
 
 
-def figure_to_png(fig: go.Figure, width: int = 1400, scale: int = 2) -> bytes:
+def figure_to_png(fig: go.Figure, width: int = 1400, scale: int = 3) -> bytes:
     """Render a Plotly figure to high-res PNG bytes (requires kaleido)."""
     import copy
     fig = copy.deepcopy(fig)

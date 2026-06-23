@@ -80,6 +80,19 @@ class NegBinParams(SharedParams):
     # (truncated to [1, k]).  When None, every trip has exactly k phases.
     lambda_k: float | None = None
 
+    @staticmethod
+    def k_max_for_lambda(lambda_k: float, quantile: float = 0.999) -> int:
+        """99.9th-percentile of Poisson(lambda_k) — used as the state-space truncation k_max."""
+        import math
+        pmf = math.exp(-lambda_k)
+        cdf = pmf
+        k = 0
+        while cdf < quantile:
+            k += 1
+            pmf *= lambda_k / k
+            cdf += pmf
+        return max(k, 1)
+
 
 @dataclass
 class SolverConfig:

@@ -43,4 +43,4 @@ htmlcov/
 .streamlit/secrets.toml
 wandb/
 
-figures/
+*figures/

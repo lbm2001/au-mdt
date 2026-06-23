@@ -43,5 +43,4 @@ htmlcov/
 .streamlit/secrets.toml
 wandb/
 
-# Saved sensitivity-analysis snapshots
-saved_analyses/
+figures/

@@ -9,7 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from ev_mdt.plots.viz import POLICY_COLORS, POLICY_ORDER
+from ev_mdt.plots.viz import POLICY_COLORS, POLICY_ORDER, rgba as _rgba
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -18,12 +18,24 @@ def _costs(rollout_results: dict, policy: str) -> np.ndarray:
     return np.array([m["Total cost (€)"] for m in rollout_results[policy]])
 
 
-def _opt_rates_averaged(pi, actions, params, pbp_fn, T: int) -> np.ndarray:
-    """u*(t, e) averaged over price bins for parked state (chi=0)."""
-    desired = actions[pi[:, 0, :, :]]                              # (T, N_e, K)
+def _opt_rates_averaged(pi, actions, params, pbp_fn, T: int, chi: int = 0) -> np.ndarray:
+    """u*(t, e) for state `chi`, averaged over price bins by the price distribution."""
+    desired = actions[pi[:, chi, :, :]]                           # (T, N_e, K)
     weights = np.array([pbp_fn(t) for t in range(T)])             # (T, K)
     avg = (desired * weights[:, np.newaxis, :]).sum(axis=2)        # (T, N_e)
     return np.clip(avg, 0.0, params.u_max)
+
+
+def _effective_rates(rates: np.ndarray, chi: int, e_grid, params) -> np.ndarray:
+    """Clip to [0, u_max] and zero out charging while driving above the floor.
+
+    `rates` is (T, N_e) (one row per time) or (N_e,) — masking applies on the
+    battery axis (the last axis).
+    """
+    rates = np.clip(rates, 0.0, params.u_max).astype(float, copy=True)
+    if chi > 0:
+        rates[..., e_grid > params.e_min] = 0.0
+    return rates
 
 
 def _bin_heatmap(rates, e_grid, T: int, time_bin_min: int, battery_bin_kwh: float,
@@ -62,15 +74,6 @@ def _charge_battery_ceiling(pi, actions, e_grid, t: int) -> np.ndarray:
     top_e    = (charging * e_rank).max(axis=0) - 1                # (K,) highest charging e-index
     return np.where(charging.any(axis=0),
                     e_grid[np.clip(top_e, 0, len(e_grid) - 1)], np.nan)
-
-
-def _rgba(hex_color: str, alpha: float) -> str:
-    """rgba() string for a hex (#RRGGBB) or named colour, at the given opacity."""
-    named = {"orange": "255,165,0", "lightgray": "211,211,211"}
-    if hex_color.startswith("#"):
-        h = hex_color.lstrip("#")
-        return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{alpha})"
-    return f"rgba({named.get(hex_color, '128,128,128')},{alpha})"
 
 
 # ── Public figure factories ────────────────────────────────────────────────────
@@ -208,32 +211,34 @@ SUMMARY_METRIC_FORMATS = {
 }
 
 
+def _cost_summary(mlist: list[dict]) -> dict:
+    """The six per-policy summary metrics from a list of per-rollout metric dicts."""
+    costs  = np.array([m["Total cost (€)"]      for m in mlist])
+    pen    = np.array([m["Penalty minutes"]      for m in mlist])
+    energy = np.array([m["Energy charged (kWh)"] for m in mlist])
+    n  = len(costs)
+    sd = float(costs.std(ddof=1)) if n > 1 else 0.0
+    return {
+        "Mean cost (€)":             float(costs.mean()),
+        "SEM cost (€)":              sd / np.sqrt(n) if n > 0 else 0.0,
+        "Std cost (€)":              sd,
+        "Mean penalty min":          float(pen.mean()),
+        "% scenarios with penalty":  float((pen > 0).mean() * 100),
+        "Mean energy charged (kWh)": float(energy.mean()),
+    }
+
+
 def build_summary_df(results: list[dict]) -> pd.DataFrame:
     """One row per (swept_value, policy) with the same metrics as the Policy-Rollout table."""
-    rows = []
-    for r in results:
-        for policy in POLICY_ORDER:
-            mlist   = r["rollouts"][policy]
-            costs   = np.array([m["Total cost (€)"]      for m in mlist])
-            pen     = np.array([m["Penalty minutes"]      for m in mlist])
-            energy  = np.array([m["Energy charged (kWh)"] for m in mlist])
-            n  = len(costs)
-            sd = float(costs.std(ddof=1)) if n > 1 else 0.0
-            rows.append({
-                "Swept value":               r["label"],
-                "Policy":                    policy,
-                "Mean cost (€)":             float(costs.mean()),
-                "SEM cost (€)":              sd / np.sqrt(n) if n > 0 else 0.0,
-                "Std cost (€)":              sd,
-                "Mean penalty min":          float(pen.mean()),
-                "% scenarios with penalty":  float((pen > 0).mean() * 100),
-                "Mean energy charged (kWh)": float(energy.mean()),
-            })
+    rows = [
+        {"Swept value": r["label"], "Policy": policy, **_cost_summary(r["rollouts"][policy])}
+        for r in results for policy in POLICY_ORDER
+    ]
     return pd.DataFrame(rows)
 
 
-def fig_baseline_cost(full: dict) -> go.Figure:
-    """Per-policy mean total cost (incl. penalty), log axis, ordered by POLICY_ORDER, ±SEM."""
+def fig_baseline_cost(full: dict, *, error: str = "sem", log_y: bool = True) -> go.Figure:
+    """Per-policy mean total cost (incl. penalty), ordered by POLICY_ORDER, ±SEM/Std."""
     names = [p for p in POLICY_ORDER if p in full]
     means, errs = [], []
     for name in names:
@@ -241,22 +246,44 @@ def fig_baseline_cost(full: dict) -> go.Figure:
         m  = len(costs)
         sd = float(costs.std(ddof=1)) if m > 1 else 0.0
         means.append(float(costs.mean()))
-        errs.append(sd / np.sqrt(m) if m > 0 else 0.0)
+        errs.append(sd / np.sqrt(m) if (error == "sem" and m > 0) else sd)
     minus = [min(e, mu) for mu, e in zip(means, errs)]
     fig = go.Figure(go.Bar(
         x=names, y=means, marker_color=[POLICY_COLORS[n] for n in names],
         error_y=dict(type="data", symmetric=False, array=errs, arrayminus=minus,
                      visible=True, thickness=1.2, width=4)))
+    yaxis = dict(title="Mean total cost incl. penalty (€)" + ("  [log]" if log_y else ""),
+                 type="log" if log_y else "linear")
+    if log_y:
+        yaxis["dtick"] = 1
     fig.update_layout(
         template="plotly_white",
         plot_bgcolor="white",
         paper_bgcolor="white",
-        yaxis=dict(title="Mean total cost incl. penalty (€)  [log]", type="log", dtick=1),
+        yaxis=yaxis,
         xaxis_title="Policy", height=460, margin=dict(l=40, r=20, t=20, b=110),
         showlegend=False,
     )
     fig.update_xaxes(categoryorder="array", categoryarray=POLICY_ORDER)
     return fig
+
+
+def _hourly_mean(arr2d: np.ndarray, T_hours: int) -> np.ndarray:
+    """Average a (N, T_minutes) array down to (N, T_hours)."""
+    n, t = arr2d.shape
+    return arr2d.reshape(n, T_hours, t // T_hours).mean(axis=2)
+
+
+def _traj_band(fig, x, mean, half, color, name, row, showlegend=False) -> None:
+    """Add a mean line + ±half SEM ribbon to subplot `row` (shared by trajectory figs)."""
+    fill = _rgba(color, 0.12)
+    fig.add_trace(go.Scatter(x=x, y=mean + half, mode="lines", line=dict(width=0),
+                             showlegend=False, hoverinfo="skip", legendgroup=name), row=row, col=1)
+    fig.add_trace(go.Scatter(x=x, y=mean - half, mode="lines", line=dict(width=0),
+                             fill="tonexty", fillcolor=fill, showlegend=False,
+                             hoverinfo="skip", legendgroup=name), row=row, col=1)
+    fig.add_trace(go.Scatter(x=x, y=mean, mode="lines", line=dict(color=color, width=1.6),
+                             name=name, legendgroup=name, showlegend=showlegend), row=row, col=1)
 
 
 def fig_baseline_trajectories(full: dict, scenarios: list, T: int, params) -> go.Figure:
@@ -267,33 +294,19 @@ def fig_baseline_trajectories(full: dict, scenarios: list, T: int, params) -> go
     n = max(len(scenarios), 1)
     sem = lambda a: a.std(axis=0) / np.sqrt(n)
 
-    def _hourly(arr2d: np.ndarray) -> np.ndarray:
-        m, t = arr2d.shape
-        return arr2d.reshape(m, T_hours, t // T_hours).mean(axis=2)
-
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
                         subplot_titles=("Mean price", "Mean mobility (0 parked, 1 driving)"))
 
-    def band(x, mean, half, color, name, row, legend=False):
-        fill = _rgba(color, 0.12)
-        fig.add_trace(go.Scatter(x=x, y=mean + half, mode="lines", line=dict(width=0),
-                                 showlegend=False, hoverinfo="skip", legendgroup=name), row=row, col=1)
-        fig.add_trace(go.Scatter(x=x, y=mean - half, mode="lines", line=dict(width=0),
-                                 fill="tonexty", fillcolor=fill, showlegend=False,
-                                 hoverinfo="skip", legendgroup=name), row=row, col=1)
-        fig.add_trace(go.Scatter(x=x, y=mean, mode="lines", line=dict(color=color, width=1.6),
-                                 name=name, legendgroup=name, showlegend=legend), row=row, col=1)
-
-    P = _hourly(np.array([sc["lam_path"] for sc in scenarios]))   # (N, T_hours)
-    band(h_axis, P.mean(0), sem(P), "lightgray", "λ̄<sub>t</sub>", row=1)
+    P = _hourly_mean(np.array([sc["lam_path"] for sc in scenarios]), T_hours)   # (N, T_hours)
+    _traj_band(fig, h_axis, P.mean(0), sem(P), "lightgray", "λ̄<sub>t</sub>", row=1)
     Mob = np.array([(r["chi_traj"] > 0).astype(float) for r in full["Backward Induction"]])
-    band(m_axis, Mob.mean(0), sem(Mob), "orange", "driving", row=2)
+    _traj_band(fig, m_axis, Mob.mean(0), sem(Mob), "orange", "driving", row=2)
 
     fig.update_layout(
         template="plotly_white",
         plot_bgcolor="white",
         paper_bgcolor="white",
-        height=620, 
+        height=620,
         margin=dict(l=40, r=30, t=60, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.02)
     )
@@ -301,6 +314,90 @@ def fig_baseline_trajectories(full: dict, scenarios: list, T: int, params) -> go
     fig.update_xaxes(title_text="Hour (h)", row=2, col=1)
     fig.update_yaxes(title_text="€/kWh", row=1, col=1)
     fig.update_yaxes(title_text="Fraction driving", tickvals=[0, 0.5, 1], row=2, col=1)
+    return fig
+
+
+def fig_rollout_trajectories(scenarios: list, T: int, mobility_bands: list) -> go.Figure:
+    """Scenario-averaged price + mobility trajectories for the Policy-Rollout page.
+
+    mobility_bands : list of (label, color, [chi_traj arrays], showlegend) — one
+    band per mobility series (one for Baseline; two for a NegBin model and its
+    sibling variant). Price is always a single light-grey band.
+    """
+    T_hours = T // 60
+    h_axis = np.arange(T_hours)
+    m_axis = np.arange(T) / 60
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                        subplot_titles=("Mean price", "Mean mobility (0 parked, 1 driving)"))
+
+    P = _hourly_mean(np.array([sc["lam_path"] for sc in scenarios]), T_hours)
+    n_scen = max(P.shape[0], 1)
+    sem = lambda a: a.std(axis=0) / np.sqrt(n_scen)
+    _traj_band(fig, h_axis, P.mean(0), sem(P), "lightgray", "λ̄<sub>t</sub>", row=1)
+
+    show_legend = False
+    for label, color, chi_list, sl in mobility_bands:
+        Mob = np.array([(chi > 0).astype(float) for chi in chi_list])
+        _traj_band(fig, m_axis, Mob.mean(0), sem(Mob), color, label, row=2, showlegend=sl)
+        show_legend = show_legend or sl
+
+    fig.update_layout(template="plotly_white", plot_bgcolor="white", paper_bgcolor="white",
+                      height=560, hovermode="x unified",
+                      margin=dict(l=50, r=30, t=50, b=40), showlegend=show_legend,
+                      legend=dict(x=1.01, y=0.2, xanchor="left"))
+    fig.update_xaxes(range=[0, T_hours], dtick=max(1, T_hours // 8))
+    fig.update_xaxes(title_text="Hour (h)", row=2, col=1)
+    fig.update_yaxes(title_text="€/kWh", row=1, col=1)
+    fig.update_yaxes(title_text="Fraction driving", tickvals=[0, 0.5, 1], row=2, col=1)
+    return fig
+
+
+def fig_policy_heatmap(pi, actions, e_grid, params, T: int, chi: int = 0, *,
+                       lam_bin: int | None = None, pbp_fn=None,
+                       time_bin_min: int = 10, battery_bin_kwh: float = 1.0) -> go.Figure:
+    """Single optimal-policy heatmap over (hour × battery) for state `chi`.
+
+    Either a single price bin (`lam_bin`) or price-averaged (`pbp_fn`). Used by
+    the Policy-Explorer page.
+    """
+    if lam_bin is not None:
+        rates = actions[pi[:, chi, :, lam_bin]]                    # (T, N_e)
+    else:
+        rates = _opt_rates_averaged(pi, actions, params, pbp_fn, T, chi)
+    rates = _effective_rates(rates, chi, e_grid, params)
+    z, t_centers, b_centers = _bin_heatmap(
+        rates, e_grid, T, time_bin_min, battery_bin_kwh, params.e_min, params.e_max)
+    T_hours = T // 60
+    fig = go.Figure(data=go.Heatmap(
+        x=t_centers, y=b_centers, z=z, zmin=0, zmax=params.u_max,
+        colorscale="RdYlBu_r", colorbar=dict(title="u (kW)"),
+        hovertemplate="Hour: %{x:.2f}<br>Battery: %{y:.2f} kWh<br>Charge: %{z:.2f} kW<extra></extra>",
+    ))
+    fig.update_layout(
+        template="plotly_white", plot_bgcolor="white", paper_bgcolor="white",
+        xaxis_title="Hour (h)", yaxis_title="Battery (kWh)", height=430,
+        margin=dict(l=30, r=30, t=55, b=35),
+    )
+    fig.update_xaxes(range=[0, T_hours], dtick=T_hours // 8)
+    return fig
+
+
+def fig_policy_price_map(pi, actions, e_grid, lam_grid, params, chi: int = 0, t: int = 0) -> go.Figure:
+    """u*(battery × price bin) at a fixed minute `t` — keeps the price axis."""
+    rates = actions[pi[t, chi, :, :]].astype(float, copy=True)     # (N_e, K)
+    if chi > 0:
+        rates[e_grid > params.e_min, :] = 0.0
+    fig = go.Figure(data=go.Heatmap(
+        x=lam_grid, y=e_grid, z=rates, zmin=0, zmax=params.u_max,
+        colorscale="RdYlBu_r", colorbar=dict(title="u (kW)"),
+        hovertemplate="Price: %{x:.3f} €/kWh<br>Battery: %{y:.2f} kWh<br>Charge: %{z:.2f} kW<extra></extra>",
+    ))
+    fig.update_layout(
+        template="plotly_white", plot_bgcolor="white", paper_bgcolor="white",
+        xaxis_title="Price (€/kWh)", yaxis_title="Battery (kWh)", height=430,
+        margin=dict(l=30, r=30, t=55, b=35),
+    )
     return fig
 
 

@@ -28,6 +28,7 @@ from ev_mdt.analysis.sensitivity import (
     save_tables,
     baseline_optimal_result,
     baseline_model_figures,
+    HEATMAP_NCOLS,
     PHI_VALUES,
     BETA_VALUES,
     HORIZON_HOURS,
@@ -183,10 +184,8 @@ def _render_export_figure(export_id: str) -> tuple[str, bytes]:
         if not results:
             raise ValueError("Selected sweep has no results.")
         folder = dict(_SWEEP_RESULT_KEYS)[key]
-        _HEATMAP_NCOLS = {"sa_phi_results": 3, "sa_beta_results": 3,
-                          "sa_pricing_season_results": 2, "sa_mobility_results": 2}
         if figure_name == "policy_heatmaps":
-            fig = fig_heatmap_grid(results, ncols=_HEATMAP_NCOLS.get(key, 1))
+            fig = fig_heatmap_grid(results, ncols=HEATMAP_NCOLS.get(folder, 1))
         elif figure_name == "charge_border":
             fig = fig_charge_boundary_grid(results)
         elif figure_name == "cost":
@@ -209,10 +208,9 @@ def _show_results(results: list[dict], sweep_label: str):
         st.caption("Mobility model: **varies by panel**" if len(models) > 1
                    else f"Mobility model: **{next(iter(models))}**")
 
-    _heatmap_ncols = {"penalty": 3, "beta": 3, "pricing_season": 2, "mobility_model": 2,
-                      "pricing_crisis": 3}.get(sweep_label, 1)
     st.subheader("Policy heatmaps")
-    _chart(fig_heatmap_grid(results, ncols=_heatmap_ncols), f"{sweep_label}_policy_heatmaps")
+    _chart(fig_heatmap_grid(results, ncols=HEATMAP_NCOLS.get(sweep_label, 1)),
+           f"{sweep_label}_policy_heatmaps")
 
     st.subheader("Charge / no-charge border (all hours)")
     st.caption(

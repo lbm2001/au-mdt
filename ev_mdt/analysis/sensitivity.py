@@ -26,7 +26,6 @@ Standalone end-to-end usage
     results = run_all_sweeps(N_rollouts=200, N_e=200, seed=42)
     save_figures(results, out_dir="figures/")
 """
-import math
 from pathlib import Path
 from typing import Callable
 
@@ -42,12 +41,8 @@ from ev_mdt.models.baseline.rollout import simulate_policy_rollout as _baseline_
 from ev_mdt.models.negbin.model import transition_matrix as _negbin_tm
 from ev_mdt.models.negbin.rollout import simulate_policy_rollout as _negbin_rollout
 from ev_mdt.models.common.model_utils import price_bin_probs as _gaussian_pbp, mean_price
-from ev_mdt.models.common.policies import (
-    backward_induction_policy, night_charging_policy, dp_heuristic_policy,
-    maximal_charging_policy, always_minimum_policy, price_oriented_policy,
-    minimum_soc_policy,
-)
-from ev_mdt.models.common.rollout_utils import rollout_metrics
+from ev_mdt.models.common.policies import backward_induction_policy, policy_registry
+from ev_mdt.models.common.rollout_utils import rollout_metrics, run_policies
 from ev_mdt.plots.viz import POLICY_ORDER
 
 
@@ -80,25 +75,13 @@ ALL_SWEEP_NAMES = [
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
-def _poisson_kmax(lambda_k: float, quantile: float = 0.999) -> int:
-    """Smallest k_max with P(X ≤ k_max) ≥ quantile for X ~ Poisson(lambda_k)."""
-    pmf = math.exp(-lambda_k)
-    cdf = pmf
-    k   = 0
-    while cdf < quantile:
-        k   += 1
-        pmf *= lambda_k / k
-        cdf += pmf
-    return max(k, 1)
-
-
 def build_params(model_label: str, **overrides):
     """Build the params object for the selected mobility model, applying field overrides."""
     if model_label == BASELINE_MODEL:
         return BaselineParams(**overrides)
     if model_label == NEGBIN_SAMPLED_MODEL:
         return NegBinParams(**overrides, lambda_k=NEGBIN_LAMBDA_K,
-                            k=_poisson_kmax(NEGBIN_LAMBDA_K))
+                            k=NegBinParams.k_max_for_lambda(NEGBIN_LAMBDA_K))
     return NegBinParams(**overrides)
 
 
@@ -150,60 +133,36 @@ def run_rollouts(pi, actions, e_grid, params, scenarios: list, _rollout_fn, pbp_
 
     If ``desc`` is given, shows a per-rollout progress bar (x/N) under the sweep bars.
     """
-    chi0 = 0
-    benchmarks = [
-        ("Night Charging",        night_charging_policy,   {}),
-        ("DP-Heuristic",          dp_heuristic_policy,     {"price_bin_probs_fn": pbp_fn}),
-        ("Always-Maximum",        maximal_charging_policy, {}),
-        ("Always-Minimum",        always_minimum_policy,   {}),
-        ("Price-Oriented",        price_oriented_policy,
-         {"low_threshold": params.price_night, "high_threshold": params.price_evening}),
-        ("Minimum Battery Level", minimum_soc_policy,      {"soc_threshold": params.e_max * 0.25}),
-    ]
-    results: dict[str, list] = {p: [] for p in POLICY_ORDER}
-    bar = None
+    raw = run_rollouts_full(pi, actions, e_grid, params, scenarios, _rollout_fn, pbp_fn, desc=desc)
+    return {name: [rollout_metrics(r, params) for r in rolls] for name, rolls in raw.items()}
+
+
+def run_rollouts_full(pi, actions, e_grid, params, scenarios, _rollout_fn, pbp_fn,
+                      desc: str | None = None) -> dict:
+    """Like run_rollouts but keeps each raw rollout dict (u_traj/chi_traj/cost_traj)."""
+    registry = policy_registry(params, pbp_fn, pi=pi, actions=actions, e_grid=e_grid)
+    e0s = [float(sc["e0"]) for sc in scenarios]
+    bar = progress = None
     if desc is not None:
         from tqdm import tqdm
-        bar = tqdm(total=len(scenarios), desc=desc, unit="rollout",
-                   position=2, leave=False)
-    for sc in scenarios:
-        e0 = float(sc["e0"])
-        ro = _rollout_fn(
-            backward_induction_policy, sc, e0, chi0, params,
-            pi=pi, actions=actions, e_grid=e_grid,
-        )
-        results["Backward Induction"].append(rollout_metrics(ro, params))
-        for name, fn, kw in benchmarks:
-            ro = _rollout_fn(fn, sc, e0, chi0, params, **kw)
-            results[name].append(rollout_metrics(ro, params))
-        if bar is not None:
-            bar.update(1)
+        bar = tqdm(total=len(scenarios), desc=desc, unit="rollout", position=2, leave=False)
+        progress = lambda: bar.update(1)
+    out = run_policies(registry, scenarios, e0s, 0, params, _rollout_fn, progress=progress)
     if bar is not None:
         bar.close()
-    return results
-
-
-def run_rollouts_full(pi, actions, e_grid, params, scenarios, _rollout_fn, pbp_fn) -> dict:
-    """Like run_rollouts but keeps each raw rollout dict (u_traj/chi_traj/cost_traj)."""
-    chi0 = 0
-    benchmarks = [
-        ("Night Charging",        night_charging_policy,   {}),
-        ("DP-Heuristic",          dp_heuristic_policy,     {"price_bin_probs_fn": pbp_fn}),
-        ("Always-Maximum",        maximal_charging_policy, {}),
-        ("Always-Minimum",        always_minimum_policy,   {}),
-        ("Price-Oriented",        price_oriented_policy,
-         {"low_threshold": params.price_night, "high_threshold": params.price_evening}),
-        ("Minimum Battery Level", minimum_soc_policy,      {"soc_threshold": params.e_max * 0.25}),
-    ]
-    out: dict[str, list] = {p: [] for p in POLICY_ORDER}
-    for sc in scenarios:
-        e0 = float(sc["e0"])
-        out["Backward Induction"].append(_rollout_fn(
-            backward_induction_policy, sc, e0, chi0, params,
-            pi=pi, actions=actions, e_grid=e_grid))
-        for name, fn, kw in benchmarks:
-            out[name].append(_rollout_fn(fn, sc, e0, chi0, params, **kw))
     return out
+
+
+def rollout_stats_table(rollouts_by_policy: dict, params):
+    """Per-policy summary DataFrame (indexed by policy) from raw rollout dicts.
+
+    The Policy-Rollout page's stats table; columns match build_summary_df's metrics.
+    """
+    import pandas as pd
+    from ev_mdt.plots.sensitivity import _cost_summary
+    rows = {policy: _cost_summary([rollout_metrics(r, params) for r in rolls])
+            for policy, rolls in rollouts_by_policy.items()}
+    return pd.DataFrame(rows).T
 
 
 def _run_sweep_step(model_label: str, label: str, params, pbp_fn,
@@ -390,8 +349,8 @@ def sweep_mobility_models(N_rollouts: int, N_e: int, seed: int,
     configs = [
         (NEGBIN_FIXED_MODEL,   "NegBin fixed k=5",    NegBinParams(k=5)),
         (NEGBIN_FIXED_MODEL,   "NegBin fixed k=10",   NegBinParams(k=10)),
-        (NEGBIN_SAMPLED_MODEL, "NegBin Poisson k=5",  NegBinParams(lambda_k=5.0,  k=_poisson_kmax(5.0))),
-        (NEGBIN_SAMPLED_MODEL, "NegBin Poisson k=10", NegBinParams(lambda_k=10.0, k=_poisson_kmax(10.0))),
+        (NEGBIN_SAMPLED_MODEL, "NegBin Poisson k=5",  NegBinParams(lambda_k=5.0,  k=NegBinParams.k_max_for_lambda(5.0))),
+        (NEGBIN_SAMPLED_MODEL, "NegBin Poisson k=10", NegBinParams(lambda_k=10.0, k=NegBinParams.k_max_for_lambda(10.0))),
     ]
     results = []
     for i, (model, label, params) in enumerate(configs):
@@ -567,7 +526,8 @@ _SWEEP_FOLDER = {
     "mobility_model":    "mobility_model",
 }
 
-_HEATMAP_NCOLS = {
+# Heatmap-grid columns per sweep (single source of truth; app + CLI + figure export).
+HEATMAP_NCOLS = {
     "penalty": 3,
     "beta": 3,
     "pricing_season": 2,
@@ -603,7 +563,7 @@ def save_figures(
         dest = out_dir / "sensitivity_figures" / folder
         dest.mkdir(parents=True, exist_ok=True)
 
-        ncols = _HEATMAP_NCOLS.get(sweep_name, 1)
+        ncols = HEATMAP_NCOLS.get(sweep_name, 1)
         figs = {
             "policy_heatmaps": fig_heatmap_grid(results, ncols=ncols),
             "charge_border":   fig_charge_boundary_grid(results),

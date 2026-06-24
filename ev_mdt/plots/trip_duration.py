@@ -3,8 +3,6 @@
 Used by the Policy Rollout app page and the CLI so the chart and its underlying
 sampling stay identical in both places.
 """
-import math
-
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -15,18 +13,9 @@ from ev_mdt.models.negbin.rollout import _next_state as _ns_nb
 from ev_mdt.plots.viz import MODEL_COLORS
 
 
-def _kmax(lam: float, q: float = 0.999) -> int:
-    """Smallest k_max such that a Poisson(lam) puts ≥ q of its mass in [1, k_max]."""
-    pmf, cdf, k = math.exp(-lam), math.exp(-lam), 0
-    while cdf < q:
-        k += 1
-        pmf *= lam / k
-        cdf += pmf
-    return max(k, 1)
-
-
 def compute_trip_durations(n_scen: int = 10000, horizon: int = 1440, seed: int = 0) -> dict:
     """Driving-spell lengths (minutes) per mobility model, from simulated mobility only."""
+    _kmax = NegBinParams.k_max_for_lambda
     specs = {
         "Baseline":                       (BaselineParams(),                          _ns_base),
         "Negative Binomial (fixed k)":   (NegBinParams(),                            _ns_nb),

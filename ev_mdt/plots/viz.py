@@ -1,5 +1,16 @@
 """Shared plotting constants — canonical colours, labels, and order for all plots."""
 
+_NAMED_RGB = {"orange": "255,165,0", "lightgray": "211,211,211"}
+
+
+def rgba(color: str, alpha: float) -> str:
+    """rgba() string for a hex (#RRGGBB) or named colour, at the given opacity."""
+    if color.startswith("#"):
+        h = color.lstrip("#")
+        return f"rgba({int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)},{alpha})"
+    return f"rgba({_NAMED_RGB.get(color, '128,128,128')},{alpha})"
+
+
 POLICY_ORDER = [
     "Backward Induction",
     "DP-Heuristic",

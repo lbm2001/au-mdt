@@ -18,6 +18,7 @@ import plotly.graph_objects as go
 
 from ev_mdt.params import SharedParams
 from ev_mdt.models.common.model_utils import mean_price
+from ev_mdt.plots.viz import rgba as _rgba
 from ev_mdt.pricing.samplers import (
     GaussianBinnedSampler, GMMSampler, MDNSampler, SEASONS,
 )
@@ -141,11 +142,6 @@ def simulate_price_paths(
 
 
 # ── Figures ───────────────────────────────────────────────────────────────────
-
-def _rgba(hex_color: str, alpha: float) -> str:
-    h = hex_color.lstrip("#")
-    return f"rgba({int(h[0:2],16)},{int(h[2:4],16)},{int(h[4:6],16)},{alpha})"
-
 
 def price_figures(
     results: dict[str, np.ndarray],

@@ -95,6 +95,26 @@ def simulate_policy_rollout(
     }
 
 
+def run_policies(registry, scenarios, e0s, chi0, params, rollout_fn, progress=None):
+    """Run every policy in ``registry`` over each (scenario, e0); return raw rollouts.
+
+    registry   : list of (name, policy_fn, kwargs), e.g. from policies.policy_registry.
+    e0s        : per-scenario initial battery, aligned with ``scenarios``.
+    chi0       : initial mobility state (shared across policies within a scenario).
+    rollout_fn : model-specific simulate_policy_rollout.
+    progress   : optional no-arg callable invoked once per scenario (progress bar).
+
+    Returns {policy_name: [raw rollout dict, ...]} in registry order.
+    """
+    out: dict[str, list] = {name: [] for name, _, _ in registry}
+    for sc, e0 in zip(scenarios, e0s):
+        for name, fn, kw in registry:
+            out[name].append(rollout_fn(fn, sc, float(e0), int(chi0), params, **kw))
+        if progress is not None:
+            progress()
+    return out
+
+
 def rollout_metrics(
     rollout: dict[str, np.ndarray | float],
     params,

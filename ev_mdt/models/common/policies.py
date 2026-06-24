@@ -81,3 +81,26 @@ def dp_heuristic_policy(
     lam_grid = np.array([(j + 0.5) * params.lambda_max / params.K for j in range(params.K)])
     F_p      = float(probs[lam_grid <= lam].sum())
     return float(params.u_max) if F_p <= thresh else 0.0
+
+
+def policy_registry(params, pbp_fn, *, pi, actions, e_grid,
+                    low_threshold=None, high_threshold=None, soc_threshold=None):
+    """Ordered ``(name, policy_fn, kwargs)`` for every benchmark policy (POLICY_ORDER).
+
+    Single source of truth for the policy set compared everywhere (sensitivity
+    sweeps, baseline-model exports, the Policy-Rollout page). Thresholds default
+    to the canonical values: low/high = params.price_night/price_evening,
+    soc = params.e_max * 0.25.
+    """
+    low  = params.price_night   if low_threshold  is None else low_threshold
+    high = params.price_evening if high_threshold is None else high_threshold
+    soc  = params.e_max * 0.25  if soc_threshold  is None else soc_threshold
+    return [
+        ("Backward Induction",    backward_induction_policy, dict(pi=pi, actions=actions, e_grid=e_grid)),
+        ("DP-Heuristic",          dp_heuristic_policy,       dict(price_bin_probs_fn=pbp_fn)),
+        ("Price-Oriented",        price_oriented_policy,     dict(low_threshold=low, high_threshold=high)),
+        ("Night Charging",        night_charging_policy,     {}),
+        ("Always-Maximum",        maximal_charging_policy,   {}),
+        ("Minimum Battery Level", minimum_soc_policy,        dict(soc_threshold=soc)),
+        ("Always-Minimum",        always_minimum_policy,     {}),
+    ]

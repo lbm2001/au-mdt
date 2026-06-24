@@ -7,7 +7,7 @@ import streamlit as st
 from ev_mdt.params import (
     SharedParams as _SP, BaselineParams as _BP, NegBinParams as _NP,
     N_e as _N_E, T_hours as _T_HOURS,
-    BASELINE_MODEL, NEGBIN_FIXED_MODEL, NEGBIN_SAMPLED_MODEL, MODEL_LABELS,
+    BASELINE_MODEL, NEGBIN_SAMPLED_MODEL, MODEL_LABELS,
 )
 
 st.set_page_config(page_title="Settings — EV Charging MDP", layout="wide")
@@ -19,7 +19,7 @@ st.caption("Adjust all model parameters here, then click **Run Backward Inductio
 def _on_model_change():
     _sampler_keys = ["price_sampler_Gaussian Bins", "price_sampler_GMM", "price_sampler_MDN"]
     _world_keys   = ["price_sampler", "price_season", "price_is_weekend"]
-    for key in ["V", "pi", "actions", "e_grid", "lam_grid", "params", "T"] + _world_keys + _sampler_keys:
+    for key in ["pi", "actions", "e_grid", "lam_grid", "params", "T"] + _world_keys + _sampler_keys:
         st.session_state.pop(key, None)
 
 model = st.selectbox(
@@ -295,7 +295,7 @@ if run_btn:
                               lambda_k=float(nb_lambda_k) if nb_lambda_k is not None else None)
         mode_label = f"λ_k={nb_lambda_k:.1f}" if nb_lambda_k is not None else f"k={nb_k}"
         with st.spinner(f"Running backward induction (Negative Binomial {mode_label}, q={nb_q:.2f}, T={T} min, N_e={N_e})…"):
-            V, pi, actions, e_grid, lam_grid = _bi(
+            _J, pi, actions, e_grid, lam_grid = _bi(
                 params, transition_matrix_fn=lambda t: _tm(t, params),
                 price_bin_probs_fn=_pbp_fn, n_chi=params.k + 1, T=T, N_e=N_e, N_a=N_a)
     else:
@@ -310,7 +310,7 @@ if run_btn:
         _pbp_fn_baseline = _pbp_fn if _pbp_fn is not None else (lambda t: _gaussian_pbp(t, params))
         n_a_label = "Default" if N_a is None else str(N_a)
         with st.spinner(f"Running backward induction (Baseline, T={T} min, N_e={N_e}, N_a={n_a_label})…"):
-            V, pi, actions, e_grid, lam_grid = _bi(
+            _J, pi, actions, e_grid, lam_grid = _bi(
                 params,
                 transition_matrix_fn=lambda t: _tm(t, params),
                 price_bin_probs_fn=_pbp_fn_baseline,
@@ -320,7 +320,6 @@ if run_btn:
                 N_a=N_a,
             )
 
-    st.session_state["V"]            = V
     st.session_state["pi"]           = pi
     st.session_state["actions"]      = actions
     st.session_state["e_grid"]       = e_grid

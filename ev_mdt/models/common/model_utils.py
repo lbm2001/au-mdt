@@ -1,4 +1,6 @@
 """Shared model utilities for all EV charging MDP models."""
+from functools import lru_cache
+
 import numpy as np
 from math import erf as _erf, sqrt as _sqrt
 
@@ -47,3 +49,59 @@ def price_bin_probs(t: int, params) -> np.ndarray:
 def consumption(chi: int, params) -> float:
     """Energy consumed per minute in state chi (kWh/min). chi > 0 means driving."""
     return params.mu * params.v * params.omega if chi > 0 else 0.0
+
+
+def _hazard(h: float, p_morning: float, p_lunch: float, p_evening: float, p_default: float) -> float:
+    """Parked→Driving departure hazard for hour-of-day h. Windows shared by both models."""
+    if 7.0 <= h < 9.0:
+        return p_morning
+    if 12.0 <= h < 14.0:
+        return p_lunch
+    if 16.0 <= h < 18.0:
+        return p_evening
+    return p_default
+
+
+def departure_prob(t: int, params) -> float:
+    """Parked→Driving departure probability p_t^{P→D} at minute t (per minute, periodic).
+
+    Identical to baseline.transition_probs/negbin.p_pd, but model-agnostic: reads only
+    the p_pd_* fields on SharedParams so shared policies can use it without a model object.
+    """
+    return _hazard((t % 1440) / 60,
+                   params.p_pd_morning, params.p_pd_lunch,
+                   params.p_pd_evening, params.p_pd_default)
+
+
+@lru_cache(maxsize=8)
+def _tau_table(p_morning: float, p_lunch: float, p_evening: float, p_default: float) -> tuple:
+    """Exact E[minutes until next departure] for every minute-of-day, given the hazards.
+
+    Solves the periodic recurrence  τ(m) = 1 + (1 − p_{m+1})·τ(m+1)  over the 1440-minute
+    ring by Gauss–Seidel sweeps (backward, so each sweep uses freshly-updated successors).
+    Contraction per cycle is the survival product ∏(1−p) ≪ 1, so it converges in a few
+    sweeps. Cached on the four hazard values, so it is computed once per parameter set.
+    """
+    haz = [_hazard(m / 60, p_morning, p_lunch, p_evening, p_default) for m in range(1440)]
+    tau = [0.0] * 1440
+    for _ in range(200):
+        max_delta = 0.0
+        for m in range(1439, -1, -1):
+            nxt = (m + 1) % 1440
+            new = 1.0 + (1.0 - haz[nxt]) * tau[nxt]
+            max_delta = max(max_delta, abs(new - tau[m]))
+            tau[m] = new
+        if max_delta < 1e-9:
+            break
+    return tuple(tau)
+
+
+def minutes_to_departure(t: int, params) -> float:
+    """Charging window τ(t): exact E[minutes until the next Parked→Driving departure].
+
+    Forward expectation over the periodic departure hazard departure_prob(·), i.e.
+    τ(t) = Σ_{s≥1} s · P(first departure at t+s). Computed via the cached ring solve.
+    """
+    table = _tau_table(params.p_pd_morning, params.p_pd_lunch,
+                       params.p_pd_evening, params.p_pd_default)
+    return table[t % 1440]

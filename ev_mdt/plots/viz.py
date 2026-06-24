@@ -14,6 +14,7 @@ def rgba(color: str, alpha: float) -> str:
 POLICY_ORDER = [
     "Backward Induction",
     "DP-Heuristic",
+    "Next-Trip Urgency",
     "Price-Oriented",
     "Night Charging",
     "Always-Maximum",
@@ -24,6 +25,7 @@ POLICY_ORDER = [
 POLICY_COLORS = {
     "Backward Induction":   "#4477AA",
     "DP-Heuristic":         "#009988",
+    "Next-Trip Urgency":    "#66CCEE",
     "Price-Oriented":       "#EE6677",
     "Night Charging":       "#AA3377",
     "Always-Maximum":       "#228833",

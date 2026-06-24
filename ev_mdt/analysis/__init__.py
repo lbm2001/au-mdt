@@ -8,6 +8,8 @@ from ev_mdt.analysis.sensitivity import (
     run_all_sweeps,
     save_figures,
     save_tables,
+    exact_bi_cost_table,
+    bi_expected_cost,
     sweep_penalty,
     sweep_beta,
     sweep_horizon,

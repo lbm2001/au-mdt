@@ -124,3 +124,71 @@ def backward_induction(
             J[t, chi]  = np.min(Q,   axis=1)
 
     return J, pi, actions, e_grid, lam_grid
+
+
+def evaluate_policy(
+    params,
+    transition_matrix_fn: Callable[[int], np.ndarray],
+    price_bin_probs_fn: Callable[[int], np.ndarray],
+    n_chi: int,
+    action_fn: Callable[[int, int], np.ndarray],
+    T: int,
+    N_e: int,
+    beta: float | None = None,
+    consumption_fn: Callable[[int], float] | None = None,
+):
+    """Exact policy evaluation: expected cost-to-go Jπ for a fixed deterministic policy.
+
+    Same recursion as ``backward_induction`` but with no minimisation — the action
+    is supplied by ``action_fn(t, chi) -> (N_e, K)`` desired charge rates (the
+    driving/battery-floor gating is applied here, exactly as in the solver). With
+    ``beta=1`` this yields the expected *undiscounted* total cost, matching the
+    undiscounted cost summed in the Monte-Carlo rollouts.
+
+    Returns Jπ of shape (T+1, n_chi, N_e, K).
+    """
+    beta = params.beta if beta is None else beta
+    K      = params.K
+    e_grid = np.linspace(params.e_min, params.e_max, N_e)
+    lam_grid = np.array([(j + 0.5) * params.lambda_max / K for j in range(K)])
+    if consumption_fn is None:
+        consumption_fn = lambda chi: _consumption(chi, params)
+
+    J = np.zeros((T + 1, n_chi, N_e, K))
+    all_p_next = np.array([price_bin_probs_fn(t + 1) for t in range(T)])
+    E = e_grid[:, np.newaxis]    # (N_e, 1)
+
+    for t in range(T - 1, -1, -1):
+        P     = transition_matrix_fn(t)
+        J_bar = J[t + 1] @ all_p_next[t]       # (n_chi, N_e)
+
+        for chi in range(n_chi):
+            driving = chi > 0
+            u = np.asarray(action_fn(t, chi), dtype=float)      # (N_e, K) desired rates
+            if driving:
+                u = np.where(E > params.e_min, 0.0, u)          # on the road → u = 0
+
+            cost = u * params.omega * lam_grid[np.newaxis, :]   # (N_e, K)
+            if driving:
+                penalty = np.where(E > params.e_min, 0.0, params.omega * params.phi)
+                cost = cost + penalty
+
+            cons   = consumption_fn(chi)
+            e_next = np.clip(E + params.eta_c * params.omega * u - cons,
+                             params.e_min, params.e_max)
+            e_next_f = (e_next - params.e_min) / (params.e_max - params.e_min) * (N_e - 1)
+            e_lo = np.floor(e_next_f).astype(int)
+            e_hi = np.minimum(e_lo + 1, N_e - 1)
+            w_hi = e_next_f - e_lo
+            w_lo = 1.0 - w_hi
+
+            EJ = np.zeros((N_e, K))
+            for chi_next in range(n_chi):
+                p = P[chi, chi_next]
+                if p == 0.0:
+                    continue
+                EJ += p * (w_lo * J_bar[chi_next][e_lo] + w_hi * J_bar[chi_next][e_hi])
+
+            J[t, chi] = cost + beta * EJ
+
+    return J

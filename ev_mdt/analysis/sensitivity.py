@@ -35,7 +35,9 @@ from ev_mdt.params import (
     BaselineParams, NegBinParams,
     BASELINE_MODEL, NEGBIN_FIXED_MODEL, NEGBIN_SAMPLED_MODEL,
 )
-from ev_mdt.models.common.backward_induction import backward_induction as _backward_induction
+from ev_mdt.models.common.backward_induction import (
+    backward_induction as _backward_induction, evaluate_policy as _evaluate_policy,
+)
 from ev_mdt.models.baseline.model import transition_matrix as _baseline_tm
 from ev_mdt.models.baseline.rollout import simulate_policy_rollout as _baseline_rollout
 from ev_mdt.models.negbin.model import transition_matrix as _negbin_tm
@@ -101,6 +103,29 @@ def solve(model_label: str, params, pbp_fn, T: int, N_e: int):
         n_chi=n_chi, T=T, N_e=N_e,
     )
     return pi, actions, e_grid, lam_grid
+
+
+def bi_expected_cost(result: dict, beta: float = 1.0) -> float:
+    """Exact expected cost of the optimal (Backward Induction) policy for a config.
+
+    Evaluates the solved policy `pi` (from a solve()/sweep-step/baseline result dict)
+    analytically and averages over the rollout initial-state distribution:
+    χ₀=0, e₀ ~ Uniform[e_min,e_max] (battery grid), λ̂₀ ~ price marginal at t=0.
+    With beta=1 (default) this is the expected *undiscounted* total cost, directly
+    comparable to the Monte-Carlo "Mean cost".
+    """
+    model_label = result["model"]
+    params, pbp_fn = result["params"], result["pbp_fn"]
+    pi, actions, e_grid, T = result["pi"], result["actions"], result["e_grid"], result["T"]
+    if model_label == BASELINE_MODEL:
+        tm_fn, n_chi = (lambda t: _baseline_tm(t, params)), 2
+    else:
+        tm_fn, n_chi = (lambda t: _negbin_tm(t, params)), params.k + 1
+    Jpi = _evaluate_policy(
+        params, transition_matrix_fn=tm_fn, price_bin_probs_fn=pbp_fn, n_chi=n_chi,
+        action_fn=lambda t, chi: actions[pi[t, chi]], T=T, N_e=len(e_grid), beta=beta,
+    )
+    return float(np.mean(Jpi[0, 0] @ np.asarray(pbp_fn(0))))
 
 
 def make_scenario(params, seed: int, horizon: int,
@@ -552,6 +577,7 @@ def save_figures(
     """
     from ev_mdt.plots.sensitivity import (
         fig_heatmap_grid, fig_charge_boundary_grid, fig_cost_distribution, figure_to_png,
+        fig_baseline_cost, fig_baseline_trajectories, fig_rollout_trajectories,
     )
     from ev_mdt.plots.trip_duration import compute_trip_durations, trip_duration_figure
 
@@ -577,18 +603,57 @@ def save_figures(
     if include_baseline:
         bm_dir = out_dir / "baseline_models"
         bm_dir.mkdir(parents=True, exist_ok=True)
+        prefixes = {
+            BASELINE_MODEL:       "baseline",
+            NEGBIN_FIXED_MODEL:   "negbin",
+            NEGBIN_SAMPLED_MODEL: "negbin_poisson",
+        }
+        # NegBin variants share one combined trajectory figure (mobility overlaid).
+        negbin_display = {
+            NEGBIN_FIXED_MODEL:   ("Negative Binomial (fixed k)",   "#EE6677"),
+            NEGBIN_SAMPLED_MODEL: ("Negative Binomial (Poisson k)", "#228833"),
+        }
+        negbin_bands: list = []
+        negbin_scenarios = negbin_T = None
+
         for model_label in [BASELINE_MODEL, NEGBIN_FIXED_MODEL, NEGBIN_SAMPLED_MODEL]:
-            prefix = {
-                BASELINE_MODEL:       "baseline",
-                NEGBIN_FIXED_MODEL:   "negbin",
-                NEGBIN_SAMPLED_MODEL: "negbin_poisson",
-            }[model_label]
+            prefix = prefixes[model_label]
             result = baseline_optimal_result(model_label, N_e)
-            figs = baseline_model_figures(result, N_rollouts, seed)
-            for name, fig in figs.items():
-                p = bm_dir / f"{prefix}_{name.replace('baseline_', '')}.png"
+            params, T, pbp_fn = result["params"], result["T"], result["pbp_fn"]
+            scenarios = [make_scenario(params, seed + i, T) for i in range(N_rollouts)]
+            full = run_rollouts_full(result["pi"], result["actions"], result["e_grid"],
+                                     params, scenarios, rollout_fn(model_label), pbp_fn)
+
+            for name, fig in (("cost", fig_baseline_cost(full)),
+                              ("optimal_policy", fig_heatmap_grid([result], show_titles=False))):
+                p = bm_dir / f"{prefix}_{name}.png"
                 p.write_bytes(figure_to_png(fig))
                 saved.append(p)
+
+            if model_label == BASELINE_MODEL:
+                p = bm_dir / "baseline_trajectories.png"
+                p.write_bytes(figure_to_png(fig_baseline_trajectories(full, scenarios, T, params)))
+                saved.append(p)
+            else:
+                label, color = negbin_display[model_label]
+                chi_list = [r["chi_traj"] for r in full["Backward Induction"]]
+                negbin_bands.append((label, color, chi_list, True))
+                negbin_scenarios, negbin_T = scenarios, T
+
+        # Single combined NegBin trajectory figure (both variants on one plot).
+        if negbin_bands:
+            fig = fig_rollout_trajectories(negbin_scenarios, negbin_T, negbin_bands)
+            # Export-only: full-width horizontal legend on top (frees the side
+            # space the app's side-legend takes) with a slightly larger font.
+            # Extra top margin so it clears the first subplot title.
+            fig.update_layout(
+                margin=dict(l=40, r=30, t=90, b=40),
+                legend=dict(orientation="h", yanchor="bottom", y=1.10,
+                            xanchor="left", x=0, font=dict(size=18)),
+            )
+            p = bm_dir / "negbin_trajectories.png"
+            p.write_bytes(figure_to_png(fig))
+            saved.append(p)
 
         # Trip duration figure
         durs = compute_trip_durations()
@@ -660,3 +725,36 @@ def save_tables(
         if _log: _log(f"  Saved table: {p}")
 
     return saved
+
+
+def exact_bi_cost_table(N_e: int = 500, seed: int = 42, _log: Callable | None = None):
+    """Analytical (exact) expected cost of the BI policy for every scenario.
+
+    One row for the Baseline config plus one per sensitivity-sweep configuration
+    (all 34). No Monte-Carlo: each config is solved and its optimal policy is
+    evaluated exactly (β=1, undiscounted). Returns a DataFrame
+    [Sweep, Configuration, Exact BI cost (€)].
+
+    Note: this still fits the price samplers (incl. MDN) for the pricing configs,
+    but runs only a single throwaway rollout per config to reuse the sweep
+    pipeline — the reported cost is purely analytical (from the value function).
+    """
+    import pandas as pd
+
+    rows = [{
+        "Sweep":             "baseline",
+        "Configuration":     "Baseline",
+        "Exact BI cost (€)": bi_expected_cost(baseline_optimal_result(BASELINE_MODEL, N_e)),
+    }]
+    if _log: _log("Baseline: exact BI cost computed.")
+
+    results = run_all_sweeps(N_rollouts=1, N_e=N_e, seed=seed, _log=_log)
+    for sweep_name, steps in results.items():
+        for step in steps:
+            rows.append({
+                "Sweep":             sweep_name,
+                "Configuration":     step["label"],
+                "Exact BI cost (€)": bi_expected_cost(step),
+            })
+
+    return pd.DataFrame(rows)

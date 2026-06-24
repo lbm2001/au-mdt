@@ -61,17 +61,40 @@ def cmd_run(args: argparse.Namespace) -> None:
         run_all_sweeps, save_figures, save_tables, ALL_SWEEP_NAMES,
     )
 
+    figures_dir = Path(args.out_dir) / "figures_app"
+    tables_dir  = Path(args.out_dir) / "tables"
+
+    # ── Exact-cost mode: analytical expected BI cost per scenario (no rollouts) ─
+    if args.exact_cost:
+        from ev_mdt.analysis.sensitivity import exact_bi_cost_table
+        print("Computing exact (analytical) BI cost per scenario…", flush=True)
+        df = exact_bi_cost_table(N_e=args.N_e, seed=args.seed, _log=tqdm.write)
+        tables_dir.mkdir(parents=True, exist_ok=True)
+        out = tables_dir / "exact_bi_cost.csv"
+        df.to_csv(out, index=False)
+        print(df.to_string(index=False))
+        print(f"\nSaved: {out}")
+        return
+
+    # ── Baseline-only mode: just the baseline/NegBin model figures ─────────────
+    if args.baseline_only:
+        print("Rendering baseline-model figures only…", flush=True)
+        saved = save_figures({}, out_dir=figures_dir, N_rollouts=args.N_rollouts,
+                             seed=args.seed, N_e=args.N_e, include_baseline=True)
+        for p in saved:
+            print(f"  Saved: {p}")
+        print(f"\nDone. Figures → {figures_dir}/baseline_models/")
+        return
+
     if args.all:
         sweeps = list(ALL_SWEEP_NAMES)
     elif args.sweep:
         sweeps = [args.sweep]
     else:
-        print("Nothing to do: pass --all (full export) or --sweep <name>.", file=sys.stderr)
+        print("Nothing to do: pass --all, --baseline-only, or --sweep <name>.", file=sys.stderr)
         sys.exit(1)
 
     do_baseline = args.all
-    figures_dir = Path(args.out_dir) / "figures_app"
-    tables_dir  = Path(args.out_dir) / "tables"
 
     # ── W&B setup ─────────────────────────────────────────────────────────────
     wandb_run = None
@@ -157,6 +180,23 @@ def cmd_run(args: argparse.Namespace) -> None:
                              _log=tqdm.write):
             tqdm.write(f"  Saved: {p}")
 
+        # Price-model comparison figures (mean diurnal profile + std), as on the
+        # Price Explorer page.
+        tqdm.write("Fitting price models + rendering comparison…")
+        from ev_mdt.pricing.entsoe import load_prices
+        from ev_mdt.analysis.prices import fit_samplers, simulate_price_paths, price_figures
+        from ev_mdt.plots.sensitivity import figure_to_png
+        _df = load_prices(_log=tqdm.write)
+        _samplers = fit_samplers(_df)
+        _px = simulate_price_paths(_samplers, n_days=1000, seed=args.seed)
+        _fig_mean, _fig_std = price_figures(_px)
+        px_dir = figures_dir / "price_explorer"
+        px_dir.mkdir(parents=True, exist_ok=True)
+        for _nm, _fig in (("mean_profile", _fig_mean), ("std_profile", _fig_std)):
+            _p = px_dir / f"{_nm}.png"
+            _p.write_bytes(figure_to_png(_fig))
+            tqdm.write(f"  Saved: {_p}")
+
     print("\nRun complete.")
     print(f"  Figures → {figures_dir}/")
     print(f"  Tables  → {tables_dir}/")
@@ -233,6 +273,10 @@ def main() -> None:
     p_run = sub.add_parser("run", help="Run sweeps + model rollouts, export figures and tables")
     p_run.add_argument("--all", action="store_true",
                        help="Run every sweep plus the baseline/NegBin models (full export)")
+    p_run.add_argument("--baseline-only", action="store_true",
+                       help="Only render the baseline/NegBin model figures (no sweeps)")
+    p_run.add_argument("--exact-cost", action="store_true",
+                       help="Analytical exact expected BI cost per scenario (no rollouts) → tables/exact_bi_cost.csv")
     p_run.add_argument("--sweep", default=None,
                        choices=ALL_SWEEP_NAMES, metavar="SWEEP",
                        help=f"Run a single sweep (no baseline models). Options: {', '.join(ALL_SWEEP_NAMES)}")

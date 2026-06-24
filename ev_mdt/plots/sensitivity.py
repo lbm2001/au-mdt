@@ -192,9 +192,9 @@ def fig_cost_distribution(results: list[dict], log_y: bool = True,
         paper_bgcolor="white",
         barmode="group", yaxis=yaxis, height=440,
         margin=dict(l=80, r=20, t=40, b=40),
-        # Compact single-row legend: 7 policies fit one line at this font size.
+        # Compact single-row legend: 7 policies still fit one line at this size.
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
-                    font=dict(size=11), itemsizing="constant"),
+                    font=dict(size=14), itemsizing="constant"),
     )
     return fig
 
@@ -295,7 +295,7 @@ def fig_baseline_trajectories(full: dict, scenarios: list, T: int, params) -> go
     sem = lambda a: a.std(axis=0) / np.sqrt(n)
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-                        subplot_titles=("Mean price", "Mean mobility (0 parked, 1 driving)"))
+                        subplot_titles=("Mean sampled price", "Mean sampled mobility (0 parked, 1 driving)"))
 
     P = _hourly_mean(np.array([sc["lam_path"] for sc in scenarios]), T_hours)   # (N, T_hours)
     _traj_band(fig, h_axis, P.mean(0), sem(P), "lightgray", "λ̄<sub>t</sub>", row=1)
@@ -329,7 +329,7 @@ def fig_rollout_trajectories(scenarios: list, T: int, mobility_bands: list) -> g
     m_axis = np.arange(T) / 60
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-                        subplot_titles=("Mean price", "Mean mobility (0 parked, 1 driving)"))
+                        subplot_titles=("Mean sampled price", "Mean sampled mobility (0 parked, 1 driving)"))
 
     P = _hourly_mean(np.array([sc["lam_path"] for sc in scenarios]), T_hours)
     n_scen = max(P.shape[0], 1)

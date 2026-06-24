@@ -49,4 +49,4 @@ wandb/
 entsoe-data/
 
 # Exported figures and tables
-export/
+*export*/

@@ -151,7 +151,6 @@ def price_figures(
     Each figure has one trace per pricing model.
     """
     hours = np.arange(24)
-    n     = next(iter(results.values())).shape[0]
 
     fig_mean = go.Figure()
     fig_std  = go.Figure()
@@ -159,7 +158,7 @@ def price_figures(
     for name, prices in results.items():
         col = PRICE_MODEL_COLORS.get(name, "#888888")
         mu  = prices.mean(axis=0)
-        sem = prices.std(axis=0) / np.sqrt(n)
+        sem = prices.std(axis=0) / np.sqrt(prices.shape[0])
         std = prices.std(axis=0)
 
         fig_mean.add_trace(go.Scatter(

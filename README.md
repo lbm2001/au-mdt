@@ -78,20 +78,28 @@ python -m ev_mdt rollout --model "Negative Binomial trips (fixed k)" --n 200
 
 ```bash
 python -m ev_mdt run --all [--N-rollouts N] [--N-e N] [--seed SEED] [--out-dir DIR]
+python -m ev_mdt run --baseline-only ...      # only the baseline/NegBin model figures
+python -m ev_mdt run --exact-cost ...         # analytical exact BI cost per scenario (no rollouts)
 python -m ev_mdt run --sweep SWEEP ...        # single sweep, no baseline models
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--all` | — | Run every sweep **plus** the baseline/NegBin models (full export) |
+| `--all` | — | Run every sweep **plus** the baseline/NegBin models + price-model comparison (full export) |
+| `--baseline-only` | — | Only render the baseline/NegBin model figures (`figures_app/baseline_models/`), no sweeps |
+| `--exact-cost` | — | Analytical **exact** expected cost of the optimal (BI) policy for Baseline + all 34 sensitivity configs (no Monte-Carlo) → `tables/exact_bi_cost.csv` |
 | `--sweep` | — | Run a single sweep (no baseline models). One of: `pricing_model`, `pricing_season`, `pricing_daytype`, `pricing_crisis`, `penalty`, `beta`, `horizon`, `departure_profile`, `mobility_model` |
 | `--N-rollouts` | `500` | Rollouts per swept value |
 | `--N-e` | `500` | Battery grid points |
 | `--seed` | `42` | Random seed |
 | `--out-dir` | `export` | Export base: figures → `<dir>/figures_app/`, summary tables (CSV) → `<dir>/tables/` |
 
+With `--all`, the export also includes the price-model comparison
+(`figures_app/price_explorer/{mean_profile,std_profile}.png`).
+
 ```bash
 python -m ev_mdt run --all                            # full figure + table export
+python -m ev_mdt run --baseline-only                  # just baseline_models/ figures
 python -m ev_mdt run --sweep penalty
 python -m ev_mdt run --sweep mobility_model --N-rollouts 200 --out-dir out/
 ```

@@ -1,20 +1,18 @@
-import math
+import numpy as np
 
 from ev_mdt.models.common.rollout_utils import simulate_policy_rollout as _simulate
-from ev_mdt.models.negbin.model import PARKED, p_pd
+from ev_mdt.models.negbin.model import PARKED, p_pd, _poisson_entry_probs
 
 
-def _sample_poisson_k(uniform_draw: float, lambda_k: float, k_max: int) -> int:
-    """Inverse-CDF sample from Poisson(lambda_k) truncated to [1, k_max]."""
-    pmf_r = math.exp(-lambda_k)
-    total = 1.0 - pmf_r
-    cdf   = 0.0
-    for r in range(1, k_max + 1):
-        pmf_r *= lambda_k / r
-        cdf   += pmf_r / total
-        if uniform_draw <= cdf:
-            return r
-    return k_max
+def _sample_poisson_k(uniform_draw: float, params) -> int:
+    """Inverse-CDF sample of the trip's phase count k ∈ [1, k_max].
+
+    Uses the *same* truncated-and-renormalised Poisson PMF the solver assumes
+    (model._poisson_entry_probs), so the simulated trip-length distribution
+    matches the one backward induction optimises against.
+    """
+    cdf = np.cumsum(_poisson_entry_probs(params))
+    return min(int(np.searchsorted(cdf, uniform_draw, side="left")) + 1, params.k)
 
 
 def _next_state(chi: int, scenario: dict, t: int, params) -> int:
@@ -24,7 +22,7 @@ def _next_state(chi: int, scenario: dict, t: int, params) -> int:
         if mob_draw < p_pd(t, params):
             if params.lambda_k is None:
                 return params.k
-            return _sample_poisson_k(phase_draw, params.lambda_k, params.k)
+            return _sample_poisson_k(phase_draw, params)
         return PARKED
     return chi - 1 if mob_draw < params.q else chi
 

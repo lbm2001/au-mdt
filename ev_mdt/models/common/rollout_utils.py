@@ -13,8 +13,16 @@ def generate_rollout_scenario(
     params,
     seed: int,
     horizon: int = 2880,
+    sampler=None,
+    season: str = "winter",
+    is_weekend: bool = False,
 ) -> dict[str, np.ndarray]:
     """Generate sampled prices and mobility draws shared across policy rollouts.
+
+    Prices are drawn from the Gaussian-parametric marginal (``sampler=None``) or,
+    when a fitted price ``sampler`` is supplied, from that sampler at the given
+    ``season``/``is_weekend`` context — so a policy is evaluated in the same price
+    world it was solved in.
 
     Always includes phase_draws; models that don't need them simply ignore the key.
     """
@@ -22,8 +30,12 @@ def generate_rollout_scenario(
     lam_path       = np.zeros(horizon)
     mobility_draws = np.zeros(horizon)
     phase_draws    = np.zeros(horizon)
+    dow = 5 if is_weekend else 0
     for t in range(horizon):
-        lam_path[t]       = float(np.maximum(0.0, rng.normal(mean_price(t, params), params.sigma_lambda)))
+        if sampler is None:
+            lam_path[t] = float(max(0.0, rng.normal(mean_price(t, params), params.sigma_lambda)))
+        else:
+            lam_path[t] = float(max(0.0, sampler.sample(dow, (t // 60) % 24, season, rng=rng)))
         mobility_draws[t] = rng.random()
         phase_draws[t]    = rng.random()
     return {"lam_path": lam_path, "mobility_draws": mobility_draws, "phase_draws": phase_draws}

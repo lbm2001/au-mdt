@@ -252,9 +252,9 @@ def _show_results(results: list[dict], sweep_label: str):
 st.set_page_config(page_title="Sensitivity Analysis — EV Charging MDP", layout="wide")
 st.title("Sensitivity Analysis")
 with st.expander("About this page", expanded=False):
-    st.markdown("""
+    st.markdown(f"""
 **Baseline configuration** (SharedParams / BaselineParams defaults):
-battery e_max = 40 kWh · η_c = 0.95 · u_max = 11 kW · φ = 1000 €/h · K = 20 bins · λ_max = 0.30 €/kWh
+battery e_max = 40 kWh · η_c = 0.95 · u_max = 11 kW · φ = 1000 €/h · K = 100 bins · λ_max = 0.25 €/kWh
 
 **Prices** are wholesale DK1 day-ahead levels (€/kWh). The Gaussian-parametric means are fitted to
 ENTSO-E data **excluding** the 2021–23 crisis; the data-driven models (bins/GMM/MDN) train on **all**
@@ -270,11 +270,13 @@ years. Negative wholesale prices (~2.6% of hours) are floored to 0.
 > Default trip durations differ across models, so switching the model is **not** a controlled
 > comparison — read each model's sweeps on their own.
 
-**Four independent sweep dimensions** (others held at baseline):
-1. **Pricing model** — Gaussian parametric · Gaussian Bins · GMM · MDN
-2. **Penalty** — {0, 100, 500, 1000, 2000, 5000, 10 000} €/h
-3. **Horizon T** — {24 h, 48 h, 168 h}
-4. **Season × Day type** — all 8 combinations of {winter, spring, summer, autumn} × {weekday, weekend}
+**Six independent sweep dimensions** (others held at baseline):
+1. **Pricing model / season / day-type / crisis** — on ENTSO-E DK1 data (Gaussian Bins · GMM · MDN)
+2. **Penalty** — φ ∈ {PHI_VALUES} €/h
+3. **Discount β** — {BETA_VALUES}
+4. **Horizon T** — {HORIZON_HOURS} h
+5. **Departure profile** — {list(DEPARTURE_PROFILES)}
+6. **Mobility model** — NegBin {{fixed-k, Poisson-k}} × {{k=5, k=10}}
 
 > **Reading the Pricing tab:** each pricing model is solved *and* evaluated in its **own** price
 > world. Compare policies *within* a column (which policy wins, optimality gap, feasibility) — not

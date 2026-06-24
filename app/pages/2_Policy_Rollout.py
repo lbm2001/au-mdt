@@ -71,6 +71,20 @@ low_threshold  = float(st.session_state.get("benchmark_low_threshold",  params.p
 high_threshold = float(st.session_state.get("benchmark_high_threshold", params.price_evening))
 soc_threshold  = float(st.session_state.get("soc_threshold",            params.e_max * 0.25))
 
+# Price world the policy was solved in (Settings) — draw rollout prices and the
+# DP-Heuristic's price distribution from it, so the policy is evaluated in the
+# same world it was optimised for (None → Gaussian parametric).
+from ev_mdt.models.common.model_utils import price_bin_probs as _gaussian_pbp
+_price_sampler   = st.session_state.get("price_sampler")
+_price_season    = st.session_state.get("price_season") or "winter"
+_price_isweekend = bool(st.session_state.get("price_is_weekend", False))
+if _price_sampler is not None:
+    from ev_mdt.pricing.samplers import make_price_bin_probs_fn
+    _pbp_fn = make_price_bin_probs_fn(_price_sampler, params, _price_season, _price_isweekend)
+else:
+    _pbp_fn = lambda t: _gaussian_pbp(t, params)
+_scen_kw = dict(sampler=_price_sampler, season=_price_season, is_weekend=_price_isweekend)
+
 # ── Single rollout ────────────────────────────────────────────────────────────
 
 st.subheader("Single-Scenario Rollout")
@@ -96,14 +110,15 @@ else:
     seed = st.session_state.get("sim_seed", int(seed))
 
 chi0_int = 0 if chi0 == "Parked" else 1  # D_1 (state 1) is the natural driving start for NegBin
-scenario = generate_rollout_scenario(params, int(seed), horizon=T)
+scenario = generate_rollout_scenario(params, int(seed), horizon=T, **_scen_kw)
 
 single_rollouts = {
     "Backward Induction": simulate_policy_rollout(
         backward_induction_policy, scenario, float(e0), chi0_int, params,
         pi=pi, actions=actions, e_grid=e_grid),
     "DP-Heuristic": simulate_policy_rollout(
-        dp_heuristic_policy, scenario, float(e0), chi0_int, params),
+        dp_heuristic_policy, scenario, float(e0), chi0_int, params,
+        price_bin_probs_fn=_pbp_fn),
     "Always-Maximum": simulate_policy_rollout(
         maximal_charging_policy, scenario, float(e0), chi0_int, params),
     "Price-Oriented": simulate_policy_rollout(
@@ -151,7 +166,7 @@ if st.session_state.get("_nd_key") != _nd_key:
     with st.spinner(f"Rolling out all policies over {n_days} scenarios…"):
         rng_nd = np.random.default_rng(int(nd_seed))
         nd_scenarios = [
-            generate_rollout_scenario(params, int(rng_nd.integers(0, 1_000_000)), horizon=T)
+            generate_rollout_scenario(params, int(rng_nd.integers(0, 1_000_000)), horizon=T, **_scen_kw)
             for _ in range(n_days)
         ]
         nd_e0s = [float(rng_nd.uniform(params.e_min, params.e_max)) for _ in range(n_days)]
@@ -161,7 +176,8 @@ if st.session_state.get("_nd_key") != _nd_key:
                 backward_induction_policy, sc, e0_i, nd_chi0_int, params,
                 pi=pi, actions=actions, e_grid=e_grid))
             nd_rollouts["DP-Heuristic"].append(simulate_policy_rollout(
-                dp_heuristic_policy, sc, e0_i, nd_chi0_int, params))
+                dp_heuristic_policy, sc, e0_i, nd_chi0_int, params,
+                price_bin_probs_fn=_pbp_fn))
             nd_rollouts["Always-Maximum"].append(simulate_policy_rollout(
                 maximal_charging_policy, sc, e0_i, nd_chi0_int, params))
             nd_rollouts["Price-Oriented"].append(simulate_policy_rollout(

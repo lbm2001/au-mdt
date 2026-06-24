@@ -18,7 +18,8 @@ st.caption("Adjust all model parameters here, then click **Run Backward Inductio
 
 def _on_model_change():
     _sampler_keys = ["price_sampler_Gaussian Bins", "price_sampler_GMM", "price_sampler_MDN"]
-    for key in ["V", "pi", "actions", "e_grid", "lam_grid", "params", "T"] + _sampler_keys:
+    _world_keys   = ["price_sampler", "price_season", "price_is_weekend"]
+    for key in ["V", "pi", "actions", "e_grid", "lam_grid", "params", "T"] + _world_keys + _sampler_keys:
         st.session_state.pop(key, None)
 
 model = st.selectbox(
@@ -327,6 +328,11 @@ if run_btn:
     st.session_state["params"]       = params
     st.session_state["T"]            = T
     st.session_state["solved_model"] = model
+    # Price world the policy was solved in — so rollout pages evaluate it
+    # against the same price distribution (None → Gaussian parametric).
+    st.session_state["price_sampler"]    = st.session_state.get(_cache_key) if use_sampler else None
+    st.session_state["price_season"]     = price_season if use_sampler else None
+    st.session_state["price_is_weekend"] = bool(price_is_weekend) if use_sampler else False
     st.rerun()
 
 # ── Parameter summary (copy-paste) ────────────────────────────────────────────

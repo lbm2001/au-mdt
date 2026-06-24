@@ -35,6 +35,19 @@ HOURS = np.arange(T) / 60
 from ev_mdt.models.common.model_utils import price_bin_probs
 from ev_mdt.plots.viz import POLICY_COLORS
 
+# Price world the policy was solved in (Settings) — used to weight the
+# price-averaged optimal-policy heatmap (None → Gaussian parametric).
+_price_sampler = st.session_state.get("price_sampler")
+if _price_sampler is not None:
+    from ev_mdt.pricing.samplers import make_price_bin_probs_fn
+    _pbp_fn = make_price_bin_probs_fn(
+        _price_sampler, params,
+        st.session_state.get("price_season") or "winter",
+        bool(st.session_state.get("price_is_weekend", False)),
+    )
+else:
+    _pbp_fn = lambda t: price_bin_probs(t, params)
+
 if is_negbin:
     from ev_mdt.models.negbin import (
         mean_price, transition_probs, p_pd,
@@ -132,7 +145,7 @@ def optimal_policy_rates(chi: int, lam_bin: int) -> np.ndarray:
 def optimal_policy_rates_averaged(chi: int) -> np.ndarray:
     """E_λ[actions[π(t,χ,e,k)]] weighted by the time-dependent price distribution."""
     desired = actions[pi[:, chi, :, :]]                                    # (T, N_e, K)
-    weights = np.array([price_bin_probs(t, params) for t in range(T)])     # (T, K)
+    weights = np.array([_pbp_fn(t) for t in range(T)])                     # (T, K)
     averaged = (desired * weights[:, np.newaxis, :]).sum(axis=2)           # (T, N_e)
     return effective_policy_rates(chi, averaged)
 

@@ -28,7 +28,6 @@ streamlit run app/app.py
 | **Settings** | Configure all model parameters, choose mobility model and price source, run backward induction |
 | **Policy Explorer** | Visualise the optimal charging policy as a heatmap over battery level × time |
 | **Policy Rollout** | Simulate N scenarios and compare backward induction vs always-minimum policy |
-| **Backward Induction Steps** | Step through the value function as it propagates backwards in time |
 | **Sensitivity Analysis** | Sweep penalty, discount, horizon, departure profiles, pricing models and mobility models |
 | **Price Explorer** | Fit all pricing models on ENTSO-E data and compare simulated diurnal price profiles |
 

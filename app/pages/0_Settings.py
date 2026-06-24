@@ -4,6 +4,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import streamlit as st
+from ev_mdt.params import (
+    SharedParams as _SP, BaselineParams as _BP, NegBinParams as _NP,
+    N_e as _N_E, T_hours as _T_HOURS,
+    BASELINE_MODEL, NEGBIN_SAMPLED_MODEL, MODEL_LABELS,
+)
 
 st.set_page_config(page_title="Settings — EV Charging MDP", layout="wide")
 st.title("Settings")
@@ -13,28 +18,25 @@ st.caption("Adjust all model parameters here, then click **Run Backward Inductio
 
 def _on_model_change():
     _sampler_keys = ["price_sampler_Gaussian Bins", "price_sampler_GMM", "price_sampler_MDN"]
-    for key in ["V", "pi", "actions", "e_grid", "lam_grid", "params", "T"] + _sampler_keys:
+    _world_keys   = ["price_sampler", "price_season", "price_is_weekend"]
+    for key in ["pi", "actions", "e_grid", "lam_grid", "params", "T"] + _world_keys + _sampler_keys:
         st.session_state.pop(key, None)
 
 model = st.selectbox(
     "Mobility model",
-    ["Baseline — Geometric trips", "NegBin — Erlang trips"],
+    MODEL_LABELS,
     key="model",
     on_change=_on_model_change,
     help=(
         "**Baseline**: trip duration ~ Geom(p_DP), mean ≈ 1/p_DP min. "
-        "**NegBin**: trip duration ~ NegBin(k, q) via a k-phase Markov chain, "
-        "mean = k/q min."
+        "**Negative Binomial (fixed k)**: trip duration ~ NB(k, q) via exactly k Erlang phases, mean = k/q min. "
+        "**Negative Binomial (sampled k)**: k ~ Poisson(λ_k) drawn each trip, so mean = λ_k/q min."
     ),
 )
-is_negbin = "NegBin" in model
+is_negbin    = model != BASELINE_MODEL
+is_poisson_k = model == NEGBIN_SAMPLED_MODEL
 
 # ── Defaults (single source of truth: the dataclass defaults) ────────────────
-
-from models.params import SharedParams as _SP
-from models.baseline.params import BaselineParams as _BP
-from models.negative_binomial_trips.params import NegBinParams as _NP
-from models.solver_config import N_e as _N_E, T_hours as _T_HOURS
 
 _sp, _bp, _np = _SP(), _BP(), _NP()
 _DEFAULTS = dict(
@@ -107,7 +109,7 @@ with col2:
     use_sampler = price_source != "Gaussian (parametric)"
 
     if use_sampler:
-        from pricing_models.pricing import SEASONS as _SEASONS
+        from ev_mdt.pricing.samplers import SEASONS as _SEASONS
         price_season = st.radio(
             "Season", [s.capitalize() for s in _SEASONS],
             horizontal=True, key="price_season",
@@ -160,40 +162,25 @@ with col3:
                              0.001, format="%.3f", key="p_pd_default")
 
     if is_negbin:
-        st.markdown("**NegBin trip duration: T ~ NegBin(k, q)**")
-        nb_phase_mode = st.radio(
-            "Phase count per trip",
-            ["Fixed k", "Poisson(λ_k) sampled"],
-            horizontal=True, key="nb_phase_mode",
-            help="Fixed: every trip has exactly k phases. Sampled: k ~ Poisson(λ_k) drawn at trip start.",
-        )
+        st.markdown("**Negative Binomial trip duration: T ~ NB(k, q)**")
         nb_q = st.slider("Phase prob q  (timescale)",
                          0.01, 1.0, _DEFAULTS["nb_q"], 0.01,
                          format="%.2f", key="nb_q",
                          help="Per-phase transition probability. E[T] = k / q.")
-        if nb_phase_mode == "Fixed k":
+        if is_poisson_k:
+            nb_lambda_k = st.slider("Mean phases λ_k",
+                                    0.5, 20.0, float(_DEFAULTS["nb_k"]), 0.5, key="nb_lambda_k",
+                                    help="Mean of Poisson distribution for k. E[T] = λ_k / q.")
+            nb_k = _NP.k_max_for_lambda(nb_lambda_k)
+            st.caption(f"λ_k = {nb_lambda_k:.1f},  k_max = {nb_k},  "
+                       f"E[T] = {nb_lambda_k:.1f}/{nb_q:.2f} = **{nb_lambda_k / nb_q:.1f} min**")
+        else:
             nb_k = st.slider("Phases k",
                              1, 20, _DEFAULTS["nb_k"], 1, key="nb_k",
                              help="Fixed number of driving phases.")
             nb_lambda_k = None
             st.caption(f"E[T] = {nb_k}/{nb_q:.2f} = **{nb_k / nb_q:.1f} min**,  "
                        f"Var[T] = {nb_k * (1 - nb_q) / nb_q**2:.1f} min²")
-        else:
-            nb_lambda_k = st.slider("Mean phases λ_k",
-                                    0.5, 20.0, float(_DEFAULTS["nb_k"]), 0.5, key="nb_lambda_k",
-                                    help="Mean of Poisson distribution for k. E[T] = λ_k / q.")
-            import math as _math
-            # k_max = 99.9th percentile of Poisson(lambda_k); start CDF from k=0
-            _pmf_r = _math.exp(-nb_lambda_k)   # P(X=0)
-            _cdf   = _pmf_r
-            nb_k   = 0
-            while _cdf < 0.999:
-                nb_k  += 1
-                _pmf_r *= nb_lambda_k / nb_k
-                _cdf   += _pmf_r
-            nb_k = max(nb_k, 1)
-            st.caption(f"λ_k = {nb_lambda_k:.1f},  k_max = {nb_k},  "
-                       f"E[T] = {nb_lambda_k:.1f}/{nb_q:.2f} = **{nb_lambda_k / nb_q:.1f} min**")
     else:
         st.markdown("**Driving → Parked**")
         p_dp_morning = st.slider("Morning  (07:30–09:30 h)", 0.0, 1.0, _DEFAULTS["p_dp_morning"], 0.01, key="p_dp_morning")
@@ -201,66 +188,6 @@ with col3:
         p_dp_evening = st.slider("Evening  (16:30–18:30 h)", 0.0, 1.0, _DEFAULTS["p_dp_evening"], 0.01, key="p_dp_evening")
         p_dp_default = st.slider("Default",                  0.0, 1.0, _DEFAULTS["p_dp_default"], 0.01, key="p_dp_default")
 
-# ── Summary statistics (steady-state approximation) ───────────────────────────
-st.subheader("Expected statistics")
-
-# Day-weighted average p_PD: three 2-hour peak windows + 18 h default
-_w_peak = 120 / 1440          # each 2-hour window / 24 h
-_w_def  = 1080 / 1440         # remaining 18 h
-_avg_p_pd = (_w_peak * (p_pd_morning + p_pd_lunch + p_pd_evening)
-             + _w_def * p_pd_default)
-
-if is_negbin:
-    # E[k]: use lambda_k when Poisson-sampled, fixed k otherwise
-    _exp_k      = float(nb_lambda_k) if nb_lambda_k is not None else float(nb_k)
-    _E_trip     = _exp_k / nb_q          # E[T] = E[k] / q
-    # Var[T] for fixed k: k(1-q)/q²; for Poisson k: (λ_k + λ_k(1-q)) / q² = λ_k(2-q)/q²
-    if nb_lambda_k is None:
-        _std_trip = (float(nb_k) * (1 - nb_q)) ** 0.5 / nb_q
-    else:
-        _std_trip = (nb_lambda_k * (2 - nb_q)) ** 0.5 / nb_q
-    _avg_p_dp   = None
-else:
-    _avg_p_dp   = (_w_peak * (p_dp_morning + p_dp_lunch + p_dp_evening)
-                   + _w_def * p_dp_default)
-    _E_trip     = (1.0 / _avg_p_dp) if _avg_p_dp > 0 else float("inf")
-    _std_trip   = _E_trip  # Geom: std = sqrt(1-p)/p ≈ 1/p for small p
-
-# Steady-state: π_D / π_P = avg_p_pd * E_trip  (flow balance)
-if _avg_p_pd > 0 and _E_trip < 1e9:
-    _rate_ratio = _avg_p_pd * _E_trip   # π_D / π_P
-    _pi_d = _rate_ratio / (1 + _rate_ratio)
-else:
-    _pi_d = 0.0
-_pi_p = 1.0 - _pi_d
-_trips_per_day = _pi_p * 1440 * _avg_p_pd
-
-_E_dist   = v * (_E_trip / 60)   # km  (v in km/h, E_trip in min)
-_E_energy = mu * _E_dist          # kWh
-
-_sc = st.columns(5)
-with _sc[0]:
-    st.metric("Avg p_PD (per min)", f"{_avg_p_pd:.4f}",
-              help="Day-weighted average parked→driving probability.")
-with _sc[1]:
-    st.metric("E[trip duration]", f"{_E_trip:.1f} min",
-              delta=f"σ = {_std_trip:.1f} min", delta_color="off",
-              help="Expected trip length. For Baseline: 1/avg_p_DP. For NegBin: E[k]/q.")
-with _sc[2]:
-    if _avg_p_dp is not None:
-        st.metric("Avg p_DP (per min)", f"{_avg_p_dp:.4f}",
-                  help="Day-weighted average driving→parked probability (Baseline only).")
-    else:
-        st.metric("Phase prob q", f"{nb_q:.2f}",
-                  help="Per-phase transition probability; E[T] = E[k]/q.")
-with _sc[3]:
-    st.metric("% time driving", f"{_pi_d * 100:.1f} %",
-              delta=f"{_trips_per_day:.1f} trips/day", delta_color="off",
-              help="Steady-state fraction of time in driving state.")
-with _sc[4]:
-    st.metric("E[energy / trip]", f"{_E_energy:.2f} kWh",
-              delta=f"{_E_dist:.1f} km", delta_color="off",
-              help="Expected distance and energy consumed per trip, given v and μ.")
 
 st.divider()
 
@@ -295,10 +222,9 @@ if run_btn:
     # ── Build price_bin_probs_fn ──────────────────────────────────────────────
     _pbp_fn = None  # None → models fall back to Gaussian parametric path
     if use_sampler:
-        from pricing_models.entsoe_loader import load_prices
-        from pricing_models.pricing import (
-            GaussianBinnedSampler, GMMSampler, MDNSampler,
-            make_price_bin_probs_fn,
+        from ev_mdt.pricing.entsoe import load_prices
+        from ev_mdt.pricing.samplers import (
+            GaussianBinnedSampler, GMMSampler, MDNSampler, make_price_bin_probs_fn,
         )
 
         _sampler_classes = {
@@ -356,22 +282,26 @@ if run_btn:
                     st.session_state[_cache_key] = _sampler.fit(_df, _progress=_fit_progress)
                 _fit_status.update(label=f"{price_source} model ready.", state="complete", expanded=False)
 
-        from models.params import SharedParams as _SP
+        from ev_mdt.params import SharedParams as _SP
         _sp_tmp = _SP(**{k: v for k, v in common_kwargs.items() if k in _SP.__dataclass_fields__})
         _pbp_fn = make_price_bin_probs_fn(st.session_state[_cache_key], _sp_tmp, price_season, price_is_weekend)
 
+    from ev_mdt.models.common.backward_induction import backward_induction as _bi
+
     if is_negbin:
-        from models.negative_binomial_trips import NegBinParams
-        from models.negative_binomial_trips.backward_induction import backward_induction as _bi
+        from ev_mdt.params import NegBinParams
+        from ev_mdt.models.negbin.model import transition_matrix as _tm
         params = NegBinParams(**common_kwargs, k=int(nb_k), q=float(nb_q),
                               lambda_k=float(nb_lambda_k) if nb_lambda_k is not None else None)
         mode_label = f"λ_k={nb_lambda_k:.1f}" if nb_lambda_k is not None else f"k={nb_k}"
-        with st.spinner(f"Running backward induction (NegBin {mode_label}, q={nb_q:.2f}, T={T} min, N_e={N_e})…"):
-            V, pi, actions, e_grid, lam_grid = _bi(params, price_bin_probs_fn=_pbp_fn, T=T, N_e=N_e, N_a=N_a)
+        with st.spinner(f"Running backward induction (Negative Binomial {mode_label}, q={nb_q:.2f}, T={T} min, N_e={N_e})…"):
+            _J, pi, actions, e_grid, lam_grid = _bi(
+                params, transition_matrix_fn=lambda t: _tm(t, params),
+                price_bin_probs_fn=_pbp_fn, n_chi=params.k + 1, T=T, N_e=N_e, N_a=N_a)
     else:
-        from models.baseline import BaselineParams, transition_probs, consumption
-        from models.model_utils import price_bin_probs as _gaussian_pbp
-        from utils.backward_induction import backward_induction as _bi
+        from ev_mdt.params import BaselineParams
+        from ev_mdt.models.baseline.model import transition_matrix as _tm
+        from ev_mdt.models.common.model_utils import price_bin_probs as _gaussian_pbp
         params = BaselineParams(
             **common_kwargs,
             p_dp_morning=p_dp_morning, p_dp_lunch=p_dp_lunch,
@@ -380,17 +310,16 @@ if run_btn:
         _pbp_fn_baseline = _pbp_fn if _pbp_fn is not None else (lambda t: _gaussian_pbp(t, params))
         n_a_label = "Default" if N_a is None else str(N_a)
         with st.spinner(f"Running backward induction (Baseline, T={T} min, N_e={N_e}, N_a={n_a_label})…"):
-            V, pi, actions, e_grid, lam_grid = _bi(
+            _J, pi, actions, e_grid, lam_grid = _bi(
                 params,
-                transition_probs_fn=lambda t: transition_probs(t, params),
-                consumption_fn=lambda chi: consumption(chi, params),
+                transition_matrix_fn=lambda t: _tm(t, params),
                 price_bin_probs_fn=_pbp_fn_baseline,
+                n_chi=2,
                 T=T,
                 N_e=N_e,
                 N_a=N_a,
             )
 
-    st.session_state["V"]            = V
     st.session_state["pi"]           = pi
     st.session_state["actions"]      = actions
     st.session_state["e_grid"]       = e_grid
@@ -398,6 +327,11 @@ if run_btn:
     st.session_state["params"]       = params
     st.session_state["T"]            = T
     st.session_state["solved_model"] = model
+    # Price world the policy was solved in — so rollout pages evaluate it
+    # against the same price distribution (None → Gaussian parametric).
+    st.session_state["price_sampler"]    = st.session_state.get(_cache_key) if use_sampler else None
+    st.session_state["price_season"]     = price_season if use_sampler else None
+    st.session_state["price_is_weekend"] = bool(price_is_weekend) if use_sampler else False
     st.rerun()
 
 # ── Parameter summary (copy-paste) ────────────────────────────────────────────
@@ -437,7 +371,7 @@ with st.expander("Parameter summary (copy-paste)"):
         mode_str = (f"Poisson-sampled, lambda_k = {_fmt(nb_lambda_k,1)}, k_max = {nb_k}"
                     if nb_lambda_k is not None else f"fixed k = {nb_k}")
         lines += ["",
-                  "Trip duration — NegBin(k, q):",
+                  "Trip duration — Negative Binomial NB(k, q):",
                   f"  Phases: {mode_str}",
                   f"  q = {_fmt(nb_q,2)}",
                   f"  E[T] = {_fmt(exp_k / nb_q, 1)} min"]

@@ -43,5 +43,10 @@ htmlcov/
 .streamlit/secrets.toml
 wandb/
 
-# Saved sensitivity-analysis snapshots
-saved_analyses/
+*figures*/
+
+# Cached ENTSO-E price data
+entsoe-data/
+
+# Exported figures and tables
+export/

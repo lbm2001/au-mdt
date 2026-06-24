@@ -1,3 +1,5 @@
+import numpy as np
+
 from ev_mdt.params import BaselineParams
 
 PARKED  = 0
@@ -27,3 +29,17 @@ def transition_probs(t: int, params: BaselineParams) -> tuple[float, float]:
         p_dp = params.p_dp_default
 
     return p_pd, p_dp
+
+
+def transition_matrix(t: int, params: BaselineParams) -> np.ndarray:
+    """The 2×2 one-step mobility transition matrix at minute t (rows = from-state).
+
+        [[1 - p_PD, p_PD],
+         [p_DP,     1 - p_DP]]
+
+    Mirrors negbin.model.transition_matrix so both models plug into the shared
+    backward-induction solver.
+    """
+    p_pd, p_dp = transition_probs(t, params)
+    return np.array([[1.0 - p_pd, p_pd],
+                     [p_dp,       1.0 - p_dp]])

@@ -56,7 +56,6 @@ def cmd_run(args: argparse.Namespace) -> None:
     import threading
     import time
     from pathlib import Path
-    import numpy as np
     from tqdm import tqdm
     from ev_mdt.analysis.sensitivity import (
         run_all_sweeps, save_figures, save_tables, ALL_SWEEP_NAMES,
@@ -121,14 +120,23 @@ def cmd_run(args: argparse.Namespace) -> None:
         hb_thread = threading.Thread(target=heartbeat, daemon=True)
         hb_thread.start()
         try:
+            # W&B logs only the MDN fitting curve (during the pricing_model sweep);
+            # no sweep metrics or figures are uploaded.
             results = run_all_sweeps(
                 N_rollouts=args.N_rollouts, N_e=args.N_e, seed=args.seed,
-                sweeps=[sw], progress_cb=cb, _log=tqdm.write,
+                sweeps=[sw], progress_cb=cb, _log=tqdm.write, _wandb_run=wandb_run,
             )
         finally:
             stop.set()
             hb_thread.join()
         inner.close()
+
+        # The MDN is fit (and logged) during the pricing_model sweep — finish W&B
+        # right after so the run contains only the MDN curve and nothing else.
+        if wandb_run is not None and sw == "pricing_model":
+            wandb_run.finish()
+            wandb_run = None
+            tqdm.write("W&B: MDN fitting logged — run finished.")
 
         saved = save_figures(results, out_dir=figures_dir,
                              N_rollouts=args.N_rollouts, seed=args.seed, N_e=args.N_e,
@@ -138,27 +146,6 @@ def cmd_run(args: argparse.Namespace) -> None:
                              include_baseline=False)
         for p in saved:
             tqdm.write(f"  Saved: {p}")
-
-        # ── W&B logging ───────────────────────────────────────────────────────
-        if wandb_run is not None:
-            import wandb as _wb
-            for step_results in results.get(sw, []):
-                label    = step_results["label"]
-                rollouts = step_results["rollouts"]
-                for policy, metrics_list in rollouts.items():
-                    costs   = np.array([m["Total cost (€)"]  for m in metrics_list])
-                    pen     = np.array([m["Penalty minutes"]  for m in metrics_list])
-                    energy  = np.array([m["Energy charged (kWh)"] for m in metrics_list])
-                    prefix  = f"{sw}/{label}/{policy}"
-                    wandb_run.log({
-                        f"{prefix}/mean_cost":           costs.mean(),
-                        f"{prefix}/sem_cost":            costs.std() / len(costs) ** 0.5,
-                        f"{prefix}/mean_penalty_min":    pen.mean(),
-                        f"{prefix}/mean_energy_kwh":     energy.mean(),
-                    })
-            for p in saved:
-                if p.suffix == ".png":
-                    wandb_run.log({f"figures/{sw}": _wb.Image(str(p))})
 
     outer.close()
 

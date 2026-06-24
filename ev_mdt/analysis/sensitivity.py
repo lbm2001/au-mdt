@@ -36,12 +36,12 @@ from ev_mdt.params import (
     BaselineParams, NegBinParams,
     BASELINE_MODEL, NEGBIN_FIXED_MODEL, NEGBIN_SAMPLED_MODEL,
 )
-from ev_mdt.models.baseline.backward_induction import backward_induction as _baseline_bi
-from ev_mdt.models.baseline.model import transition_probs as _baseline_tp
+from ev_mdt.models.common.backward_induction import backward_induction as _backward_induction
+from ev_mdt.models.baseline.model import transition_matrix as _baseline_tm
 from ev_mdt.models.baseline.rollout import simulate_policy_rollout as _baseline_rollout
-from ev_mdt.models.negbin.backward_induction import backward_induction as _negbin_bi
+from ev_mdt.models.negbin.model import transition_matrix as _negbin_tm
 from ev_mdt.models.negbin.rollout import simulate_policy_rollout as _negbin_rollout
-from ev_mdt.models.common.model_utils import consumption as _consumption, price_bin_probs as _gaussian_pbp, mean_price
+from ev_mdt.models.common.model_utils import price_bin_probs as _gaussian_pbp, mean_price
 from ev_mdt.models.common.policies import (
     backward_induction_policy, night_charging_policy, dp_heuristic_policy,
     maximal_charging_policy, always_minimum_policy, price_oriented_policy,
@@ -108,19 +108,15 @@ def rollout_fn(model_label: str):
 
 
 def solve(model_label: str, params, pbp_fn, T: int, N_e: int):
-    """Run the model-appropriate backward induction; returns (pi, actions, e_grid, lam_grid)."""
+    """Run backward induction for the model; returns (pi, actions, e_grid, lam_grid)."""
     if model_label == BASELINE_MODEL:
-        _, pi, actions, e_grid, lam_grid = _baseline_bi(
-            params,
-            transition_probs_fn=lambda t: _baseline_tp(t, params),
-            consumption_fn=lambda chi: _consumption(chi, params),
-            price_bin_probs_fn=pbp_fn,
-            T=T, N_e=N_e,
-        )
+        tm_fn, n_chi = (lambda t: _baseline_tm(t, params)), 2
     else:
-        _, pi, actions, e_grid, lam_grid = _negbin_bi(
-            params, price_bin_probs_fn=pbp_fn, T=T, N_e=N_e,
-        )
+        tm_fn, n_chi = (lambda t: _negbin_tm(t, params)), params.k + 1
+    _, pi, actions, e_grid, lam_grid = _backward_induction(
+        params, transition_matrix_fn=tm_fn, price_bin_probs_fn=pbp_fn,
+        n_chi=n_chi, T=T, N_e=N_e,
+    )
     return pi, actions, e_grid, lam_grid
 
 
@@ -462,6 +458,7 @@ def run_all_sweeps(
     sweeps: list[str] | None = None,
     progress_cb: Callable | None = None,
     _log: Callable | None = None,
+    _wandb_run=None,
 ) -> dict[str, list[dict]]:
     """Run selected (or all) sweeps and return a mapping sweep_name -> results list.
 
@@ -526,7 +523,8 @@ def run_all_sweeps(
             if _log: _log("Fitting GMM sampler…")
             sampler_gmm = GMMSampler().fit(df_excl, _progress=_fit_progress("GMM"))
             if _log: _log("Fitting MDN sampler (neural net — this can take a while)…")
-            sampler_mdn = MDNSampler().fit(df_excl, _progress=_fit_progress("MDN"))
+            sampler_mdn = MDNSampler().fit(df_excl, _progress=_fit_progress("MDN"),
+                                           _wandb_run=_wandb_run)
             samplers = {
                 "Gaussian Bins": sampler_excl,
                 "GMM":           sampler_gmm,

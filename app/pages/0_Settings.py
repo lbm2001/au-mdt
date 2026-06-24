@@ -285,19 +285,22 @@ if run_btn:
         _sp_tmp = _SP(**{k: v for k, v in common_kwargs.items() if k in _SP.__dataclass_fields__})
         _pbp_fn = make_price_bin_probs_fn(st.session_state[_cache_key], _sp_tmp, price_season, price_is_weekend)
 
+    from ev_mdt.models.common.backward_induction import backward_induction as _bi
+
     if is_negbin:
         from ev_mdt.params import NegBinParams
-        from ev_mdt.models.negbin.backward_induction import backward_induction as _bi
+        from ev_mdt.models.negbin.model import transition_matrix as _tm
         params = NegBinParams(**common_kwargs, k=int(nb_k), q=float(nb_q),
                               lambda_k=float(nb_lambda_k) if nb_lambda_k is not None else None)
         mode_label = f"λ_k={nb_lambda_k:.1f}" if nb_lambda_k is not None else f"k={nb_k}"
         with st.spinner(f"Running backward induction (Negative Binomial {mode_label}, q={nb_q:.2f}, T={T} min, N_e={N_e})…"):
-            V, pi, actions, e_grid, lam_grid = _bi(params, price_bin_probs_fn=_pbp_fn, T=T, N_e=N_e, N_a=N_a)
+            V, pi, actions, e_grid, lam_grid = _bi(
+                params, transition_matrix_fn=lambda t: _tm(t, params),
+                price_bin_probs_fn=_pbp_fn, n_chi=params.k + 1, T=T, N_e=N_e, N_a=N_a)
     else:
         from ev_mdt.params import BaselineParams
-        from ev_mdt.models.baseline.model import transition_probs
-        from ev_mdt.models.common.model_utils import consumption, price_bin_probs as _gaussian_pbp
-        from ev_mdt.models.baseline.backward_induction import backward_induction as _bi
+        from ev_mdt.models.baseline.model import transition_matrix as _tm
+        from ev_mdt.models.common.model_utils import price_bin_probs as _gaussian_pbp
         params = BaselineParams(
             **common_kwargs,
             p_dp_morning=p_dp_morning, p_dp_lunch=p_dp_lunch,
@@ -308,9 +311,9 @@ if run_btn:
         with st.spinner(f"Running backward induction (Baseline, T={T} min, N_e={N_e}, N_a={n_a_label})…"):
             V, pi, actions, e_grid, lam_grid = _bi(
                 params,
-                transition_probs_fn=lambda t: transition_probs(t, params),
-                consumption_fn=lambda chi: consumption(chi, params),
+                transition_matrix_fn=lambda t: _tm(t, params),
                 price_bin_probs_fn=_pbp_fn_baseline,
+                n_chi=2,
                 T=T,
                 N_e=N_e,
                 N_a=N_a,

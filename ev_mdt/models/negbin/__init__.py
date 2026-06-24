@@ -1,6 +1,5 @@
 from ev_mdt.params import NegBinParams
 from ev_mdt.models.negbin.model import PARKED, is_driving, p_pd, transition_matrix, transition_probs
-from ev_mdt.models.negbin.backward_induction import backward_induction
 from ev_mdt.models.negbin.rollout import simulate_policy_rollout, _next_state
 from ev_mdt.models.negbin.policies import (
     actual_charge_rate, backward_induction_policy, maximal_charging_policy,
@@ -15,7 +14,6 @@ from ev_mdt.models.common.rollout_utils import generate_rollout_scenario, rollou
 __all__ = [
     "NegBinParams",
     "PARKED", "is_driving", "p_pd", "transition_matrix", "transition_probs",
-    "backward_induction",
     "simulate_policy_rollout", "_next_state",
     "actual_charge_rate", "backward_induction_policy", "maximal_charging_policy",
     "price_oriented_policy", "night_charging_policy", "minimum_soc_policy",

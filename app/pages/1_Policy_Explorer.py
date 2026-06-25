@@ -135,10 +135,7 @@ _chart(
         low_threshold=st.session_state["benchmark_low_threshold"],
         high_threshold=st.session_state["benchmark_high_threshold"],
         soc_threshold=params.e_max * 0.25,
-        du_target_mode=st.session_state.get("du_target_mode", "fixed"),
-        du_target_frac=st.session_state.get("du_target_frac", 1.0),
-
-        du_reserve_frac=st.session_state.get("du_reserve_frac", 0.25),
+        du_gamma=st.session_state.get("du_gamma", 0.5),
         du_use_reserve=st.session_state.get("du_use_reserve", True),
         du_alpha=st.session_state.get("du_alpha", 0.5),
         time_bin_min=st.session_state.get("time_bin", 10),

@@ -155,3 +155,16 @@ def max_minutes_to_departure(params) -> float:
     table = _tau_table(params.p_pd_morning, params.p_pd_lunch,
                        params.p_pd_evening, params.p_pd_default)
     return max(table)
+
+
+@lru_cache(maxsize=8)
+def _mean_tau(p_morning: float, p_lunch: float, p_evening: float, p_default: float) -> float:
+    """Flat average of τ(t) over all 1440 minutes, reusing the cached ring solve."""
+    table = _tau_table(p_morning, p_lunch, p_evening, p_default)
+    return sum(table) / 1440.0
+
+
+def mean_minutes_to_departure(params) -> float:
+    """Average of τ(t) = E[minutes to next departure] over the full 1440-minute day."""
+    return _mean_tau(params.p_pd_morning, params.p_pd_lunch,
+                     params.p_pd_evening, params.p_pd_default)

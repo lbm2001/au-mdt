@@ -41,38 +41,22 @@ chi0 = 0 if chi0_label == "Parked" else 1
 
 st.divider()
 st.subheader("Fixed policy settings")
-st.caption("Target mode and reserve are held constant across the sweep — only the ceiling moves.")
+st.caption("Reserve and α are held constant across the sweep — only the ceiling moves.")
 
-# Reserve fraction derived from e_trip (same as Settings)
-reserve_frac = float(st.session_state.get("du_reserve_frac", 0.0))
-use_reserve  = bool(st.session_state.get("du_use_reserve", True))
+use_reserve = bool(st.session_state.get("du_use_reserve", True))
+alpha       = float(st.session_state.get("du_alpha", 0.5))
 
-fc1, fc2 = st.columns(2)
-with fc1:
-    target_mode = st.radio(
-        "Target mode",
-        ["fixed", "linear", "power"],
-        format_func=lambda x: {"fixed": "Fixed", "linear": "Linear τ", "power": "Power τ"}[x],
-        index=["fixed", "linear", "power"].index(st.session_state.get("du_target_mode", "fixed")),
-    )
-with fc2:
-    if target_mode == "power":
-        alpha = st.slider("α", 0.1, 1.0, float(st.session_state.get("du_alpha", 0.5)), 0.05)
-    else:
-        alpha = float(st.session_state.get("du_alpha", 0.5))
+from ev_mdt.models.common.model_utils import expected_trip_minutes as _etm
+_e_trip_kwh = _etm(params) * params.mu * params.v * params.omega
 
 st.caption(
-    f"Reserve floor: **{reserve_frac * params.e_max:.3f} kWh** = e_trip "
-    f"({'active' if use_reserve else 'disabled'}) — configure in Settings."
+    f"Reserve floor = e_trip = **{_e_trip_kwh:.3f} kWh** "
+    f"({'active' if use_reserve else 'disabled'}),  α = {alpha:.2f}  — configure in Settings."
 )
 
 # ── Run sweep ─────────────────────────────────────────────────────────────────
 
-_sweep_key = (
-    n_rollouts, step_kwh, int(seed), chi0, target_mode,
-    use_reserve, reserve_frac, alpha, _solved_model,
-    st.session_state.get("du_reserve_frac"),
-)
+_sweep_key = (n_rollouts, step_kwh, int(seed), chi0, use_reserve, alpha, _solved_model)
 
 if st.session_state.get("_sweep_key") != _sweep_key:
     _prog = st.progress(0.0, text="Running sweep…")
@@ -85,8 +69,6 @@ if st.session_state.get("_sweep_key") != _sweep_key:
         N_rollouts=n_rollouts,
         seed=int(seed),
         step_kwh=step_kwh,
-        target_mode=target_mode,
-        use_reserve=use_reserve,
         alpha=alpha,
         progress_cb=_progress_cb,
     )
@@ -102,7 +84,6 @@ if st.session_state.get("_sweep_key") != _sweep_key:
         r["Mean charged (kWh)"]      = r.pop("mean_charged")
         r["Mean charging cost (€)"]  = r.pop("mean_charge_cost")
         r["Mean penalty cost (€)"]   = r.pop("mean_penalty_cost")
-        r.pop("reserve_frac", None)
 
     st.session_state["_sweep_key"]     = _sweep_key
     st.session_state["_sweep_results"] = rows
@@ -167,8 +148,9 @@ fig.add_trace(go.Scatter(
     name="Charging cost (right)", yaxis="y2",
 ))
 
-# current settings line
-current_ceil = st.session_state.get("du_target_frac", 1.0) * params.e_max
+# current settings line (show where E_CEIL_BASE sits, since that's the baseline-calibrated value)
+from ev_mdt.models.common.policies import E_CEIL_BASE
+current_ceil = E_CEIL_BASE
 fig.add_vline(
     x=current_ceil, line_dash="dash", line_color="#009988",
     annotation_text=f"Current setting ({current_ceil:.0f} kWh)",
@@ -197,10 +179,11 @@ st.caption(
 
 # ── Apply best button ──────────────────────────────────────────────────────────
 
-if st.button(f"Apply best ceiling ({best_row['Target ceiling (kWh)']:.0f} kWh) to Settings", type="primary"):
-    st.session_state["du_target_frac"] = float(best_row["Target ceiling (kWh)"]) / params.e_max
-    st.success(f"Target ceiling set to {best_row['Target ceiling (kWh)']:.0f} kWh "
-               f"({best_row['Target ceiling (%)']:.0f}%). Go to Settings to confirm.")
+st.caption(
+    f"The best ceiling found here should be set as `E_CEIL_BASE` in `ev_mdt/models/common/policies.py` "
+    f"(currently {E_CEIL_BASE:.1f} kWh). The γ and α sliders in Settings let you scale it across "
+    f"mobility models without re-running this sweep."
+)
 
 # ── Table ─────────────────────────────────────────────────────────────────────
 

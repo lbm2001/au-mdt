@@ -306,9 +306,7 @@ if st.session_state.pop("sa_run_all_triggered", False):
     _s_incl   = _get_gbins("incl")
     _s_crisis = _get_gbins("only")
     _du_kw = dict(
-        du_target_mode=st.session_state.get("du_target_mode", "fixed"),
-        du_target_frac=st.session_state.get("du_target_frac", 1.0),
-        du_reserve_frac=st.session_state.get("du_reserve_frac", 0.25),
+        du_gamma=st.session_state.get("du_gamma", 0.5),
         du_use_reserve=st.session_state.get("du_use_reserve", True),
         du_alpha=st.session_state.get("du_alpha", 0.5),
     )

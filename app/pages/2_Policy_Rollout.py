@@ -74,9 +74,7 @@ nd_chi0_int = 0 if nd_chi0 == "Parked" else 1
 # Cache the rollouts so re-renders (e.g. toggling a plot option) don't recompute them.
 _nd_key = (n_days, nd_chi0_int, int(nd_seed),
            low_threshold, high_threshold, soc_threshold, T, id(pi),
-           st.session_state.get("du_target_mode", "fixed"),
-           st.session_state.get("du_target_frac", 1.0),
-           st.session_state.get("du_reserve_frac", 0.25),
+           st.session_state.get("du_gamma", 0.5),
            st.session_state.get("du_use_reserve", True),
            st.session_state.get("du_alpha", 0.5))
 if st.session_state.get("_nd_key") != _nd_key:
@@ -90,9 +88,7 @@ if st.session_state.get("_nd_key") != _nd_key:
         registry = policy_registry(
             params, _pbp_fn, pi=pi, actions=actions, e_grid=e_grid,
             low_threshold=low_threshold, high_threshold=high_threshold, soc_threshold=soc_threshold,
-            du_target_mode=st.session_state.get("du_target_mode", "fixed"),
-            du_target_frac=st.session_state.get("du_target_frac", 1.0),
-            du_reserve_frac=st.session_state.get("du_reserve_frac", 0.25),
+            du_gamma=st.session_state.get("du_gamma", 0.5),
             du_use_reserve=st.session_state.get("du_use_reserve", True),
             du_alpha=st.session_state.get("du_alpha", 0.5),
         )

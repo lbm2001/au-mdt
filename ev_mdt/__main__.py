@@ -218,8 +218,6 @@ def cmd_target_sweep(args: argparse.Namespace) -> None:
         N_rollouts=args.N_rollouts,
         seed=args.seed,
         step_kwh=args.step,
-        target_mode=args.target_mode,
-        use_reserve=not args.no_reserve,
         alpha=args.alpha,
     )
 
@@ -239,7 +237,6 @@ def cmd_target_sweep(args: argparse.Namespace) -> None:
         "std_cost":     "Std cost (€)",
         "mean_penalty": "Mean penalty (min)",
         "mean_charged": "Mean charged (kWh)",
-        "reserve_frac": "Reserve fraction",
     }).to_csv(csv_path, index=False)
     tqdm.write(f"Saved table → {csv_path}")
 
@@ -302,11 +299,8 @@ def cmd_gamma_sweep(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     results = sweep_gamma(
-        empirical_target_kwh=args.empirical_target,
         N_rollouts=args.N_rollouts,
         seed=args.seed,
-        scaling=args.scaling,
-        target_mode=args.target_mode,
         use_reserve=not args.no_reserve,
         alpha=args.alpha,
     )
@@ -474,25 +468,16 @@ def main() -> None:
     p_ts.add_argument("--seed",        type=int,   default=42)
     p_ts.add_argument("--step",        type=float, default=5.0,   metavar="kWh",
                       help="Target ceiling step size in kWh")
-    p_ts.add_argument("--target-mode", default="fixed",
-                      choices=["fixed", "linear", "power"])
     p_ts.add_argument("--alpha",       type=float, default=0.5,
-                      help="Power exponent α (only used for --target-mode power)")
-    p_ts.add_argument("--no-reserve",  action="store_true",
-                      help="Disable the mandatory reserve floor")
+                      help="Shape exponent α for the τ-decay curve")
     p_ts.add_argument("--out-dir",     default="export/target_sweep",
                       help="Output directory for CSV and PNG")
 
     # gamma-sweep
     p_gs = sub.add_parser("gamma-sweep",
                            help="Sweep ceiling scaling exponent γ across three mobility models")
-    p_gs.add_argument("--empirical-target", type=float, default=25.0, metavar="kWh",
-                      help="Empirical baseline ceiling anchor (kWh)")
     p_gs.add_argument("--N-rollouts",  type=int,   default=500,   metavar="N")
     p_gs.add_argument("--seed",        type=int,   default=42)
-    p_gs.add_argument("--scaling",     default="length", choices=["length", "freq"],
-                      help="Scaling variable: trip length only, or length × frequency")
-    p_gs.add_argument("--target-mode", default="fixed", choices=["fixed", "linear", "power"])
     p_gs.add_argument("--alpha",       type=float, default=0.5)
     p_gs.add_argument("--no-reserve",  action="store_true")
     p_gs.add_argument("--out-dir",     default="export/gamma_sweep")

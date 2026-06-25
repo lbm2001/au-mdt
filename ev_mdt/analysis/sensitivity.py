@@ -438,8 +438,6 @@ def sweep_target_ceiling(
     N_rollouts: int = 500,
     seed: int = 42,
     step_kwh: float = 5.0,
-    target_mode: str = "fixed",
-    use_reserve: bool = True,
     alpha: float = 0.5,
     progress_cb: Callable | None = None,
     _log: Callable | None = None,
@@ -449,7 +447,6 @@ def sweep_target_ceiling(
     Returns a list of dicts with keys:
         target_kwh, target_frac, mean_cost, std_cost, mean_penalty, mean_charged, reserve_frac
     """
-    from ev_mdt.models.common.model_utils import expected_trips_per_day
     from ev_mdt.models.common.policies import next_trip_policy
     from ev_mdt.models.common.rollout_utils import generate_rollout_scenario, rollout_metrics
 
@@ -457,11 +454,6 @@ def sweep_target_ceiling(
     pbp_fn    = lambda t, p=params: _gaussian_pbp(t, p)
     _rf       = rollout_fn(model_label)
     T         = 24 * 60
-
-    # Reserve = e_trip (same derivation as Settings page)
-    from ev_mdt.models.common.model_utils import expected_trip_minutes
-    e_trip       = expected_trip_minutes(params) * params.mu * params.v * params.omega
-    reserve_frac = e_trip / params.e_max
 
     ceil_values = np.arange(params.e_min + step_kwh, params.e_max + 1e-6, step_kwh)
     ceil_values = ceil_values[ceil_values <= params.e_max]
@@ -478,7 +470,6 @@ def sweep_target_ceiling(
     outer = tqdm(list(ceil_values), desc="Target ceiling", unit="step", position=0)
     rows  = []
     for ceil_kwh in outer:
-        target_frac = float(ceil_kwh) / params.e_max
         outer.set_postfix(ceiling=f"{ceil_kwh:.0f} kWh")
         costs, penalties, charged, charge_costs, penalty_costs = [], [], [], [], []
 
@@ -488,11 +479,8 @@ def sweep_target_ceiling(
             result = _rf(
                 next_trip_policy, sc, float(e0), 0, params,
                 price_bin_probs_fn=pbp_fn,
-                target_mode=target_mode,
-                target_frac=target_frac,
-                reserve_frac=reserve_frac,
-                use_reserve=use_reserve,
                 alpha=alpha,
+                _ceil_override=float(ceil_kwh),
             )
             m = rollout_metrics(result, params)
             costs.append(m["Total cost (€)"])
@@ -504,14 +492,13 @@ def sweep_target_ceiling(
 
         rows.append({
             "target_kwh":        float(ceil_kwh),
-            "target_frac":       target_frac,
+            "target_frac":       float(ceil_kwh) / params.e_max,
             "mean_cost":         float(np.mean(costs)),
             "std_cost":          float(np.std(costs)),
             "mean_penalty":      float(np.mean(penalties)),
             "mean_charged":      float(np.mean(charged)),
             "mean_charge_cost":  float(np.mean(charge_costs)),
             "mean_penalty_cost": float(np.mean(penalty_costs)),
-            "reserve_frac":      reserve_frac,
         })
         i = len(rows)
         if progress_cb: progress_cb(i / len(ceil_values), f"ceiling {ceil_kwh:.0f} kWh")
@@ -521,42 +508,33 @@ def sweep_target_ceiling(
 
 
 def sweep_gamma(
-    empirical_target_kwh: float = 25.0,
     N_rollouts: int = 500,
     seed: int = 42,
-    scaling: str = "length",   # "length" | "freq"
-    target_mode: str = "fixed",
-    use_reserve: bool = True,
     alpha: float = 0.5,
+    use_reserve: bool = True,
     gamma_values: list | None = None,
     progress_cb: Callable | None = None,
     _log: Callable | None = None,
 ) -> dict[str, list[dict]]:
     """Sweep γ ∈ gamma_values for each of the three mobility models.
 
-    For each (model, γ):
-      - Derives target_frac = min(1, empirical_target_kwh × ratio^γ / e_max)
-        where ratio = E[T_trip]/E[T_trip]_ref  (scaling="length")
-               or  = e_daily/e_daily_ref       (scaling="freq")
-      - Runs N_rollouts with next_trip_policy
-    Returns {model_label: [row_dict, ...]} with keys:
-        gamma, target_kwh, target_frac, mean_cost, std_cost,
+    For each (model, γ) the policy computes:
+        e_ceil = min(e_max, E_CEIL_BASE × (e_daily / e_daily_ref) ^ γ)
+    where E_CEIL_BASE = 25.0 kWh (from target-sweep at Baseline) and e_daily_ref
+    is the Baseline daily energy demand.
+
+    Returns {model_name: [row_dict, ...]} with keys:
+        gamma, target_kwh, mean_cost, std_cost,
         mean_charge_cost, mean_penalty_cost, mean_penalty, mean_charged
     """
     from tqdm import tqdm
-    from ev_mdt.models.common.model_utils import (
-        expected_trip_minutes, expected_trips_per_day,
-    )
-    from ev_mdt.models.common.policies import next_trip_policy
+    from ev_mdt.models.common.policies import next_trip_policy, _du_e_daily, E_CEIL_BASE, _e_daily_ref
     from ev_mdt.models.common.rollout_utils import rollout_metrics, generate_rollout_scenario
 
     if gamma_values is None:
         gamma_values = [round(g, 2) for g in np.arange(0.1, 1.01, 0.1)]
 
-    # Baseline reference quantities
-    bp = build_params(BASELINE_MODEL)
-    _e_trip_ref  = expected_trip_minutes(bp)
-    _e_daily_ref = expected_trips_per_day(bp) * _e_trip_ref * bp.mu * bp.v * bp.omega
+    e_daily_ref = _e_daily_ref()
 
     model_configs = [
         (BASELINE_MODEL,       "Baseline",            build_params(BASELINE_MODEL)),
@@ -572,12 +550,8 @@ def sweep_gamma(
     outer = tqdm(model_configs, desc="Models", unit="model", position=0)
     for model_label, model_name, params in outer:
         outer.set_postfix(model=model_name)
-        _rf       = rollout_fn(model_label)
-        pbp_fn    = lambda t, p=params: _gaussian_pbp(t, p)
-        e_trip_min = expected_trip_minutes(params)
-        n_trips    = expected_trips_per_day(params)
-        e_daily    = n_trips * e_trip_min * params.mu * params.v * params.omega
-        reserve_frac = (e_trip_min * params.mu * params.v * params.omega) / params.e_max
+        _rf    = rollout_fn(model_label)
+        pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
 
         # Pre-generate scenarios once per model
         rng       = np.random.default_rng(seed)
@@ -587,25 +561,21 @@ def sweep_gamma(
         ]
         e0s = [float(rng.uniform(params.e_min, params.e_max)) for _ in range(N_rollouts)]
 
+        e_daily = _du_e_daily(params)
+        ratio   = e_daily / e_daily_ref if e_daily_ref > 0 else 1.0
+
         rows: list[dict] = []
         inner = tqdm(gamma_values, desc=f"  γ sweep ({model_name})", unit="γ",
                      position=1, leave=False)
         for gamma in inner:
-            if scaling == "length":
-                ratio = e_trip_min / _e_trip_ref if _e_trip_ref > 0 else 1.0
-            else:
-                ratio = e_daily / _e_daily_ref if _e_daily_ref > 0 else 1.0
-            target_kwh  = min(params.e_max, empirical_target_kwh * ratio ** gamma)
-            target_frac = target_kwh / params.e_max
+            target_kwh = min(params.e_max, E_CEIL_BASE * ratio ** gamma)
 
             costs, charge_costs, penalty_costs, penalties, charged = [], [], [], [], []
             for sc, e0 in zip(scenarios, e0s):
                 result = _rf(
                     next_trip_policy, sc, float(e0), 0, params,
                     price_bin_probs_fn=pbp_fn,
-                    target_mode=target_mode,
-                    target_frac=target_frac,
-                    reserve_frac=reserve_frac,
+                    gamma=gamma,
                     use_reserve=use_reserve,
                     alpha=alpha,
                 )
@@ -619,7 +589,6 @@ def sweep_gamma(
             rows.append({
                 "gamma":             gamma,
                 "target_kwh":        target_kwh,
-                "target_frac":       target_frac,
                 "mean_cost":         float(np.mean(costs)),
                 "std_cost":          float(np.std(costs)),
                 "mean_charge_cost":  float(np.mean(charge_costs)),

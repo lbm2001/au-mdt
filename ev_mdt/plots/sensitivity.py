@@ -10,9 +10,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from ev_mdt.models.common.model_utils import (
-    departure_prob, expected_trip_minutes, max_minutes_to_departure, minutes_to_departure,
+    expected_trip_minutes, max_minutes_to_departure,
+    mean_minutes_to_departure, minutes_to_departure,
 )
-from ev_mdt.models.common.policies import _departure_urgency_target
+from ev_mdt.models.common.policies import E_CEIL_BASE, _du_e_daily, _e_daily_ref
 from ev_mdt.plots.viz import POLICY_COLORS, POLICY_ORDER, rgba as _rgba
 
 
@@ -80,28 +81,29 @@ def _charge_battery_ceiling(pi, actions, e_grid, t: int) -> np.ndarray:
                     e_grid[np.clip(top_e, 0, len(e_grid) - 1)], np.nan)
 
 
+def _du_e_ceil(params, gamma: float) -> float:
+    """Demand-scaled DU ceiling for the given params and gamma."""
+    e_daily = _du_e_daily(params)
+    ref     = _e_daily_ref()
+    ratio   = e_daily / ref if ref > 0 else 1.0
+    return min(params.e_max, E_CEIL_BASE * ratio ** gamma)
+
+
 def _du_rates_averaged(params, pbp_fn, T: int, e_grid, lam_grid, chi: int = 0,
-                       target_mode: str = "fixed", target_frac: float = 1.0,
-                       reserve_frac: float = 0.25, use_reserve: bool = True,
+                       gamma: float = 0.5, use_reserve: bool = True,
                        alpha: float = 0.5) -> np.ndarray:
     """Price-averaged Departure Urgency charge rate u_DU(t, e)."""
-    e_ceil = target_frac * params.e_max
-    if target_mode != "fixed":
-        e_trip  = expected_trip_minutes(params) * params.mu * params.v * params.omega
-        tau_max = max_minutes_to_departure(params)
-        _alp    = 1.0 if target_mode == "linear" else alpha
-    else:
-        e_trip = tau_max = _alp = None
+    e_trip  = expected_trip_minutes(params) * params.mu * params.v * params.omega
+    tau_max = max_minutes_to_departure(params)
+    e_ceil  = _du_e_ceil(params, gamma)
 
     rates = np.zeros((T, len(e_grid)))
     for t in range(T):
         probs = np.asarray(pbp_fn(t))                              # (K,)
         tau   = minutes_to_departure(t, params)
 
-        if target_mode == "fixed":
-            e_target_v = e_ceil
-        else:
-            e_target_v = _departure_urgency_target(tau, tau_max, e_trip, e_ceil, _alp)
+        frac       = (min(1.0, tau / tau_max) if tau_max > 0 else 1.0) ** alpha
+        e_target_v = e_trip + (e_ceil - e_trip) * frac
 
         deliverable = params.u_max * params.eta_c * params.omega * tau
         rho = np.clip((e_target_v - e_grid) / deliverable, 0.0, 1.0) if deliverable > 0 else np.ones(len(e_grid))
@@ -116,7 +118,7 @@ def _du_rates_averaged(params, pbp_fn, T: int, e_grid, lam_grid, chi: int = 0,
                      np.where(cum_2d <= rho_2d + extra, params.u_max / 2.0, 0.0))  # (N_e, K)
 
         if use_reserve:
-            u[e_grid < reserve_frac * params.e_max, :] = params.u_max
+            u[e_grid < e_trip, :] = params.u_max
         if chi > 0:
             u[e_grid > params.e_min, :] = 0.0
         u[e_grid >= params.e_max, :] = 0.0
@@ -127,21 +129,17 @@ def _du_rates_averaged(params, pbp_fn, T: int, e_grid, lam_grid, chi: int = 0,
 
 
 def _du_charge_battery_ceiling(params, pbp_fn, e_grid, t: int,
-                                target_mode: str = "fixed", target_frac: float = 1.0,
-                                reserve_frac: float = 0.25, use_reserve: bool = True,
+                                gamma: float = 0.5, use_reserve: bool = True,
                                 alpha: float = 0.5) -> np.ndarray:
     """(K,) highest battery level at which DU policy still charges at each price bin at time t."""
-    probs = np.asarray(pbp_fn(t))                                  # (K,)
-    tau   = minutes_to_departure(t, params)
-    e_ceil = target_frac * params.e_max
+    probs   = np.asarray(pbp_fn(t))                                # (K,)
+    tau     = minutes_to_departure(t, params)
+    tau_max = max_minutes_to_departure(params)
+    e_trip  = expected_trip_minutes(params) * params.mu * params.v * params.omega
+    e_ceil  = _du_e_ceil(params, gamma)
 
-    if target_mode == "fixed":
-        e_target_v = e_ceil
-    else:
-        e_trip  = expected_trip_minutes(params) * params.mu * params.v * params.omega
-        tau_max = max_minutes_to_departure(params)
-        _alp    = 1.0 if target_mode == "linear" else alpha
-        e_target_v = _departure_urgency_target(tau, tau_max, e_trip, e_ceil, _alp)
+    frac       = (min(1.0, tau / tau_max) if tau_max > 0 else 1.0) ** alpha
+    e_target_v = e_trip + (e_ceil - e_trip) * frac
 
     deliverable = params.u_max * params.eta_c * params.omega * tau
     rho = np.clip((e_target_v - e_grid) / deliverable, 0.0, 1.0) if deliverable > 0 else np.ones(len(e_grid))
@@ -154,7 +152,7 @@ def _du_charge_battery_ceiling(params, pbp_fn, e_grid, t: int,
 
     charging = (cum_2d <= rho_2d + extra) & (e_grid[:, np.newaxis] < params.e_max)  # (N_e, K)
     if use_reserve:
-        charging[e_grid < reserve_frac * params.e_max, :] = True
+        charging[e_grid < e_trip, :] = True
     charging[e_grid >= params.e_max, :] = False
 
     e_rank = (np.arange(len(e_grid)) + 1)[:, np.newaxis]
@@ -636,26 +634,17 @@ def _baseline_policy_rates(
         return np.where(e_grid[np.newaxis, :] >= params.e_max, 0.0, rate)
 
     if name == "Departure Urgency":
-        target_mode  = kwargs.get("target_mode",   "fixed")
-        target_frac  = kwargs.get("target_frac",   1.0)
-        reserve_frac = kwargs.get("reserve_frac",  0.25)
-        use_reserve  = kwargs.get("use_reserve",   True)
-        alpha        = kwargs.get("alpha",         0.5)
-        e_reserve    = reserve_frac * params.e_max
-        e_ceil       = target_frac * params.e_max
+        gamma       = kwargs.get("gamma",       0.5)
+        use_reserve = kwargs.get("use_reserve", True)
+        alpha       = kwargs.get("alpha",       0.5)
+        e_trip      = expected_trip_minutes(params) * params.mu * params.v * params.omega
+        e_ceil      = _du_e_ceil(params, gamma)
+        tau_max     = max_minutes_to_departure(params)
 
         slots = np.array([minutes_to_departure(t, params) for t in range(T)])  # (T,)
-
-        if target_mode == "fixed":
-            e_target_t = np.full(T, e_ceil)
-        else:
-            e_trip  = expected_trip_minutes(params) * params.mu * params.v * params.omega
-            tau_max = max_minutes_to_departure(params)
-            _alpha  = 1.0 if target_mode == "linear" else alpha
-            e_target_t = np.array([
-                _departure_urgency_target(slots[t], tau_max, e_trip, e_ceil, _alpha)
-                for t in range(T)
-            ])
+        frac_t     = np.array([(min(1.0, s / tau_max) if tau_max > 0 else 1.0) ** alpha
+                                for s in slots])                                # (T,)
+        e_target_t = e_trip + (e_ceil - e_trip) * frac_t                       # (T,)
 
         deliverable = params.u_max * params.eta_c * params.omega * slots        # (T,)
         e_diff      = np.maximum(0.0, e_target_t[:, np.newaxis] - e_grid[np.newaxis, :])  # (T, N_e)
@@ -672,7 +661,7 @@ def _baseline_policy_rates(
         rate = params.u_max * p1 + (params.u_max / 2) * (p12 - p1)
 
         if use_reserve:
-            rate = np.where(e_grid[np.newaxis, :] < e_reserve, params.u_max, rate)
+            rate = np.where(e_grid[np.newaxis, :] < e_trip, params.u_max, rate)
         rate = np.where(e_grid[np.newaxis, :] >= params.e_max, 0.0, rate)
         return rate
 
@@ -685,9 +674,7 @@ def fig_baseline_policy_heatmaps(
     low_threshold: float | None = None,
     high_threshold: float | None = None,
     soc_threshold: float | None = None,
-    du_target_mode: str = "fixed",
-    du_target_frac: float = 1.0,
-    du_reserve_frac: float = 0.25,
+    du_gamma: float = 0.5,
     du_use_reserve: bool = True,
     du_alpha: float = 0.5,
     time_bin_min: int = 10,
@@ -708,9 +695,7 @@ def fig_baseline_policy_heatmaps(
         low_threshold=low_threshold,
         high_threshold=high_threshold,
         soc_threshold=soc_threshold,
-        du_target_mode=du_target_mode,
-        du_target_frac=du_target_frac,
-        du_reserve_frac=du_reserve_frac,
+        du_gamma=du_gamma,
         du_use_reserve=du_use_reserve,
         du_alpha=du_alpha,
     )
@@ -722,11 +707,9 @@ def fig_baseline_policy_heatmaps(
     def _du_subtitle(name: str) -> str:
         if name != "Departure Urgency":
             return name
-        mode_label = {"fixed": "fixed", "linear": "linear τ", "power": f"power τ (α={du_alpha:.2f})"}[du_target_mode]
-        ceil_label = f"{int(round(du_target_frac * 100))}% e_max"
-        reserve_label = (f"reserve {int(round(du_reserve_frac * 100))}%"
-                         if du_use_reserve else "no reserve")
-        return f"Departure Urgency  [{mode_label}, ceil {ceil_label}, {reserve_label}]"
+        e_ceil_kwh = _du_e_ceil(params, du_gamma)
+        reserve_str = f"reserve=e_trip" if du_use_reserve else "no reserve"
+        return f"Departure Urgency  [ceil {e_ceil_kwh:.1f} kWh (γ={du_gamma:.2f}), {reserve_str}, α={du_alpha:.2f}]"
 
     ncols  = 2
     nrows  = int(np.ceil(len(policies) / ncols))

@@ -258,7 +258,7 @@ battery e_max = 40 kWh · η_c = 0.95 · u_max = 11 kW · φ = 1000 €/h · K =
 ENTSO-E data **excluding** the 2021–23 crisis; the data-driven models (bins/GMM/MDN) train on **all**
 years. Negative wholesale prices (~2.6% of hours) are floored to 0.
 
-**Policies compared:** Optimal (Backward Induction) · Night Charging · DP-Heuristic · Always-Maximum · Always-Minimum
+**Policies compared:** Optimal (Backward Induction) · Night Charging · Battery Level Urgency · Always-Maximum · Always-Minimum
 
 **Mobility model** (sidebar — applies to every sweep):
 - **Baseline** — trip ~ Geom(p_DP); 2-state chain; default E[T] ≈ 11 min.
@@ -278,7 +278,7 @@ years. Negative wholesale prices (~2.6% of hours) are floored to 0.
 
 > **Reading the Pricing tab:** each pricing model is solved *and* evaluated in its **own** price
 > world. Compare policies *within* a column (which policy wins, optimality gap, feasibility) — not
-> absolute costs *across* columns. The DP-Heuristic uses each world's own price distribution.
+> absolute costs *across* columns. The Battery Level Urgency uses each world's own price distribution.
 > Negative Binomial models have more mobility states → slower solves; lower **N_e** if needed.
 > Re-run a single sweep with its **Run** button.
     """)
@@ -305,27 +305,34 @@ if st.session_state.pop("sa_run_all_triggered", False):
     _s_excl   = _get_gbins("excl")
     _s_incl   = _get_gbins("incl")
     _s_crisis = _get_gbins("only")
+    _du_kw = dict(
+        du_target_mode=st.session_state.get("du_target_mode", "fixed"),
+        du_target_frac=st.session_state.get("du_target_frac", 1.0),
+        du_reserve_frac=st.session_state.get("du_reserve_frac", 0.25),
+        du_use_reserve=st.session_state.get("du_use_reserve", True),
+        du_alpha=st.session_state.get("du_alpha", 0.5),
+    )
     _steps = [
         ("Pricing · model",    "sa_pricing_model_results",
          lambda cb: sweep_pricing_model(
              {m: _get_price_model(m) for m in ("Gaussian Bins", "GMM", "MDN")},
-             N_rollouts, N_e, seed, cb)),
+             N_rollouts, N_e, seed, cb, **_du_kw)),
         ("Pricing · season",   "sa_pricing_season_results",
-         lambda cb: sweep_pricing_season(_s_excl, N_rollouts, N_e, seed, cb)),
+         lambda cb: sweep_pricing_season(_s_excl, N_rollouts, N_e, seed, cb, **_du_kw)),
         ("Pricing · day-type", "sa_pricing_daytype_results",
-         lambda cb: sweep_pricing_daytype(_s_excl, N_rollouts, N_e, seed, cb)),
+         lambda cb: sweep_pricing_daytype(_s_excl, N_rollouts, N_e, seed, cb, **_du_kw)),
         ("Pricing · crisis",   "sa_pricing_crisis_results",
-         lambda cb: sweep_pricing_crisis(_s_excl, _s_incl, _s_crisis, N_rollouts, N_e, seed, cb)),
+         lambda cb: sweep_pricing_crisis(_s_excl, _s_incl, _s_crisis, N_rollouts, N_e, seed, cb, **_du_kw)),
         ("Penalty",            "sa_phi_results",
-         lambda cb: sweep_penalty(BASELINE_MODEL, N_rollouts, N_e, seed, cb)),
+         lambda cb: sweep_penalty(BASELINE_MODEL, N_rollouts, N_e, seed, cb, **_du_kw)),
         ("Discount β",         "sa_beta_results",
-         lambda cb: sweep_beta(BASELINE_MODEL, N_rollouts, N_e, seed, cb)),
+         lambda cb: sweep_beta(BASELINE_MODEL, N_rollouts, N_e, seed, cb, **_du_kw)),
         ("Horizon",            "sa_horizon_results",
-         lambda cb: sweep_horizon(BASELINE_MODEL, N_rollouts, N_e, seed, cb)),
+         lambda cb: sweep_horizon(BASELINE_MODEL, N_rollouts, N_e, seed, cb, **_du_kw)),
         ("Departure",          "sa_departure_results",
-         lambda cb: sweep_departure_profiles(BASELINE_MODEL, N_rollouts, N_e, seed, cb)),
+         lambda cb: sweep_departure_profiles(BASELINE_MODEL, N_rollouts, N_e, seed, cb, **_du_kw)),
         ("Mobility",           "sa_mobility_results",
-         lambda cb: sweep_mobility_models(N_rollouts, N_e, seed, cb)),
+         lambda cb: sweep_mobility_models(N_rollouts, N_e, seed, cb, **_du_kw)),
     ]
     n = len(_steps)
 

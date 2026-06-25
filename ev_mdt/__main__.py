@@ -166,7 +166,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                              include_baseline=(do_baseline and i == 0))
         saved += save_tables(results, out_dir=tables_dir,
                              N_rollouts=args.N_rollouts, seed=args.seed, N_e=args.N_e,
-                             include_baseline=False)
+                             include_baseline=False, _log=tqdm.write)
         for p in saved:
             tqdm.write(f"  Saved: {p}")
 
@@ -202,6 +202,180 @@ def cmd_run(args: argparse.Namespace) -> None:
     print(f"  Tables  → {tables_dir}/")
     if wandb_run is not None:
         wandb_run.finish()
+
+
+def cmd_target_sweep(args: argparse.Namespace) -> None:
+    from pathlib import Path
+    from tqdm import tqdm
+    from ev_mdt.analysis.sensitivity import sweep_target_ceiling
+    from ev_mdt.plots.sensitivity import figure_to_png
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = sweep_target_ceiling(
+        model_label=args.model,
+        N_rollouts=args.N_rollouts,
+        seed=args.seed,
+        step_kwh=args.step,
+        target_mode=args.target_mode,
+        use_reserve=not args.no_reserve,
+        alpha=args.alpha,
+    )
+
+    import pandas as pd
+    import numpy as np
+    df = pd.DataFrame(rows)
+    best = df.loc[df["mean_cost"].idxmin()]
+    tqdm.write(f"\nBest ceiling: {best['target_kwh']:.0f} kWh "
+               f"({best['target_frac']:.0%}) — mean cost {best['mean_cost']:.4f} €")
+
+    # Save table
+    csv_path = out_dir / "target_sweep.csv"
+    df.rename(columns={
+        "target_kwh":   "Target ceiling (kWh)",
+        "target_frac":  "Target ceiling (%)",
+        "mean_cost":    "Mean cost (€)",
+        "std_cost":     "Std cost (€)",
+        "mean_penalty": "Mean penalty (min)",
+        "mean_charged": "Mean charged (kWh)",
+        "reserve_frac": "Reserve fraction",
+    }).to_csv(csv_path, index=False)
+    tqdm.write(f"Saved table → {csv_path}")
+
+    # Save plot
+    try:
+        import plotly.graph_objects as go
+        fig = go.Figure()
+        x = df["target_kwh"]
+        fig.add_trace(go.Scatter(
+            x=pd.concat([x, x.iloc[::-1]]),
+            y=pd.concat([df["mean_cost"] + df["std_cost"],
+                         (df["mean_cost"] - df["std_cost"]).iloc[::-1]]),
+            fill="toself", fillcolor="rgba(68,119,170,0.10)",
+            line=dict(color="rgba(0,0,0,0)"), name="Total ±1 std", hoverinfo="skip", yaxis="y1",
+        ))
+        fig.add_trace(go.Scatter(
+            x=x, y=df["mean_cost"], mode="lines+markers",
+            line=dict(color="#4477AA", width=2), marker=dict(size=7), name="Total cost", yaxis="y1",
+        ))
+        fig.add_trace(go.Scatter(
+            x=x, y=df["mean_penalty_cost"], mode="lines+markers",
+            line=dict(color="#CC3311", width=2, dash="dash"), marker=dict(size=6),
+            name="Penalty cost", yaxis="y1",
+        ))
+        fig.add_trace(go.Scatter(
+            x=[best["target_kwh"]], y=[best["mean_cost"]],
+            mode="markers", marker=dict(color="#EE6677", size=12, symbol="star"),
+            name=f"Best: {best['target_kwh']:.0f} kWh ({best['target_frac']:.0%})", yaxis="y1",
+        ))
+        fig.add_trace(go.Scatter(
+            x=x, y=df["mean_charge_cost"], mode="lines+markers",
+            line=dict(color="#228833", width=2, dash="dot"), marker=dict(size=6),
+            name="Charging cost (right)", yaxis="y2",
+        ))
+        fig.update_layout(
+            xaxis_title="Target ceiling (kWh)",
+            yaxis=dict(title="Total / penalty cost (€)"),
+            yaxis2=dict(title="Charging cost (€)", overlaying="y", side="right",
+                        showgrid=False),
+            legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+            template="plotly_white", height=500,
+        )
+        png_path = out_dir / "target_sweep.png"
+        png_path.write_bytes(figure_to_png(fig))
+        tqdm.write(f"Saved plot  → {png_path}")
+    except Exception as e:
+        tqdm.write(f"Could not save plot (kaleido missing?): {e}")
+
+
+def cmd_gamma_sweep(args: argparse.Namespace) -> None:
+    from pathlib import Path
+    import pandas as pd
+    from tqdm import tqdm
+    from plotly.subplots import make_subplots
+    import plotly.graph_objects as go
+    from ev_mdt.analysis.sensitivity import sweep_gamma
+    from ev_mdt.plots.sensitivity import figure_to_png
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    results = sweep_gamma(
+        empirical_target_kwh=args.empirical_target,
+        N_rollouts=args.N_rollouts,
+        seed=args.seed,
+        scaling=args.scaling,
+        target_mode=args.target_mode,
+        use_reserve=not args.no_reserve,
+        alpha=args.alpha,
+    )
+
+    # Save CSV per model
+    for model_name, rows in results.items():
+        slug = model_name.lower().replace(" ", "_").replace("=", "")
+        csv_path = out_dir / f"gamma_sweep_{slug}.csv"
+        pd.DataFrame(rows).to_csv(csv_path, index=False)
+        tqdm.write(f"Saved {csv_path}")
+
+    # Build stacked figure: one subplot per model, dual y-axes
+    model_names = list(results.keys())
+    n_models = len(model_names)
+    fig = make_subplots(
+        rows=n_models, cols=1,
+        shared_xaxes=True,
+        subplot_titles=model_names,
+        vertical_spacing=0.10,
+    )
+    colors = {"total": "#4477AA", "charging": "#228833", "penalty": "#CC3311"}
+    for row_i, model_name in enumerate(model_names, start=1):
+        df   = pd.DataFrame(results[model_name])
+        x    = df["gamma"]
+        show = row_i == 1
+
+        fig.add_trace(go.Scatter(
+            x=x, y=df["mean_cost"], mode="lines+markers",
+            line=dict(color=colors["total"], width=2), marker=dict(size=6),
+            name="Total cost", legendgroup="total", showlegend=show,
+        ), row=row_i, col=1)
+        fig.add_trace(go.Scatter(
+            x=x, y=df["mean_charge_cost"], mode="lines+markers",
+            line=dict(color=colors["charging"], width=2, dash="dot"), marker=dict(size=5),
+            name="Charging cost", legendgroup="charging", showlegend=show,
+        ), row=row_i, col=1)
+        fig.add_trace(go.Scatter(
+            x=x, y=df["mean_penalty_cost"], mode="lines+markers",
+            line=dict(color=colors["penalty"], width=2, dash="dash"), marker=dict(size=5),
+            name="Penalty cost", legendgroup="penalty", showlegend=show,
+        ), row=row_i, col=1)
+
+        best = df.loc[df["mean_cost"].idxmin()]
+        fig.add_trace(go.Scatter(
+            x=[best["gamma"]], y=[best["mean_cost"]],
+            mode="markers", marker=dict(color="#EE6677", size=11, symbol="star"),
+            name=f"Best γ={best['gamma']:.1f}", legendgroup=f"best_{row_i}",
+            showlegend=show,
+        ), row=row_i, col=1)
+
+        fig.update_yaxes(title_text="Cost (€)", row=row_i, col=1)
+
+        tqdm.write(f"{model_name}: best γ={best['gamma']:.1f}  "
+                   f"(target={best['target_kwh']:.1f} kWh, cost={best['mean_cost']:.4f} €)")
+
+    fig.update_xaxes(title_text="γ", row=n_models, col=1)
+    fig.update_layout(
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        height=320 * n_models,
+        margin=dict(l=70, r=80, t=60, b=40),
+    )
+
+    try:
+        png_path = out_dir / "gamma_sweep.png"
+        png_path.write_bytes(figure_to_png(fig))
+        tqdm.write(f"Saved plot → {png_path}")
+    except Exception as e:
+        tqdm.write(f"Could not save plot: {e}")
 
 
 def cmd_prices(args: argparse.Namespace) -> None:
@@ -291,6 +465,38 @@ def main() -> None:
     p_run.add_argument("--wandb-project", default="au-mdt",      help="W&B project name")
     p_run.add_argument("--wandb-run",     default="",            help="W&B run name (auto if omitted)")
 
+    # target-sweep
+    from ev_mdt.params import MODEL_LABELS
+    p_ts = sub.add_parser("target-sweep",
+                           help="Sweep Departure Urgency target ceiling and export cost plot + CSV")
+    p_ts.add_argument("--model",       default="Baseline", choices=MODEL_LABELS)
+    p_ts.add_argument("--N-rollouts",  type=int,   default=500,   metavar="N")
+    p_ts.add_argument("--seed",        type=int,   default=42)
+    p_ts.add_argument("--step",        type=float, default=5.0,   metavar="kWh",
+                      help="Target ceiling step size in kWh")
+    p_ts.add_argument("--target-mode", default="fixed",
+                      choices=["fixed", "linear", "power"])
+    p_ts.add_argument("--alpha",       type=float, default=0.5,
+                      help="Power exponent α (only used for --target-mode power)")
+    p_ts.add_argument("--no-reserve",  action="store_true",
+                      help="Disable the mandatory reserve floor")
+    p_ts.add_argument("--out-dir",     default="export/target_sweep",
+                      help="Output directory for CSV and PNG")
+
+    # gamma-sweep
+    p_gs = sub.add_parser("gamma-sweep",
+                           help="Sweep ceiling scaling exponent γ across three mobility models")
+    p_gs.add_argument("--empirical-target", type=float, default=25.0, metavar="kWh",
+                      help="Empirical baseline ceiling anchor (kWh)")
+    p_gs.add_argument("--N-rollouts",  type=int,   default=500,   metavar="N")
+    p_gs.add_argument("--seed",        type=int,   default=42)
+    p_gs.add_argument("--scaling",     default="length", choices=["length", "freq"],
+                      help="Scaling variable: trip length only, or length × frequency")
+    p_gs.add_argument("--target-mode", default="fixed", choices=["fixed", "linear", "power"])
+    p_gs.add_argument("--alpha",       type=float, default=0.5)
+    p_gs.add_argument("--no-reserve",  action="store_true")
+    p_gs.add_argument("--out-dir",     default="export/gamma_sweep")
+
     # prices
     p_prices = sub.add_parser("prices", help="Fit price models and simulate diurnal profiles")
     p_prices.add_argument("--n-days",  type=int,   default=1000, help="Simulated days")
@@ -309,6 +515,10 @@ def main() -> None:
         cmd_rollout(args)
     elif args.command == "run":
         cmd_run(args)
+    elif args.command == "gamma-sweep":
+        cmd_gamma_sweep(args)
+    elif args.command == "target-sweep":
+        cmd_target_sweep(args)
     elif args.command == "prices":
         cmd_prices(args)
     else:

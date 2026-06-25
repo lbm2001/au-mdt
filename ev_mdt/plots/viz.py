@@ -13,9 +13,8 @@ def rgba(color: str, alpha: float) -> str:
 
 POLICY_ORDER = [
     "Backward Induction",
-    "DP-Heuristic",
-    "Next-Trip Urgency",
-    "Next-Trip (Simple τ)",
+    "Battery Level Urgency",
+    "Departure Urgency",
     "Price-Oriented",
     "Night Charging",
     "Always-Maximum",
@@ -24,15 +23,14 @@ POLICY_ORDER = [
 ]
 
 POLICY_COLORS = {
-    "Backward Induction":   "#4477AA",
-    "DP-Heuristic":         "#009988",
-    "Next-Trip Urgency":    "#66CCEE",
-    "Next-Trip (Simple τ)": "#99DDFF",
-    "Price-Oriented":       "#EE6677",
-    "Night Charging":       "#AA3377",
-    "Always-Maximum":       "#228833",
-    "Minimum Battery Level": "#EE7733",
-    "Always-Minimum":       "#BBBBBB",
+    "Backward Induction":       "#4477AA",
+    "Battery Level Urgency":    "#009988",
+    "Departure Urgency":        "#3399BB",
+    "Price-Oriented":           "#EE6677",
+    "Night Charging":           "#AA3377",
+    "Always-Maximum":           "#228833",
+    "Minimum Battery Level":    "#EE7733",
+    "Always-Minimum":           "#BBBBBB",
 }
 
 MODEL_COLORS = {

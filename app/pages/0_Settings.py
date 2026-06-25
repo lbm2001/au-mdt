@@ -191,6 +191,136 @@ with col3:
 
 st.divider()
 
+# ── Departure Urgency policy options ──────────────────────────────────────────
+
+st.subheader("Departure Urgency Policy")
+st.caption(
+    "Controls the single **Departure Urgency** benchmark shown in all pages. "
+    "τ(t) = E[minutes to next departure] is computed via Gauss–Seidel backward recursion."
+)
+
+_du_col1, _du_col2 = st.columns(2)
+
+with _du_col1:
+    st.markdown("**Charge target**")
+    du_target_mode = st.radio(
+        "Target mode",
+        options=["fixed", "linear", "power"],
+        index=["fixed", "linear", "power"].index(st.session_state.get("du_target_mode", "fixed")),
+        format_func=lambda x: {
+            "fixed":  "Fixed e_max — always top up to full battery",
+            "linear": "Linear τ-interpolation — e_trip → e_max as τ grows",
+            "power":  "Concave-power τ-interpolation — rises fast from e_trip, flattens",
+        }[x],
+        help=(
+            "**Fixed**: ρ = (e_max − e) / deliverable. Overcharges near departure peaks "
+            "(τ small → deliverable small → ρ > 1). "
+            "**Linear / Power**: target = e_trip + (e_max − e_trip)·(τ/τ_max)^α, "
+            "so the target falls toward e_trip when τ is small."
+        ),
+    )
+    st.session_state["du_target_mode"] = du_target_mode
+
+    from ev_mdt.models.common.model_utils import expected_trip_minutes
+
+    _e_max_cur_target = st.session_state.get("e_max", _DEFAULTS["e_max"])
+
+    # Compute e_daily for current params
+    class _FakeParams:
+        p_pd_morning = st.session_state.get("p_pd_morning", _DEFAULTS["p_pd_morning"])
+        p_pd_lunch   = st.session_state.get("p_pd_lunch",   _DEFAULTS["p_pd_lunch"])
+        p_pd_evening = st.session_state.get("p_pd_evening", _DEFAULTS["p_pd_evening"])
+        p_pd_default = st.session_state.get("p_pd_default", _DEFAULTS["p_pd_default"])
+        p_dp_morning = st.session_state.get("p_dp_morning", _DEFAULTS.get("p_dp_morning", 0.5))
+        p_dp_lunch   = st.session_state.get("p_dp_lunch",   _DEFAULTS.get("p_dp_lunch",   0.5))
+        p_dp_evening = st.session_state.get("p_dp_evening", _DEFAULTS.get("p_dp_evening", 0.5))
+        p_dp_default = st.session_state.get("p_dp_default", _DEFAULTS["p_dp_default"])
+        if model != BASELINE_MODEL:
+            q        = st.session_state.get("nb_q") or _DEFAULTS["nb_q"]
+            lambda_k = st.session_state.get("nb_lambda_k")
+            k        = st.session_state.get("nb_k") or _DEFAULTS["nb_k"]
+
+    # Baseline reference: expected trip length from default Baseline params
+    from ev_mdt.models.common.model_utils import expected_trips_per_day
+    _e_trip_min_ref = expected_trip_minutes(_bp)
+    _e_trip_min_cur = expected_trip_minutes(_FakeParams())
+    _mu  = st.session_state.get("mu",  _DEFAULTS["mu"])
+    _v   = st.session_state.get("v",   _DEFAULTS["v"])
+    _omega = _bp.omega  # fixed conversion factor
+    _n_trips_ref = expected_trips_per_day(_bp)
+    _n_trips_cur = expected_trips_per_day(_FakeParams())
+    _e_daily_ref = _n_trips_ref * _e_trip_min_ref * _bp.mu * _bp.v * _omega
+    _e_daily_cur = _n_trips_cur * _e_trip_min_cur * _mu * _v * _omega
+
+    # Empirical baseline target ceiling in kWh (set from Target Sweep at baseline params)
+    du_empirical_target_kwh = st.number_input(
+        "Empirical baseline target ceiling (kWh)",
+        min_value=1.0, max_value=float(_e_max_cur_target),
+        value=float(st.session_state.get("du_empirical_target_kwh", 25.0)),
+        step=1.0, format="%.1f",
+        help="Set this from the Target Sweep page for the default Baseline params.",
+    )
+    st.session_state["du_empirical_target_kwh"] = du_empirical_target_kwh
+
+    _gamma = st.slider(
+        "Scaling exponent γ", min_value=0.0, max_value=1.0,
+        value=float(st.session_state.get("du_gamma", 0.5)), step=0.05, format="%.2f",
+        help="γ=0 → ceiling always equals empirical anchor. γ=1 → linear scaling with ratio. γ=0.5 → sqrt dampening.",
+    )
+    st.session_state["du_gamma"] = _gamma
+
+    # Version B: trip length × frequency (e_daily)
+    _ratio_b  = _e_daily_cur / _e_daily_ref if _e_daily_ref > 0 else 1.0
+    _target_b = min(_e_max_cur_target, du_empirical_target_kwh * _ratio_b ** _gamma)
+
+    st.caption(
+        f"e_daily {_e_daily_ref:.2f}→{_e_daily_cur:.2f} kWh, "
+        f"ratio^γ = {_ratio_b**_gamma:.3f}  →  **{_target_b:.1f} kWh** ({_target_b/_e_max_cur_target:.0%})"
+    )
+
+    st.session_state["du_target_frac"] = _target_b / _e_max_cur_target
+
+    if du_target_mode == "power":
+        du_alpha = st.slider(
+            "Power exponent α",
+            min_value=0.1, max_value=1.0,
+            value=float(st.session_state.get("du_alpha", 0.5)),
+            step=0.05, format="%.2f",
+            help="α < 1 → concave curve (target rises quickly from e_trip then flattens). α = 1 → same as linear.",
+        )
+        st.session_state["du_alpha"] = du_alpha
+    else:
+        du_alpha = float(st.session_state.get("du_alpha", 0.5))
+
+with _du_col2:
+    st.markdown("**Mandatory reserve band**")
+
+    _e_max_cur = st.session_state.get("e_max", _DEFAULTS["e_max"])
+    if model != BASELINE_MODEL:
+        _k_mean = st.session_state.get("nb_lambda_k") or st.session_state.get("nb_k") or _DEFAULTS["nb_k"]
+        _q      = st.session_state.get("nb_q") or _DEFAULTS["nb_q"]
+        _e_trip = (_k_mean / _q) * st.session_state.get("mu", _DEFAULTS["mu"]) * st.session_state.get("v", _DEFAULTS["v"]) / 60
+    else:
+        _e_trip = (1.0 / (st.session_state.get("p_dp_default") or _DEFAULTS["p_dp_default"])
+                   * st.session_state.get("mu", _DEFAULTS["mu"]) * st.session_state.get("v", _DEFAULTS["v"]) / 60)
+    du_reserve_frac = _e_trip / _e_max_cur
+    st.session_state["du_reserve_frac"] = du_reserve_frac
+
+    du_use_reserve = st.toggle(
+        "Enable reserve floor",
+        value=bool(st.session_state.get("du_use_reserve", True)),
+        help="When enabled, charge at u_max unconditionally below e_trip = reserve_frac · e_max, "
+             "regardless of price. Ad-hoc safety net (not from Kempker).",
+    )
+    st.session_state["du_use_reserve"] = du_use_reserve
+
+    st.caption(
+        f"Reserve floor = e_trip = **{_e_trip:.3f} kWh** "
+        f"({'active' if du_use_reserve else 'disabled'})"
+    )
+
+st.divider()
+
 col_btn, col_status = st.columns([1, 3])
 with col_btn:
     run_btn = st.button("▶ Run Backward Induction", type="primary", use_container_width=True)
@@ -291,13 +421,15 @@ if run_btn:
     if is_negbin:
         from ev_mdt.params import NegBinParams
         from ev_mdt.models.negbin.model import transition_matrix as _tm
+        from ev_mdt.models.common.model_utils import price_bin_probs as _gaussian_pbp
         params = NegBinParams(**common_kwargs, k=int(nb_k), q=float(nb_q),
                               lambda_k=float(nb_lambda_k) if nb_lambda_k is not None else None)
         mode_label = f"λ_k={nb_lambda_k:.1f}" if nb_lambda_k is not None else f"k={nb_k}"
+        _pbp_fn_negbin = _pbp_fn if _pbp_fn is not None else (lambda t: _gaussian_pbp(t, params))
         with st.spinner(f"Running backward induction (Negative Binomial {mode_label}, q={nb_q:.2f}, T={T} min, N_e={N_e})…"):
-            _J, pi, actions, e_grid, lam_grid = _bi(
+            _, pi, actions, e_grid, lam_grid = _bi(
                 params, transition_matrix_fn=lambda t: _tm(t, params),
-                price_bin_probs_fn=_pbp_fn, n_chi=params.k + 1, T=T, N_e=N_e, N_a=N_a)
+                price_bin_probs_fn=_pbp_fn_negbin, n_chi=params.k + 1, T=T, N_e=N_e, N_a=N_a)
     else:
         from ev_mdt.params import BaselineParams
         from ev_mdt.models.baseline.model import transition_matrix as _tm
@@ -310,7 +442,7 @@ if run_btn:
         _pbp_fn_baseline = _pbp_fn if _pbp_fn is not None else (lambda t: _gaussian_pbp(t, params))
         n_a_label = "Default" if N_a is None else str(N_a)
         with st.spinner(f"Running backward induction (Baseline, T={T} min, N_e={N_e}, N_a={n_a_label})…"):
-            _J, pi, actions, e_grid, lam_grid = _bi(
+            _, pi, actions, e_grid, lam_grid = _bi(
                 params,
                 transition_matrix_fn=lambda t: _tm(t, params),
                 price_bin_probs_fn=_pbp_fn_baseline,

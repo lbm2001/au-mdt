@@ -88,12 +88,55 @@ def _tau_table(p_morning: float, p_lunch: float, p_evening: float, p_default: fl
         max_delta = 0.0
         for m in range(1439, -1, -1):
             nxt = (m + 1) % 1440
-            new = 1.0 + (1.0 - haz[nxt]) * tau[nxt]
+            new = 1.0 + (1.0 - haz[m]) * tau[nxt]
             max_delta = max(max_delta, abs(new - tau[m]))
             tau[m] = new
         if max_delta < 1e-9:
             break
     return tuple(tau)
+
+
+def expected_trip_minutes(params) -> float:
+    """Expected duration of the next trip in minutes (certainty-equivalent of Kempker's deadline).
+
+    NegBin: E[T_trip] = k/q (or lambda_k/q for Poisson-sampled k).
+    Baseline: E[T_trip] = 1/p_dp_default (geometric trips, time-averaged by the dominant rate).
+    """
+    if hasattr(params, "q"):
+        k_mean = params.lambda_k if params.lambda_k is not None else float(params.k)
+        return k_mean / params.q
+    return 1.0 / params.p_dp_default
+
+
+def expected_trips_per_day(params) -> float:
+    """Expected number of Parked→Driving departures in a 1440-minute day.
+
+    Uses time-averaged departure and return hazards:
+        E[trips/day] = 1440 · p_pd_avg · p_dp_avg / (p_pd_avg + p_dp_avg)
+
+    p_pd_avg is the minute-weighted average departure hazard over the day.
+    p_dp_avg is approximated from the params' return-hazard fields (baseline)
+    or as 1/E[T_trip] for NegBin (geometric-phase equivalent).
+    """
+    p_pd_avg = (
+        120 * params.p_pd_morning
+        + 120 * params.p_pd_lunch
+        + 120 * params.p_pd_evening
+        + 1080 * params.p_pd_default
+    ) / 1440
+
+    if hasattr(params, "q"):
+        k_mean = params.lambda_k if params.lambda_k is not None else float(params.k)
+        p_dp_avg = params.q / k_mean  # 1 / E[T_trip]
+    else:
+        p_dp_avg = (
+            120 * params.p_dp_morning
+            + 120 * params.p_dp_lunch
+            + 120 * params.p_dp_evening
+            + 1080 * params.p_dp_default
+        ) / 1440
+
+    return 1440 * p_pd_avg * p_dp_avg / (p_pd_avg + p_dp_avg)
 
 
 def minutes_to_departure(t: int, params) -> float:
@@ -105,3 +148,10 @@ def minutes_to_departure(t: int, params) -> float:
     table = _tau_table(params.p_pd_morning, params.p_pd_lunch,
                        params.p_pd_evening, params.p_pd_default)
     return table[t % 1440]
+
+
+def max_minutes_to_departure(params) -> float:
+    """Maximum of τ(t) over all minutes of the day — the quietest off-peak value."""
+    table = _tau_table(params.p_pd_morning, params.p_pd_lunch,
+                       params.p_pd_evening, params.p_pd_default)
+    return max(table)

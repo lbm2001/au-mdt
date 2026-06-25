@@ -6,7 +6,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import streamlit as st
 
 from ev_mdt.models.common.model_utils import price_bin_probs
-from ev_mdt.plots.sensitivity import fig_policy_heatmap, fig_policy_price_map
+from ev_mdt.plots.sensitivity import (
+    fig_baseline_policy_heatmaps,
+    fig_policy_heatmap,
+    fig_policy_price_map,
+)
 
 st.set_page_config(page_title="Policy Explorer — EV Charging MDP", layout="wide")
 st.title("Policy Explorer")
@@ -115,4 +119,30 @@ ppmap_hour = st.slider("Hour of day", 0, T_hours - 1, min(12, T_hours - 1), key=
 _chart(
     fig_policy_price_map(pi, actions, e_grid, lam_grid, params, chi=0, t=ppmap_hour * 60),
     "explorer_policy_vs_price",
+)
+
+# ── Baseline policy heatmaps ──────────────────────────────────────────────────
+
+st.subheader("Baseline Policy Heatmaps")
+st.caption(
+    "Price-averaged charge rate u(hour × battery) for each benchmark policy. "
+    "Uses the same time / battery bin resolution as the optimal-policy heatmap above."
+)
+_chart(
+    fig_baseline_policy_heatmaps(
+        params, e_grid, lam_grid, T, _pbp_fn,
+        pi=pi, actions=actions,
+        low_threshold=st.session_state["benchmark_low_threshold"],
+        high_threshold=st.session_state["benchmark_high_threshold"],
+        soc_threshold=params.e_max * 0.25,
+        du_target_mode=st.session_state.get("du_target_mode", "fixed"),
+        du_target_frac=st.session_state.get("du_target_frac", 1.0),
+
+        du_reserve_frac=st.session_state.get("du_reserve_frac", 0.25),
+        du_use_reserve=st.session_state.get("du_use_reserve", True),
+        du_alpha=st.session_state.get("du_alpha", 0.5),
+        time_bin_min=st.session_state.get("time_bin", 10),
+        battery_bin_kwh=st.session_state.get("bat_bin", 1.0),
+    ),
+    "explorer_baseline_policy_heatmaps",
 )

@@ -192,3 +192,22 @@ def evaluate_policy(
             J[t, chi] = cost + beta * EJ
 
     return J
+
+
+def scalar_policy_to_action_fn(
+    policy_fn,
+    e_grid: np.ndarray,
+    lam_grid: np.ndarray,
+    params,
+    **kwargs,
+) -> "Callable[[int, int], np.ndarray]":
+    """Wrap a scalar policy ``f(t, chi, e, lam, params, **kwargs) -> float``
+    into the ``(N_e, K)`` array form expected by :func:`evaluate_policy`."""
+    def action_fn(t: int, chi: int) -> np.ndarray:
+        return np.array(
+            [[policy_fn(t, chi, float(e), float(lam), params, **kwargs)
+              for lam in lam_grid]
+             for e in e_grid],
+            dtype=float,
+        )
+    return action_fn

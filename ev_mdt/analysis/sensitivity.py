@@ -438,7 +438,6 @@ def sweep_target_ceiling(
     N_rollouts: int = 500,
     seed: int = 42,
     step_kwh: float = 5.0,
-    alpha: float = 0.5,
     progress_cb: Callable | None = None,
     _log: Callable | None = None,
 ) -> list[dict]:
@@ -479,7 +478,6 @@ def sweep_target_ceiling(
             result = _rf(
                 next_trip_policy, sc, float(e0), 0, params,
                 price_bin_probs_fn=pbp_fn,
-                alpha=alpha,
                 _ceil_override=float(ceil_kwh),
             )
             m = rollout_metrics(result, params)
@@ -510,7 +508,6 @@ def sweep_target_ceiling(
 def sweep_gamma(
     N_rollouts: int = 500,
     seed: int = 42,
-    alpha: float = 0.5,
     use_reserve: bool = True,
     gamma_values: list | None = None,
     progress_cb: Callable | None = None,
@@ -577,7 +574,6 @@ def sweep_gamma(
                     price_bin_probs_fn=pbp_fn,
                     gamma=gamma,
                     use_reserve=use_reserve,
-                    alpha=alpha,
                 )
                 m = rollout_metrics(result, params)
                 costs.append(m["Total cost (€)"])

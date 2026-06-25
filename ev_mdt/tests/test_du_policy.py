@@ -37,22 +37,20 @@ def test_next_trip_policy_baseline_ceil():
     from ev_mdt.models.common.policies import E_CEIL_BASE, next_trip_policy
 
     bp = BaselineParams()
-    # Place battery well below e_trip so reserve fires — confirm we get u_max.
+    # Below reserve floor → u_max regardless of price.
     u = next_trip_policy(0, 0, 0.0, 0.0, bp, use_reserve=True)
     assert u == bp.u_max, f"Expected u_max={bp.u_max} below reserve floor, got {u}"
 
-    # Battery at e_max → always 0 regardless of gamma.
+    # At e_max → always 0 regardless of gamma.
     for gamma in (0.0, 0.5, 1.0):
         u = next_trip_policy(0, 0, bp.e_max, 0.0, bp, gamma=gamma)
         assert u == 0.0, f"Expected 0 at e_max, got {u} (gamma={gamma})"
 
-    # _ceil_override path: override to a known value and check that at t=0 (τ large)
-    # with very low price the policy charges.
+    # _ceil_override: at near-zero price, F_p(lam) ≈ 0 ≤ ρ → should charge at u_max.
     u_override = next_trip_policy(
         0, 0, 0.5 * bp.e_max, 0.0, bp,
         _ceil_override=E_CEIL_BASE, use_reserve=False,
     )
-    # At near-zero price (lam=0), F_p(lam) ≈ 0 ≤ ρ, so should charge.
     assert u_override == bp.u_max, (
         f"Expected u_max at low price with _ceil_override={E_CEIL_BASE}, got {u_override}"
     )

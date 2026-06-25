@@ -90,11 +90,9 @@ def _du_e_ceil(params, gamma: float) -> float:
 
 
 def _du_rates_averaged(params, pbp_fn, T: int, e_grid, lam_grid, chi: int = 0,
-                       gamma: float = 0.5, use_reserve: bool = True,
-                       alpha: float = 0.5) -> np.ndarray:
+                       gamma: float = 0.5, use_reserve: bool = True) -> np.ndarray:
     """Price-averaged Departure Urgency charge rate u_DU(t, e)."""
     e_trip  = expected_trip_minutes(params) * params.mu * params.v * params.omega
-    tau_max = max_minutes_to_departure(params)
     e_ceil  = _du_e_ceil(params, gamma)
 
     rates = np.zeros((T, len(e_grid)))
@@ -102,11 +100,8 @@ def _du_rates_averaged(params, pbp_fn, T: int, e_grid, lam_grid, chi: int = 0,
         probs = np.asarray(pbp_fn(t))                              # (K,)
         tau   = minutes_to_departure(t, params)
 
-        frac       = (min(1.0, tau / tau_max) if tau_max > 0 else 1.0) ** alpha
-        e_target_v = e_trip + (e_ceil - e_trip) * frac
-
         deliverable = params.u_max * params.eta_c * params.omega * tau
-        rho = np.clip((e_target_v - e_grid) / deliverable, 0.0, 1.0) if deliverable > 0 else np.ones(len(e_grid))
+        rho = np.clip((e_ceil - e_grid) / deliverable, 0.0, 1.0) if deliverable > 0 else np.ones(len(e_grid))
 
         cumprobs = np.cumsum(probs)                                # (K,) — CDF at each bin
         extra    = 1.0 / tau if tau > 0 else 0.0
@@ -129,20 +124,15 @@ def _du_rates_averaged(params, pbp_fn, T: int, e_grid, lam_grid, chi: int = 0,
 
 
 def _du_charge_battery_ceiling(params, pbp_fn, e_grid, t: int,
-                                gamma: float = 0.5, use_reserve: bool = True,
-                                alpha: float = 0.5) -> np.ndarray:
+                                gamma: float = 0.5, use_reserve: bool = True) -> np.ndarray:
     """(K,) highest battery level at which DU policy still charges at each price bin at time t."""
     probs   = np.asarray(pbp_fn(t))                                # (K,)
     tau     = minutes_to_departure(t, params)
-    tau_max = max_minutes_to_departure(params)
     e_trip  = expected_trip_minutes(params) * params.mu * params.v * params.omega
     e_ceil  = _du_e_ceil(params, gamma)
 
-    frac       = (min(1.0, tau / tau_max) if tau_max > 0 else 1.0) ** alpha
-    e_target_v = e_trip + (e_ceil - e_trip) * frac
-
     deliverable = params.u_max * params.eta_c * params.omega * tau
-    rho = np.clip((e_target_v - e_grid) / deliverable, 0.0, 1.0) if deliverable > 0 else np.ones(len(e_grid))
+    rho = np.clip((e_ceil - e_grid) / deliverable, 0.0, 1.0) if deliverable > 0 else np.ones(len(e_grid))
 
     cumprobs = np.cumsum(probs)                                    # (K,)
     extra    = 1.0 / tau if tau > 0 else 0.0
@@ -636,18 +626,13 @@ def _baseline_policy_rates(
     if name == "Departure Urgency":
         gamma       = kwargs.get("gamma",       0.5)
         use_reserve = kwargs.get("use_reserve", True)
-        alpha       = kwargs.get("alpha",       0.5)
         e_trip      = expected_trip_minutes(params) * params.mu * params.v * params.omega
         e_ceil      = _du_e_ceil(params, gamma)
-        tau_max     = max_minutes_to_departure(params)
 
         slots = np.array([minutes_to_departure(t, params) for t in range(T)])  # (T,)
-        frac_t     = np.array([(min(1.0, s / tau_max) if tau_max > 0 else 1.0) ** alpha
-                                for s in slots])                                # (T,)
-        e_target_t = e_trip + (e_ceil - e_trip) * frac_t                       # (T,)
 
         deliverable = params.u_max * params.eta_c * params.omega * slots        # (T,)
-        e_diff      = np.maximum(0.0, e_target_t[:, np.newaxis] - e_grid[np.newaxis, :])  # (T, N_e)
+        e_diff      = np.maximum(0.0, e_ceil - e_grid[np.newaxis, :])           # (T, N_e)
         safe_del    = np.where(deliverable > 0, deliverable, 1.0)
         rho = np.where(
             deliverable[:, np.newaxis] > 0,
@@ -676,7 +661,6 @@ def fig_baseline_policy_heatmaps(
     soc_threshold: float | None = None,
     du_gamma: float = 0.5,
     du_use_reserve: bool = True,
-    du_alpha: float = 0.5,
     time_bin_min: int = 10,
     battery_bin_kwh: float = 1.0,
 ) -> go.Figure:
@@ -697,7 +681,6 @@ def fig_baseline_policy_heatmaps(
         soc_threshold=soc_threshold,
         du_gamma=du_gamma,
         du_use_reserve=du_use_reserve,
-        du_alpha=du_alpha,
     )
     policies = [(name, fn, kw) for name, fn, kw in registry if name != "Backward Induction"]
 
@@ -709,7 +692,7 @@ def fig_baseline_policy_heatmaps(
             return name
         e_ceil_kwh = _du_e_ceil(params, du_gamma)
         reserve_str = f"reserve=e_trip" if du_use_reserve else "no reserve"
-        return f"Departure Urgency  [ceil {e_ceil_kwh:.1f} kWh (γ={du_gamma:.2f}), {reserve_str}, α={du_alpha:.2f}]"
+        return f"Departure Urgency  [ceil {e_ceil_kwh:.1f} kWh (γ={du_gamma:.2f}), {reserve_str}]"
 
     ncols  = 2
     nrows  = int(np.ceil(len(policies) / ncols))

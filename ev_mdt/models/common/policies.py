@@ -4,7 +4,7 @@ import numpy as np
 from functools import lru_cache
 
 from ev_mdt.models.common.model_utils import (
-    expected_trip_minutes, max_minutes_to_departure, mean_minutes_to_departure,
+    expected_trip_minutes, mean_minutes_to_departure,
     minutes_to_departure, price_bin, price_bin_probs,
 )
 
@@ -112,15 +112,6 @@ def dp_heuristic_policy(
     return float(params.u_max) if F_p <= thresh else 0.0
 
 
-def _departure_urgency_target(tau: float, tau_max: float, e_trip: float, e_max: float,
-                              alpha: float = 1.0) -> float:
-    """Time-varying target: e_trip at τ=0, e_max at τ=τ_max, shape controlled by alpha.
-
-    alpha=1 → linear;  alpha<1 → concave (rises fast early, flattens near tau_max).
-    """
-    frac = min(1.0, tau / tau_max) if tau_max > 0 else 1.0
-    return e_trip + (e_max - e_trip) * (frac ** alpha)
-
 
 def next_trip_policy(
     t: int, chi: int, e: float, lam: float, params,
@@ -128,26 +119,24 @@ def next_trip_policy(
     price_bin_probs_fn=None,
     gamma: float = 0.5,
     use_reserve: bool = True,
-    alpha: float = 0.5,
     _ceil_override: float | None = None,
 ) -> float:
     """Departure-aware urgency heuristic.
 
     e_trip  = E[T_trip] · μ · v · ω  — expected energy the next trip consumes (kWh).
     tau     = E[minutes to next departure]  — from backward-recurrence hazard.
-    tau_max = daily maximum of tau.
 
     Demand-scaled ceiling (anchored to the empirically-swept baseline optimum):
         e_daily = E[N_trips] × e_trip    (active params)
         e_ceil  = min(e_max, E_CEIL_BASE × (e_daily / e_daily_ref) ** gamma)
 
-    Target SoC decays from e_ceil (departure far) to e_trip (departure imminent):
-        frac     = (tau / tau_max) ** alpha
-        e_target = e_trip + (e_ceil - e_trip) × frac
-
     Reserve: if use_reserve and e < e_trip, charge at u_max regardless of price.
-    Otherwise: urgency ρ = (e_target − e) / deliverable; charge u_max if F_t(λ) ≤ ρ,
-    u_max/2 in marginal band, else 0.
+
+    Urgency ratio: ρ = (e_ceil − e) / deliverable, where
+        deliverable = u_max · η_c · ω · τ  (max kWh chargeable before departure).
+    ρ rises naturally as τ shrinks — no separate target interpolation needed.
+
+    Charge u_max if F_t(λ) ≤ ρ, u_max/2 in marginal band (±1/τ), else 0.
     """
     if chi > 0 and e > params.e_min:
         return 0.0
@@ -167,13 +156,9 @@ def next_trip_policy(
         ratio   = e_daily / ref if ref > 0 else 1.0
         e_ceil  = min(params.e_max, E_CEIL_BASE * ratio ** gamma)
 
-    tau     = minutes_to_departure(t, params)
-    tau_max = max_minutes_to_departure(params)
-    frac     = (min(1.0, tau / tau_max) if tau_max > 0 else 1.0) ** alpha
-    e_target = e_trip + (e_ceil - e_trip) * frac
-
+    tau         = minutes_to_departure(t, params)
     deliverable = params.u_max * params.eta_c * params.omega * tau
-    rho = min(1.0, max(0.0, e_target - e) / deliverable) if deliverable > 0 else 1.0
+    rho = min(1.0, max(0.0, e_ceil - e) / deliverable) if deliverable > 0 else 1.0
 
     probs    = price_bin_probs(t, params) if price_bin_probs_fn is None else price_bin_probs_fn(t)
     lam_grid = np.array([(j + 0.5) * params.lambda_max / params.K for j in range(params.K)])
@@ -188,7 +173,7 @@ def next_trip_policy(
 
 def policy_registry(params, pbp_fn, *, pi, actions, e_grid,
                     low_threshold=None, high_threshold=None, soc_threshold=None,
-                    du_gamma=0.5, du_use_reserve=True, du_alpha=0.5):
+                    du_gamma=0.5, du_use_reserve=True):
     """Ordered ``(name, policy_fn, kwargs)`` for every benchmark policy (POLICY_ORDER).
 
     Single source of truth for the policy set compared everywhere (sensitivity
@@ -205,7 +190,6 @@ def policy_registry(params, pbp_fn, *, pi, actions, e_grid,
         price_bin_probs_fn=pbp_fn,
         gamma=du_gamma,
         use_reserve=du_use_reserve,
-        alpha=du_alpha,
     )
     entries = [
         ("Backward Induction",    backward_induction_policy, dict(pi=pi, actions=actions, e_grid=e_grid)),

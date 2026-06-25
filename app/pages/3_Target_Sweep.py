@@ -44,19 +44,18 @@ st.subheader("Fixed policy settings")
 st.caption("Reserve and α are held constant across the sweep — only the ceiling moves.")
 
 use_reserve = bool(st.session_state.get("du_use_reserve", True))
-alpha       = float(st.session_state.get("du_alpha", 0.5))
 
 from ev_mdt.models.common.model_utils import expected_trip_minutes as _etm
 _e_trip_kwh = _etm(params) * params.mu * params.v * params.omega
 
 st.caption(
     f"Reserve floor = e_trip = **{_e_trip_kwh:.3f} kWh** "
-    f"({'active' if use_reserve else 'disabled'}),  α = {alpha:.2f}  — configure in Settings."
+    f"({'active' if use_reserve else 'disabled'}) — configure in Settings."
 )
 
 # ── Run sweep ─────────────────────────────────────────────────────────────────
 
-_sweep_key = (n_rollouts, step_kwh, int(seed), chi0, use_reserve, alpha, _solved_model)
+_sweep_key = (n_rollouts, step_kwh, int(seed), chi0, use_reserve, _solved_model)
 
 if st.session_state.get("_sweep_key") != _sweep_key:
     _prog = st.progress(0.0, text="Running sweep…")
@@ -69,7 +68,6 @@ if st.session_state.get("_sweep_key") != _sweep_key:
         N_rollouts=n_rollouts,
         seed=int(seed),
         step_kwh=step_kwh,
-        alpha=alpha,
         progress_cb=_progress_cb,
     )
     _prog.empty()

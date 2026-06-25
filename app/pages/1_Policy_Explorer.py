@@ -137,7 +137,6 @@ _chart(
         soc_threshold=params.e_max * 0.25,
         du_gamma=st.session_state.get("du_gamma", 0.5),
         du_use_reserve=st.session_state.get("du_use_reserve", True),
-        du_alpha=st.session_state.get("du_alpha", 0.5),
         time_bin_min=st.session_state.get("time_bin", 10),
         battery_bin_kwh=st.session_state.get("bat_bin", 1.0),
     ),

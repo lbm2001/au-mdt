@@ -219,16 +219,6 @@ with _du_col1:
     )
     st.session_state["du_gamma"] = _gamma
 
-    du_alpha = st.slider(
-        "Decay exponent α",
-        min_value=0.1, max_value=1.0,
-        value=float(st.session_state.get("du_alpha", 0.5)),
-        step=0.05, format="%.2f",
-        help="e_target = e_trip + (e_ceil − e_trip) · (τ/τ_max)^α. "
-             "α=1 → linear decay; α<1 → target rises quickly from e_trip then flattens.",
-    )
-    st.session_state["du_alpha"] = du_alpha
-
     # Live preview of the ceiling computation using current (or default) params
     class _FakeParams:
         p_pd_morning = st.session_state.get("p_pd_morning", _DEFAULTS["p_pd_morning"])

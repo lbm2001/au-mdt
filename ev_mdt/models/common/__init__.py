@@ -8,5 +8,5 @@ from ev_mdt.models.common.rollout_utils import (
 from ev_mdt.models.common.policies import (
     actual_charge_rate, backward_induction_policy, maximal_charging_policy,
     price_oriented_policy, night_charging_policy, minimum_soc_policy,
-    always_minimum_policy, random_policy, dp_heuristic_policy, next_trip_policy,
+    always_minimum_policy, random_policy, dp_heuristic_policy, next_trip_policy, next_trip_policy_simple_tau,
 )

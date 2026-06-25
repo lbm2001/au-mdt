@@ -2,7 +2,7 @@
 import numpy as np
 
 from ev_mdt.models.common.model_utils import (
-    minutes_to_departure, price_bin, price_bin_probs,
+    departure_prob, minutes_to_departure, price_bin, price_bin_probs,
 )
 
 
@@ -147,6 +147,38 @@ def next_trip_policy(
     return float(params.u_max * sigma)
 
 
+def next_trip_policy_simple_tau(
+    t: int, chi: int, e: float, lam: float, params,
+    *, price_bin_probs_fn=None, reserve_frac=0.25, target_frac=0.60, kappa=float("inf"),
+) -> float:
+    """Like next_trip_policy but uses τ_t = 1/p_t^{P→D} (instantaneous rate inverse)
+    instead of the full Gauss-Seidel forward expectation."""
+    if chi > 0 and e > params.e_min:
+        return 0.0
+    if e >= params.e_max:
+        return 0.0
+
+    e_reserve = reserve_frac * params.e_max
+    if e < e_reserve:
+        return float(params.u_max)
+
+    e_target = max(e_reserve, target_frac * params.e_max)
+    p_dep = departure_prob(t, params)
+    slots = 1.0 / p_dep if p_dep > 0 else float("inf")
+    deliverable = params.u_max * params.eta_c * params.omega * slots
+    rho = max(0.0, e_target - e) / deliverable if deliverable > 0 else np.inf
+
+    probs    = price_bin_probs(t, params) if price_bin_probs_fn is None else price_bin_probs_fn(t)
+    lam_grid = np.array([(j + 0.5) * params.lambda_max / params.K for j in range(params.K)])
+    F_p      = float(probs[lam_grid <= lam].sum())
+
+    gap = rho - F_p
+    if not np.isfinite(kappa):
+        return float(params.u_max) if gap >= 0.0 else 0.0
+    sigma = 1.0 / (1.0 + np.exp(-kappa * np.clip(gap, -50.0, 50.0)))
+    return float(params.u_max * sigma)
+
+
 def policy_registry(params, pbp_fn, *, pi, actions, e_grid,
                     low_threshold=None, high_threshold=None, soc_threshold=None):
     """Ordered ``(name, policy_fn, kwargs)`` for every benchmark policy (POLICY_ORDER).
@@ -162,7 +194,8 @@ def policy_registry(params, pbp_fn, *, pi, actions, e_grid,
     return [
         ("Backward Induction",    backward_induction_policy, dict(pi=pi, actions=actions, e_grid=e_grid)),
         ("DP-Heuristic",          dp_heuristic_policy,       dict(price_bin_probs_fn=pbp_fn)),
-        ("Next-Trip Urgency",     next_trip_policy,          dict(price_bin_probs_fn=pbp_fn)),
+        ("Next-Trip Urgency",     next_trip_policy,            dict(price_bin_probs_fn=pbp_fn)),
+        ("Next-Trip (Simple τ)",  next_trip_policy_simple_tau, dict(price_bin_probs_fn=pbp_fn)),
         ("Price-Oriented",        price_oriented_policy,     dict(low_threshold=low, high_threshold=high)),
         ("Night Charging",        night_charging_policy,     {}),
         ("Always-Maximum",        maximal_charging_policy,   {}),

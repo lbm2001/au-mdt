@@ -22,6 +22,7 @@ def _du_e_daily(params) -> float:
     e_trip_min = expected_trip_minutes(params)
     mean_tau   = mean_minutes_to_departure(params)
     n_trips    = 1440.0 / (mean_tau + e_trip_min) if (mean_tau + e_trip_min) > 0 else 0.0
+    # μ·v·ω cancels in e_daily/e_daily_ref; kept here so the return value is interpretable as kWh.
     return n_trips * e_trip_min * params.mu * params.v * params.omega
 
 

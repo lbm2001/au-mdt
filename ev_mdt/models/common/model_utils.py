@@ -150,11 +150,16 @@ def minutes_to_departure(t: int, params) -> float:
     return table[t % 1440]
 
 
+@lru_cache(maxsize=8)
+def _max_tau(p_morning: float, p_lunch: float, p_evening: float, p_default: float) -> float:
+    """Maximum of τ(t) over all 1440 minutes, computed once per parameter set."""
+    return max(_tau_table(p_morning, p_lunch, p_evening, p_default))
+
+
 def max_minutes_to_departure(params) -> float:
     """Maximum of τ(t) over all minutes of the day — the quietest off-peak value."""
-    table = _tau_table(params.p_pd_morning, params.p_pd_lunch,
-                       params.p_pd_evening, params.p_pd_default)
-    return max(table)
+    return _max_tau(params.p_pd_morning, params.p_pd_lunch,
+                    params.p_pd_evening, params.p_pd_default)
 
 
 @lru_cache(maxsize=8)

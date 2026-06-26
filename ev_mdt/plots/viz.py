@@ -13,8 +13,8 @@ def rgba(color: str, alpha: float) -> str:
 
 POLICY_ORDER = [
     "Backward Induction",
-    "Battery Level Urgency",
     "Departure Urgency",
+    "Battery Level Urgency",
     "Price-Oriented",
     "Night Charging",
     "Always-Maximum",

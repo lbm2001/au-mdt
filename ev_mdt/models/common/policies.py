@@ -12,6 +12,20 @@ from ev_mdt.models.common.model_utils import (
 # Baseline params; carried as a module-level constant so the policy is param-free.
 E_CEIL_BASE: float = 25.0
 
+# Best ceiling-scaling exponent γ per mobility model, from `gamma-sweep` (N=1000).
+# At Baseline the demand ratio is 1, so γ is irrelevant there (e_ceil ≡ E_CEIL_BASE);
+# γ only shapes the ceiling for the NegBin models via (e_daily / e_daily_ref) ** γ.
+DU_GAMMA_BASELINE:       float = 0.1
+DU_GAMMA_NEGBIN_FIXED:   float = 0.1  # TODO: set from gamma-sweep (NegBin fixed k=5)
+DU_GAMMA_NEGBIN_POISSON: float = 0.4   # TODO: set from gamma-sweep (NegBin Poisson k=5)
+
+
+def du_gamma_for_params(params) -> float:
+    """Resolve the per-model DU γ from the params type (NegBin fixed vs Poisson vs Baseline)."""
+    if not hasattr(params, "q"):
+        return DU_GAMMA_BASELINE
+    return DU_GAMMA_NEGBIN_POISSON if params.lambda_k is not None else DU_GAMMA_NEGBIN_FIXED
+
 
 def _du_e_daily(params) -> float:
     """Expected daily energy demand (kWh) for the given mobility params.
@@ -173,7 +187,7 @@ def next_trip_policy(
 
 def policy_registry(params, pbp_fn, *, pi, actions, e_grid,
                     low_threshold=None, high_threshold=None, soc_threshold=None,
-                    du_gamma=0.5, du_use_reserve=True):
+                    du_gamma=None, du_use_reserve=True):
     """Ordered ``(name, policy_fn, kwargs)`` for every benchmark policy (POLICY_ORDER).
 
     Single source of truth for the policy set compared everywhere (sensitivity
@@ -182,13 +196,14 @@ def policy_registry(params, pbp_fn, *, pi, actions, e_grid,
     soc = params.e_max * 0.25.
 
     du_* kwargs control the Departure Urgency policy shown in all pages.
+    ``du_gamma=None`` auto-selects the per-model γ via ``du_gamma_for_params``.
     """
     low  = params.price_night   if low_threshold  is None else low_threshold
     high = params.price_evening if high_threshold is None else high_threshold
     soc  = params.e_max * 0.25  if soc_threshold  is None else soc_threshold
     du_kw = dict(
         price_bin_probs_fn=pbp_fn,
-        gamma=du_gamma,
+        gamma=du_gamma_for_params(params) if du_gamma is None else du_gamma,
         use_reserve=du_use_reserve,
     )
     entries = [

@@ -13,7 +13,9 @@ from ev_mdt.models.common.model_utils import (
     expected_trip_minutes, max_minutes_to_departure,
     mean_minutes_to_departure, minutes_to_departure,
 )
-from ev_mdt.models.common.policies import E_CEIL_BASE, _du_e_daily, _e_daily_ref
+from ev_mdt.models.common.policies import (
+    E_CEIL_BASE, _du_e_daily, _e_daily_ref, du_gamma_for_params,
+)
 from ev_mdt.plots.viz import POLICY_COLORS, POLICY_ORDER, rgba as _rgba
 
 
@@ -81,8 +83,10 @@ def _charge_battery_ceiling(pi, actions, e_grid, t: int) -> np.ndarray:
                     e_grid[np.clip(top_e, 0, len(e_grid) - 1)], np.nan)
 
 
-def _du_e_ceil(params, gamma: float) -> float:
-    """Demand-scaled DU ceiling for the given params and gamma."""
+def _du_e_ceil(params, gamma=None) -> float:
+    """Demand-scaled DU ceiling for the given params and gamma (None → per-model γ)."""
+    if gamma is None:
+        gamma = du_gamma_for_params(params)
     e_daily = _du_e_daily(params)
     ref     = _e_daily_ref()
     ratio   = e_daily / ref if ref > 0 else 1.0
@@ -90,8 +94,8 @@ def _du_e_ceil(params, gamma: float) -> float:
 
 
 def _du_rates_averaged(params, pbp_fn, T: int, e_grid, lam_grid, chi: int = 0,
-                       gamma: float = 0.5, use_reserve: bool = True) -> np.ndarray:
-    """Price-averaged Departure Urgency charge rate u_DU(t, e)."""
+                       gamma=None, use_reserve: bool = True) -> np.ndarray:
+    """Price-averaged Departure Urgency charge rate u_DU(t, e) (gamma None → per-model γ)."""
     e_trip  = expected_trip_minutes(params) * params.mu * params.v * params.omega
     e_ceil  = _du_e_ceil(params, gamma)
 
@@ -124,8 +128,8 @@ def _du_rates_averaged(params, pbp_fn, T: int, e_grid, lam_grid, chi: int = 0,
 
 
 def _du_charge_battery_ceiling(params, pbp_fn, e_grid, t: int,
-                                gamma: float = 0.5, use_reserve: bool = True) -> np.ndarray:
-    """(K,) highest battery level at which DU policy still charges at each price bin at time t."""
+                                gamma=None, use_reserve: bool = True) -> np.ndarray:
+    """(K,) highest battery at which DU still charges per price bin at t (gamma None → per-model γ)."""
     probs   = np.asarray(pbp_fn(t))                                # (K,)
     tau     = minutes_to_departure(t, params)
     e_trip  = expected_trip_minutes(params) * params.mu * params.v * params.omega
@@ -355,14 +359,15 @@ def _add_stacked_cost_bars(fig, xs, totals, charge, penalty, color, name, errs, 
 
     On a log axis the segment boundary is placed so the *visual* split equals the
     charging/penalty proportion (e.g. 25/75 → bottom ¼ charging, top ¾ penalty);
-    charging is drawn in a lighter shade, penalty in the full policy colour.
+    charging is the full solid policy colour, penalty is a 50%-saturated fill of the
+    same colour hatched (gestreift) with diagonal stripes in the full colour.
     """
     totals  = np.asarray(totals,  float)
     charge  = np.asarray(charge,  float)
     penalty = np.asarray(penalty, float)
     safe    = np.where(totals > 0, totals, 1.0)
     frac_c  = np.clip(charge / safe, 0.0, 1.0)                       # charging share
-    light   = _rgba(color, 0.40)
+    pen_fill = _rgba(color, 0.50)                                   # penalty fill (50%)
 
     if log_y:
         tot = np.where(totals > y0, totals, y0)
@@ -376,32 +381,35 @@ def _add_stacked_cost_bars(fig, xs, totals, charge, penalty, color, name, errs, 
     pct_c = (frac_c * 100)
     pct_p = (100 - pct_c)
     pos = dict(row=row, col=col) if row is not None else {}
+    # Charging share: full solid policy colour.
     fig.add_trace(go.Bar(
         x=xs, base=charge_base, y=charge_len, name=name, legendgroup=name,
-        marker_color=light, showlegend=False, offsetgroup=offsetgroup,
+        marker_color=color, showlegend=showlegend, offsetgroup=offsetgroup,
         customdata=np.stack([charge, pct_c], axis=-1),
         hovertemplate="%{x}<br>charging %{customdata[0]:.3f} € (%{customdata[1]:.0f}%)"
                       f"<extra>{name}</extra>",
     ), **pos)
+    # Penalty share: 50%-saturated fill, diagonal hatch (gestreift) in the full colour.
     fig.add_trace(go.Bar(
         x=xs, base=pen_base, y=pen_len, name=name, legendgroup=name,
-        marker_color=color, showlegend=showlegend, offsetgroup=offsetgroup,
-        error_y=dict(type="data", array=errs, visible=True, thickness=1.2, width=4),
+        marker=dict(color=pen_fill, pattern=dict(shape="/", fgcolor=color,
+                                                 size=8, solidity=0.42)),
+        showlegend=False, offsetgroup=offsetgroup,
         customdata=np.stack([totals, penalty, pct_p], axis=-1),
         hovertemplate="%{x}<br>total %{customdata[0]:.3f} €<br>"
                       "penalty %{customdata[1]:.3f} € (%{customdata[2]:.0f}%)"
                       f"<extra>{name}</extra>",
     ), **pos)
-
-
-def _add_cost_split_key(fig) -> None:
-    """Two neutral legend swatches documenting the lighter=charging / solid=penalty split."""
-    for color, label in ((_rgba("#777777", 0.40), "charging share (lighter)"),
-                         ("#777777", "penalty share (solid)")):
-        fig.add_trace(go.Bar(
-            x=[None], y=[None], marker_color=color, name=label,
-            legendgroup="_split_key", showlegend=True, hoverinfo="skip",
-        ))
+    # Error bars (±SEM/Std on total): carried by a transparent full-height bar so the
+    # whisker is centred at the *total* (Plotly centres error_y at the bar's y-length,
+    # which for the based segments above would land mid-bar). Same offsetgroup keeps it
+    # aligned within the policy's grouped slot.
+    fig.add_trace(go.Bar(
+        x=xs, y=totals, offsetgroup=offsetgroup, legendgroup=name,
+        marker=dict(color="rgba(0,0,0,0)"), showlegend=False, hoverinfo="skip",
+        error_y=dict(type="data", array=errs, visible=True, thickness=1.2, width=4,
+                     color="#333333"),
+    ), **pos)
 
 
 def fig_cost_distribution(results: list[dict], log_y: bool = True,
@@ -433,11 +441,11 @@ def fig_cost_distribution(results: list[dict], log_y: bool = True,
                                POLICY_COLORS[policy], policy, errs,
                                log_y=log_y, y0=y0, offsetgroup=policy)
 
-    _add_cost_split_key(fig)
     yaxis = dict(title="Mean cost (€)" + ("  [log]" if log_y else ""),
                  type="log" if log_y else "linear")
     if log_y:
         yaxis["range"] = [np.log10(y0), np.log10(all_totals.max() * 1.4)]
+        yaxis["dtick"] = 1          # decade ticks only: 0.1, 1, 10, …
     fig.update_layout(
         template="plotly_white",
         plot_bgcolor="white",
@@ -445,7 +453,7 @@ def fig_cost_distribution(results: list[dict], log_y: bool = True,
         barmode="group", yaxis=yaxis, height=440,
         margin=dict(l=80, r=20, t=40, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
-                    font=dict(size=14), itemsizing="constant"),
+                    font=dict(size=11), itemsizing="constant"),
     )
     return fig
 
@@ -456,6 +464,8 @@ SUMMARY_METRIC_FORMATS = {
     "Mean cost (€)":             "{:.3f}",
     "SEM cost (€)":              "{:.3f}",
     "Std cost (€)":              "{:.3f}",
+    "Mean charging (€)":         "{:.3f}",
+    "Mean penalty (€)":          "{:.3f}",
     "Mean penalty min":          "{:.1f}",
     "% scenarios with penalty":  "{:.1f}%",
     "Mean energy charged (kWh)": "{:.2f}",
@@ -463,16 +473,24 @@ SUMMARY_METRIC_FORMATS = {
 
 
 def _cost_summary(mlist: list[dict]) -> dict:
-    """The six per-policy summary metrics from a list of per-rollout metric dicts."""
-    costs  = np.array([m["Total cost (€)"]      for m in mlist])
-    pen    = np.array([m["Penalty minutes"]      for m in mlist])
-    energy = np.array([m["Energy charged (kWh)"] for m in mlist])
+    """Per-policy summary metrics from a list of per-rollout metric dicts.
+
+    Includes the charging-€ / penalty-€ split so the stacked cost bars can be
+    rebuilt from the saved CSV without re-running the rollouts.
+    """
+    costs   = np.array([m["Total cost (€)"]      for m in mlist])
+    charge  = np.array([m["Charging cost (€)"]   for m in mlist])
+    pencost = np.array([m["Penalty cost (€)"]    for m in mlist])
+    pen     = np.array([m["Penalty minutes"]      for m in mlist])
+    energy  = np.array([m["Energy charged (kWh)"] for m in mlist])
     n  = len(costs)
     sd = float(costs.std(ddof=1)) if n > 1 else 0.0
     return {
         "Mean cost (€)":             float(costs.mean()),
         "SEM cost (€)":              sd / np.sqrt(n) if n > 0 else 0.0,
         "Std cost (€)":              sd,
+        "Mean charging (€)":         float(charge.mean()),
+        "Mean penalty (€)":          float(pencost.mean()),
         "Mean penalty min":          float(pen.mean()),
         "% scenarios with penalty":  float((pen > 0).mean() * 100),
         "Mean energy charged (kWh)": float(energy.mean()),
@@ -509,21 +527,24 @@ def fig_baseline_cost(full: dict, *, error: str = "sem", log_y: bool = True) -> 
 
     fig = go.Figure()
     for i, name in enumerate(names):
+        # Shared offsetgroup → one slot per policy category so bars stay full-width
+        # (a unique offsetgroup per policy would split each category into len(names) slots).
         _add_stacked_cost_bars(fig, [name], [totals[i]], [charge[i]], [penalty[i]],
                                POLICY_COLORS[name], name, [errs[i]],
-                               log_y=log_y, y0=y0, offsetgroup=name)
-    _add_cost_split_key(fig)
+                               log_y=log_y, y0=y0, offsetgroup="cost")
     yaxis = dict(title="Mean cost (€)" + ("  [log]" if log_y else ""),
                  type="log" if log_y else "linear")
     if log_y:
         yaxis["range"] = [np.log10(y0), np.log10(totals_arr.max() * 1.4)]
+        yaxis["dtick"] = 1          # decade ticks only: 0.1, 1, 10, …
     fig.update_layout(
         template="plotly_white",
         plot_bgcolor="white",
         paper_bgcolor="white",
         yaxis=yaxis,
         xaxis_title="Policy", height=460, margin=dict(l=40, r=20, t=20, b=110),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
+                    font=dict(size=11), itemsizing="constant"),
     )
     fig.update_xaxes(categoryorder="array", categoryarray=POLICY_ORDER)
     return fig
@@ -719,7 +740,7 @@ def _baseline_policy_rates(
         return np.where(e_grid[np.newaxis, :] >= params.e_max, 0.0, rate)
 
     if name == "Departure Urgency":
-        gamma       = kwargs.get("gamma",       0.5)
+        gamma       = kwargs.get("gamma", None)        # None → per-model γ
         use_reserve = kwargs.get("use_reserve", True)
         e_trip      = expected_trip_minutes(params) * params.mu * params.v * params.omega
         e_ceil      = _du_e_ceil(params, gamma)
@@ -754,7 +775,7 @@ def fig_baseline_policy_heatmaps(
     low_threshold: float | None = None,
     high_threshold: float | None = None,
     soc_threshold: float | None = None,
-    du_gamma: float = 0.5,
+    du_gamma=None,
     du_use_reserve: bool = True,
     time_bin_min: int = 10,
     battery_bin_kwh: float = 1.0,
@@ -764,10 +785,12 @@ def fig_baseline_policy_heatmaps(
     Accepts the same grid/param args as the other sensitivity figure factories
     so the app can pass session-state data directly. ``pi`` and ``actions`` are
     accepted (and forwarded to ``policy_registry``) but only used to generate
-    the registry — BI is dropped from the grid.
+    the registry — BI is dropped from the grid. ``du_gamma=None`` → per-model γ.
     """
     from ev_mdt.models.common.policies import policy_registry
 
+    if du_gamma is None:
+        du_gamma = du_gamma_for_params(params)
     registry = policy_registry(
         params, pbp_fn,
         pi=pi, actions=actions, e_grid=e_grid,
@@ -782,18 +805,11 @@ def fig_baseline_policy_heatmaps(
     probs  = np.array([pbp_fn(t) for t in range(T)])   # (T, K)
     cumsum = probs.cumsum(axis=1)                        # (T, K)
 
-    def _du_subtitle(name: str) -> str:
-        if name != "Departure Urgency":
-            return name
-        e_ceil_kwh = _du_e_ceil(params, du_gamma)
-        reserve_str = f"reserve=e_trip" if du_use_reserve else "no reserve"
-        return f"Departure Urgency  [ceil {e_ceil_kwh:.1f} kWh (γ={du_gamma:.2f}), {reserve_str}]"
-
     ncols  = 2
     nrows  = int(np.ceil(len(policies) / ncols))
     fig = make_subplots(
         rows=nrows, cols=ncols,
-        subplot_titles=[_du_subtitle(name) for name, _, _ in policies],
+        subplot_titles=[name for name, _, _ in policies],
         horizontal_spacing=0.10,
         vertical_spacing=0.10,
     )

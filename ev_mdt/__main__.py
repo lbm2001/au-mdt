@@ -9,10 +9,21 @@ Usage
     python -m ev_mdt prices [--n-days 1000] [--season all] [--daytype all]
                             [--seed 42] [--out-dir figures/]
 
-`run --all` writes figures to <out-dir>/figures_app/ and summary tables to <out-dir>/tables/.
+`run --all` writes figures to <out-dir>/<timestamp>/figures_app/ and summary tables to
+<out-dir>/<timestamp>/tables/. Pass --no-timestamp to write straight into <out-dir>.
 """
 import argparse
 import sys
+
+
+def _timestamped_dir(base, *, enabled: bool = True):
+    """Append a ``YYYY-MM-DD_HHMMSS`` run folder to ``base`` (unless disabled)."""
+    from pathlib import Path
+    base = Path(base)
+    if not enabled:
+        return base
+    from datetime import datetime
+    return base / datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
 
 def _add_solve_args(parser: argparse.ArgumentParser) -> None:
@@ -55,14 +66,14 @@ def cmd_run(args: argparse.Namespace) -> None:
     import itertools
     import threading
     import time
-    from pathlib import Path
     from tqdm import tqdm
     from ev_mdt.analysis.sensitivity import (
         run_all_sweeps, save_figures, save_tables, ALL_SWEEP_NAMES,
     )
 
-    figures_dir = Path(args.out_dir) / "figures_app"
-    tables_dir  = Path(args.out_dir) / "tables"
+    base_dir    = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
+    figures_dir = base_dir / "figures_app"
+    tables_dir  = base_dir / "tables"
 
     # ── Exact-cost mode: analytical expected BI cost per scenario (no rollouts) ─
     if args.exact_cost:
@@ -205,12 +216,11 @@ def cmd_run(args: argparse.Namespace) -> None:
 
 
 def cmd_target_sweep(args: argparse.Namespace) -> None:
-    from pathlib import Path
     from tqdm import tqdm
     from ev_mdt.analysis.sensitivity import sweep_target_ceiling
     from ev_mdt.plots.sensitivity import figure_to_png
 
-    out_dir = Path(args.out_dir)
+    out_dir = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows = sweep_target_ceiling(
@@ -286,7 +296,6 @@ def cmd_target_sweep(args: argparse.Namespace) -> None:
 
 
 def cmd_gamma_sweep(args: argparse.Namespace) -> None:
-    from pathlib import Path
     import pandas as pd
     from tqdm import tqdm
     from plotly.subplots import make_subplots
@@ -294,7 +303,7 @@ def cmd_gamma_sweep(args: argparse.Namespace) -> None:
     from ev_mdt.analysis.sensitivity import sweep_gamma
     from ev_mdt.plots.sensitivity import figure_to_png
 
-    out_dir = Path(args.out_dir)
+    out_dir = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     results = sweep_gamma(
@@ -371,7 +380,6 @@ def cmd_gamma_sweep(args: argparse.Namespace) -> None:
 
 
 def cmd_prices(args: argparse.Namespace) -> None:
-    from pathlib import Path
     from tqdm import tqdm
     from ev_mdt.pricing.entsoe import load_prices
     from ev_mdt.analysis.prices import fit_samplers, simulate_price_paths, price_figures
@@ -404,7 +412,7 @@ def cmd_prices(args: argparse.Namespace) -> None:
     for name, prices in results.items():
         print(f"  {name:<30}  mean = {prices.mean():.4f} €/kWh")
 
-    out_dir = Path(args.out_dir) / "price_explorer"
+    out_dir = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp) / "price_explorer"
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
         from ev_mdt.plots.sensitivity import figure_to_png
@@ -452,7 +460,9 @@ def main() -> None:
                        help="Battery grid points")
     p_run.add_argument("--seed",          type=int, default=42,  help="Base random seed")
     p_run.add_argument("--out-dir",       default="export",
-                       help="Export base dir (figures → <dir>/figures_app, tables → <dir>/tables)")
+                       help="Export base dir; outputs go under <dir>/<timestamp>/{figures_app,tables}")
+    p_run.add_argument("--no-timestamp",  action="store_true",
+                       help="Write directly to --out-dir instead of a timestamped subfolder")
     p_run.add_argument("--wandb",         action="store_true",   help="Log results and figures to Weights & Biases")
     p_run.add_argument("--wandb-project", default="au-mdt",      help="W&B project name")
     p_run.add_argument("--wandb-run",     default="",            help="W&B run name (auto if omitted)")
@@ -467,7 +477,9 @@ def main() -> None:
     p_ts.add_argument("--step",        type=float, default=5.0,   metavar="kWh",
                       help="Target ceiling step size in kWh")
     p_ts.add_argument("--out-dir",     default="export/target_sweep",
-                      help="Output directory for CSV and PNG")
+                      help="Output base dir; outputs go under <dir>/<timestamp>/")
+    p_ts.add_argument("--no-timestamp", action="store_true",
+                      help="Write directly to --out-dir instead of a timestamped subfolder")
 
     # gamma-sweep
     p_gs = sub.add_parser("gamma-sweep",
@@ -475,7 +487,10 @@ def main() -> None:
     p_gs.add_argument("--N-rollouts",  type=int,   default=500,   metavar="N")
     p_gs.add_argument("--seed",        type=int,   default=42)
     p_gs.add_argument("--no-reserve",  action="store_true")
-    p_gs.add_argument("--out-dir",     default="export/gamma_sweep")
+    p_gs.add_argument("--out-dir",     default="export/gamma_sweep",
+                      help="Output base dir; outputs go under <dir>/<timestamp>/")
+    p_gs.add_argument("--no-timestamp", action="store_true",
+                      help="Write directly to --out-dir instead of a timestamped subfolder")
 
     # prices
     p_prices = sub.add_parser("prices", help="Fit price models and simulate diurnal profiles")
@@ -485,7 +500,10 @@ def main() -> None:
     p_prices.add_argument("--daytype", default="all",
                           choices=["all", "weekday", "weekend"])
     p_prices.add_argument("--seed",    type=int,   default=42,   help="Random seed")
-    p_prices.add_argument("--out-dir", default="figures/",       help="Output directory for PNGs")
+    p_prices.add_argument("--out-dir", default="figures/",
+                          help="Output base dir; outputs go under <dir>/<timestamp>/price_explorer/")
+    p_prices.add_argument("--no-timestamp", action="store_true",
+                          help="Write directly to --out-dir instead of a timestamped subfolder")
 
     args = parser.parse_args()
 

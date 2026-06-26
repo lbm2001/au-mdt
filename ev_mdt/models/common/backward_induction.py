@@ -136,6 +136,7 @@ def evaluate_policy(
     N_e: int,
     beta: float | None = None,
     consumption_fn: Callable[[int], float] | None = None,
+    progress_desc: str | None = None,
 ):
     """Exact policy evaluation: expected cost-to-go Jπ for a fixed deterministic policy.
 
@@ -144,6 +145,9 @@ def evaluate_policy(
     driving/battery-floor gating is applied here, exactly as in the solver). With
     ``beta=1`` this yields the expected *undiscounted* total cost, matching the
     undiscounted cost summed in the Monte-Carlo rollouts.
+
+    Pass ``progress_desc`` to show a per-timestep tqdm bar over the T backward
+    steps (useful since each step calls a potentially slow scalar ``action_fn``).
 
     Returns Jπ of shape (T+1, n_chi, N_e, K).
     """
@@ -158,7 +162,12 @@ def evaluate_policy(
     all_p_next = np.array([price_bin_probs_fn(t + 1) for t in range(T)])
     E = e_grid[:, np.newaxis]    # (N_e, 1)
 
-    for t in range(T - 1, -1, -1):
+    steps = range(T - 1, -1, -1)
+    if progress_desc is not None:
+        from tqdm import tqdm
+        steps = tqdm(steps, total=T, desc=progress_desc, unit="step",
+                     position=3, leave=False)
+    for t in steps:
         P     = transition_matrix_fn(t)
         J_bar = J[t + 1] @ all_p_next[t]       # (n_chi, N_e)
 

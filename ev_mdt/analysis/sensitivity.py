@@ -43,8 +43,15 @@ from ev_mdt.models.baseline.model import transition_matrix as _baseline_tm
 from ev_mdt.models.baseline.rollout import simulate_policy_rollout as _baseline_rollout
 from ev_mdt.models.negbin.model import transition_matrix as _negbin_tm
 from ev_mdt.models.negbin.rollout import simulate_policy_rollout as _negbin_rollout
-from ev_mdt.models.common.model_utils import price_bin_probs as _gaussian_pbp, mean_price
-from ev_mdt.models.common.policies import backward_induction_policy, policy_registry
+from ev_mdt.models.common.model_utils import (
+    price_bin_probs as _gaussian_pbp, mean_price,
+    expected_trip_minutes as _expected_trip_minutes,
+    minutes_to_departure as _minutes_to_departure,
+)
+from ev_mdt.models.common.policies import (
+    backward_induction_policy, policy_registry, du_gamma_for_params,
+    _du_e_daily, _e_daily_ref, E_CEIL_BASE,
+)
 from ev_mdt.models.common.rollout_utils import rollout_metrics, run_policies
 from ev_mdt.plots.viz import POLICY_ORDER
 
@@ -127,7 +134,76 @@ def bi_expected_cost(result: dict, beta: float = 1.0) -> float:
     return float(np.mean(Jpi[0, 0] @ np.asarray(pbp_fn(0))))
 
 
-def policy_expected_cost(result: dict, policy_fn, beta: float = 1.0, **kwargs) -> float:
+def _du_e_ceil(params, gamma: float | None = None) -> float:
+    """Demand-scaled DU ceiling (matches policies.next_trip_policy)."""
+    if gamma is None:
+        gamma = du_gamma_for_params(params)
+    ref   = _e_daily_ref()
+    ratio = _du_e_daily(params) / ref if ref > 0 else 1.0
+    return min(params.e_max, E_CEIL_BASE * ratio ** gamma)
+
+
+def _vectorized_action_grid(name: str, kwargs: dict, e_grid, lam_grid, params,
+                            T: int, probs, cumsum):
+    """(T, N_e, K) desired chi=0 charge rates for a benchmark policy, fully
+    vectorised — the λ-resolved counterpart of the per-cell scalar policy.
+
+    Returns ``None`` for policies without a vectorised form (the caller then
+    falls back to the scalar wrapper). The driving / battery-floor gate is
+    applied inside ``evaluate_policy``, exactly as for the scalar action_fn.
+    """
+    N_e, K = len(e_grid), len(lam_grid)
+    u_max, e_max = params.u_max, params.e_max
+
+    if name == "Always-Maximum":
+        return np.full((T, N_e, K), u_max)
+    if name == "Always-Minimum":
+        return np.full((T, N_e, K), params.u_min)
+    if name == "Night Charging":
+        rate_t = np.where(np.arange(T) % 1440 < 360, u_max, 0.0)
+        return np.broadcast_to(rate_t[:, None, None], (T, N_e, K)).copy()
+    if name == "Minimum Battery Level":
+        rate_e = np.where(e_grid < kwargs["soc_threshold"], u_max, 0.0)
+        return np.broadcast_to(rate_e[None, :, None], (T, N_e, K)).copy()
+    if name == "Price-Oriented":
+        low, high = kwargs["low_threshold"], kwargs["high_threshold"]
+        rate_k = np.where(lam_grid <= low, u_max,
+                          np.where(lam_grid <= high, u_max / 2, 0.0))
+        return np.broadcast_to(rate_k[None, None, :], (T, N_e, K)).copy()
+
+    if name == "Battery Level Urgency":
+        thresh = np.clip(1.0 - e_grid / e_max, 0.0, 1.0)              # (N_e,)
+        mask = cumsum[:, None, :] <= thresh[None, :, None]           # (T, N_e, K)
+        rate = np.where(mask, u_max, 0.0)
+        return np.where(e_grid[None, :, None] >= e_max, 0.0, rate)
+
+    if name == "Departure Urgency":
+        gamma       = kwargs.get("gamma", None)
+        use_reserve = kwargs.get("use_reserve", True)
+        e_trip = _expected_trip_minutes(params) * params.mu * params.v * params.omega
+        e_ceil = _du_e_ceil(params, gamma)
+
+        slots       = np.array([_minutes_to_departure(t, params) for t in range(T)])  # (T,)
+        deliverable = u_max * params.eta_c * params.omega * slots                     # (T,)
+        e_diff      = np.maximum(0.0, e_ceil - e_grid[None, :])                        # (1, N_e)
+        safe_del    = np.where(deliverable > 0, deliverable, 1.0)
+        rho  = np.where(deliverable[:, None] > 0, e_diff / safe_del[:, None], np.inf) # (T, N_e)
+        band = np.where(slots > 0, 1.0 / slots, 0.0)                                  # (T,)
+
+        F   = cumsum[:, None, :]                                      # (T, 1, K)
+        p1  = F <= rho[:, :, None]                                    # (T, N_e, K)
+        p12 = F <= (rho + band[:, None])[:, :, None]
+        rate = np.where(p1, u_max, np.where(p12, u_max / 2, 0.0))
+        if use_reserve:
+            rate = np.where(e_grid[None, :, None] < e_trip, u_max, rate)
+        return np.where(e_grid[None, :, None] >= e_max, 0.0, rate)
+
+    return None
+
+
+def policy_expected_cost(result: dict, policy_fn, beta: float = 1.0,
+                         progress_desc: str | None = None,
+                         name: str | None = None, **kwargs) -> float:
     """Exact expected cost of a scalar benchmark policy for a given configuration.
 
     Equivalent to bi_expected_cost but works for any scalar policy from the registry.
@@ -141,30 +217,56 @@ def policy_expected_cost(result: dict, policy_fn, beta: float = 1.0, **kwargs) -
         tm_fn, n_chi = (lambda t: _baseline_tm(t, params)), 2
     else:
         tm_fn, n_chi = (lambda t: _negbin_tm(t, params)), params.k + 1
-    action_fn = _scalar_policy_to_action_fn(policy_fn, e_grid, lam_grid, params, **kwargs)
+    grid = None
+    if name is not None:
+        probs  = np.array([pbp_fn(t) for t in range(T)])
+        cumsum = probs.cumsum(axis=1)
+        grid = _vectorized_action_grid(name, kwargs, e_grid, lam_grid, params, T, probs, cumsum)
+    if grid is not None:
+        action_fn = lambda t, chi, _g=grid: _g[t]
+    else:
+        action_fn = _scalar_policy_to_action_fn(policy_fn, e_grid, lam_grid, params, **kwargs)
     Jpi = _evaluate_policy(
         params, transition_matrix_fn=tm_fn, price_bin_probs_fn=pbp_fn, n_chi=n_chi,
         action_fn=action_fn, T=T, N_e=len(e_grid), beta=beta,
+        progress_desc=progress_desc,
     )
     return float(np.mean(Jpi[0, 0] @ np.asarray(pbp_fn(0))))
 
 
-def compute_all_exact_costs(result: dict, beta: float = 1.0) -> dict[str, float]:
+def compute_all_exact_costs(result: dict, beta: float = 1.0,
+                            desc: str | None = None) -> dict[str, float]:
     """Exact expected cost for every policy in the registry for a solved configuration.
 
     Returns {policy_name: cost} for all policies in POLICY_ORDER.
     The BI policy uses the fast vectorised index lookup; all others use
     scalar_policy_to_action_fn (one backward pass per policy).
+
+    This is slow: each non-BI policy runs a full backward-pass policy evaluation
+    that rebuilds the (N_e × K) action grid via a pure-Python scalar-policy call
+    at every (t, χ) cell. Pass ``desc`` to show a per-policy progress bar.
     """
     params, pbp_fn = result["params"], result["pbp_fn"]
     pi, actions, e_grid = result["pi"], result["actions"], result["e_grid"]
     registry = policy_registry(params, pbp_fn, pi=pi, actions=actions, e_grid=e_grid)
+    bar = None
+    if desc is not None:
+        from tqdm import tqdm
+        bar = tqdm(total=len(registry), desc=desc, unit="policy", position=2, leave=False)
     costs = {}
     for name, fn, kwargs in registry:
+        if bar is not None:
+            bar.set_postfix_str(name)
         if name == "Backward Induction":
             costs[name] = bi_expected_cost(result, beta=beta)
         else:
-            costs[name] = policy_expected_cost(result, fn, beta=beta, **kwargs)
+            step_desc = f"      {name}" if desc is not None else None
+            costs[name] = policy_expected_cost(result, fn, beta=beta,
+                                               progress_desc=step_desc, name=name, **kwargs)
+        if bar is not None:
+            bar.update(1)
+    if bar is not None:
+        bar.close()
     return costs
 
 
@@ -884,9 +986,14 @@ def save_tables(
     seed: int = 42,
     N_e: int = 500,
     include_baseline: bool = True,
+    compute_exact: bool = True,
     _log: Callable | None = None,
 ) -> list[Path]:
     """Write the per-sweep and (optionally) baseline-model summary tables as CSV.
+
+    ``compute_exact=False`` skips the slow analytical exact-cost step for the
+    baseline-model table (the ``Exact cost (€)`` column is omitted); the
+    rollout-based metrics are unaffected.
 
     Mirrors save_figures' directory layout under out_dir:
         sensitivity_figures/<sweep>/summary.csv   — one row per (swept value, policy)
@@ -923,20 +1030,27 @@ def save_tables(
             rollouts = run_rollouts(
                 result["pi"], result["actions"], result["e_grid"], params,
                 scenarios, rollout_fn(model_label), pbp_fn, desc=f"    [{label}] rollouts")
-            if _log: _log(f"  [{label}] computing exact costs…")
-            result["exact_costs"] = compute_all_exact_costs(result)
+            if compute_exact:
+                if _log: _log(f"  [{label}] computing exact costs…")
+                result["exact_costs"] = compute_all_exact_costs(
+                    result, desc=f"    [{label}] exact costs")
+            else:
+                result["exact_costs"] = {}
             model_results.append({"rollouts": rollouts, "label": label,
                                   "exact_costs": result["exact_costs"]})
         import pandas as pd
         rollout_df = pd.concat([build_summary_df([r]) for r in model_results], ignore_index=True)
-        exact_rows = [
-            {"Swept value": r["label"], "Policy": policy, "Exact cost (€)": cost}
-            for r in model_results
-            for policy, cost in r["exact_costs"].items()
-        ]
-        exact_df = pd.DataFrame(exact_rows).rename(columns={"Swept value": "Model"})
         rollout_df = rollout_df.rename(columns={"Swept value": "Model"})
-        df = exact_df.merge(rollout_df, on=["Model", "Policy"], how="right")
+        if compute_exact:
+            exact_rows = [
+                {"Model": r["label"], "Policy": policy, "Exact cost (€)": cost}
+                for r in model_results
+                for policy, cost in r["exact_costs"].items()
+            ]
+            exact_df = pd.DataFrame(exact_rows)
+            df = exact_df.merge(rollout_df, on=["Model", "Policy"], how="right")
+        else:
+            df = rollout_df
         p = bm_dir / "summary.csv"
         df.to_csv(p, index=False)
         saved.append(p)

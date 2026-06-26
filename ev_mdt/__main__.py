@@ -188,7 +188,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         tqdm.write("Writing baseline-model tables…")
         for p in save_tables({}, out_dir=tables_dir, N_rollouts=args.N_rollouts,
                              seed=args.seed, N_e=args.N_e, include_baseline=True,
-                             _log=tqdm.write):
+                             compute_exact=not args.no_exact, _log=tqdm.write):
             tqdm.write(f"  Saved: {p}")
 
         # Price-model comparison figures (mean diurnal profile + std), as on the
@@ -354,7 +354,7 @@ def cmd_gamma_sweep(args: argparse.Namespace) -> None:
         fig.add_trace(go.Scatter(
             x=[best["gamma"]], y=[best["mean_cost"]],
             mode="markers", marker=dict(color="#EE6677", size=11, symbol="star"),
-            name=f"Best γ={best['gamma']:.1f}", legendgroup=f"best_{row_i}",
+            name="Best", legendgroup=f"best_{row_i}",
             showlegend=show,
         ), row=row_i, col=1)
 
@@ -451,6 +451,9 @@ def main() -> None:
                        help="Only render the baseline/NegBin model figures (no sweeps)")
     p_run.add_argument("--exact-cost", action="store_true",
                        help="Analytical exact expected BI cost per scenario (no rollouts) → tables/exact_bi_cost.csv")
+    p_run.add_argument("--no-exact", action="store_true",
+                       help="Skip the slow analytical exact-cost step in the baseline-model "
+                            "table (rollout-based metrics are still written)")
     p_run.add_argument("--sweep", default=None,
                        choices=ALL_SWEEP_NAMES, metavar="SWEEP",
                        help=f"Run a single sweep (no baseline models). Options: {', '.join(ALL_SWEEP_NAMES)}")

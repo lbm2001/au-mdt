@@ -851,7 +851,7 @@ def fig_baseline_policy_heatmaps(
     return fig
 
 
-_BENCHMARK_POLICY_NAMES = ["Battery Level Urgency", "Departure Urgency"]
+_BENCHMARK_POLICY_NAMES = ["Departure Urgency", "Battery Level Urgency"]
 
 
 def fig_benchmark_heatmap_grid(

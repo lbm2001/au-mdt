@@ -151,6 +151,15 @@ def _du_charge_battery_ceiling(params, pbp_fn, e_grid, t: int,
                     e_grid[np.clip(top_e, 0, len(e_grid) - 1)], np.nan)
 
 
+def _blu_charge_battery_ceiling(params, pbp_fn, t: int) -> np.ndarray:
+    """(K,) highest battery at which Battery Level Urgency still charges per price bin at time t.
+
+    BLU charges u_max iff F_t(λ) ≤ 1 − e/e_max, i.e. e ≤ e_max·(1 − F_t(λ)).
+    """
+    cumprobs = np.cumsum(np.asarray(pbp_fn(t)))                   # F_t at each bin
+    return np.clip(params.e_max * (1.0 - cumprobs), 0.0, params.e_max)
+
+
 # ── Public figure factories ────────────────────────────────────────────────────
 
 def fig_heatmap_grid(results: list[dict], ncols: int = 1, time_bin_min: int = 1,
@@ -282,29 +291,39 @@ def fig_heatmap_grid_du(results: list[dict], ncols: int = 1, time_bin_min: int =
 
 
 def fig_charge_boundary_grid_du(results: list[dict]) -> go.Figure:
-    """Departure Urgency charge/no-charge border. Same layout as fig_charge_boundary_grid."""
+    """Benchmark charge/no-charge borders across sweep values.
+
+    Layout mirrors fig_benchmark_heatmap_grid: rows = sweep values, cols = 2
+    (Battery Level Urgency, Departure Urgency). One curve per hour of the day.
+    """
     from plotly.colors import sample_colorscale
     n = len(results)
-    rows, cols = _grid_dims(n)
-    fig = make_subplots(rows=rows, cols=cols, subplot_titles=[r["label"] for r in results],
-                        horizontal_spacing=0.06, vertical_spacing=0.12)
-    for idx, r in enumerate(results):
-        row = idx // cols + 1
-        col = idx % cols  + 1
+    ncols = 2
+    titles = [f"{r['label']} — {p}" for r in results for p in _BENCHMARK_POLICY_NAMES]
+    fig = make_subplots(rows=n, cols=ncols, subplot_titles=titles,
+                        horizontal_spacing=0.10, vertical_spacing=0.14 if n > 1 else 0.0)
+    for i, r in enumerate(results):
+        row = i + 1
         n_h = min(24, r["T"] // 60)
-        for h in range(n_h):
-            ceil  = _du_charge_battery_ceiling(r["params"], r["pbp_fn"], r["e_grid"], h * 60)
-            color = sample_colorscale("Viridis", [h / max(1, n_h - 1)])[0]
-            fig.add_trace(go.Scatter(
-                x=r["lam_grid"], y=ceil, mode="lines", line=dict(color=color, width=1.3),
-                showlegend=False,
-                hovertemplate=f"Hour {h:02d}:00<br>Price %{{x:.3f}} €/kWh<br>DU charges if battery ≤ %{{y:.1f}} kWh<extra></extra>",
-            ), row=row, col=col)
-        fig.update_xaxes(title_text="Price (€/kWh)" if row == rows else "",
-                         title_standoff=12, row=row, col=col)
-        fig.update_yaxes(title_text="Battery (kWh)" if col == 1 else "",
-                         title_standoff=12,
-                         range=[0, r["params"].e_max], row=row, col=col)
+        for j, pname in enumerate(_BENCHMARK_POLICY_NAMES):
+            col = j + 1
+            for h in range(n_h):
+                if pname == "Battery Level Urgency":
+                    ceil = _blu_charge_battery_ceiling(r["params"], r["pbp_fn"], h * 60)
+                else:
+                    ceil = _du_charge_battery_ceiling(r["params"], r["pbp_fn"], r["e_grid"], h * 60)
+                color = sample_colorscale("Viridis", [h / max(1, n_h - 1)])[0]
+                fig.add_trace(go.Scatter(
+                    x=r["lam_grid"], y=ceil, mode="lines", line=dict(color=color, width=1.3),
+                    showlegend=False,
+                    hovertemplate=f"{pname}<br>Hour {h:02d}:00<br>Price %{{x:.3f}} €/kWh<br>"
+                                  "charge if battery ≤ %{y:.1f} kWh<extra></extra>",
+                ), row=row, col=col)
+            fig.update_xaxes(title_text="Price (€/kWh)" if row == n else "",
+                             title_standoff=12, showticklabels=(row == n), row=row, col=col)
+            fig.update_yaxes(title_text="Battery (kWh)" if col == 1 else "",
+                             title_standoff=12,
+                             range=[0, r["params"].e_max], row=row, col=col)
     fig.add_trace(go.Scatter(
         x=[None], y=[None], mode="markers",
         marker=dict(colorscale="Viridis", cmin=0, cmax=23, color=[0], showscale=True,
@@ -315,40 +334,110 @@ def fig_charge_boundary_grid_du(results: list[dict]) -> go.Figure:
         template="plotly_white",
         plot_bgcolor="white",
         paper_bgcolor="white",
-        height=350 * rows + 60,
-        margin=dict(l=60, r=60, t=40, b=60),
+        height=320 * n + 60,
+        margin=dict(l=60, r=60, t=50, b=60),
     )
+    for ann in fig.layout.annotations:
+        ann.yshift = 10
     return fig
 
 
-def fig_cost_distribution(results: list[dict], log_y: bool = False,
+def _cost_floor(totals: np.ndarray) -> float:
+    """Common log-axis floor below all positive totals (anchors the proportional split)."""
+    pos = totals[totals > 0]
+    return float(pos.min() / 3.0) if pos.size else 1e-3
+
+
+def _add_stacked_cost_bars(fig, xs, totals, charge, penalty, color, name, errs, *,
+                           log_y: bool, y0: float, offsetgroup=None,
+                           showlegend: bool = True, row=None, col=None) -> None:
+    """Stacked charging+penalty bar per x: total height = total cost, split by cost %.
+
+    On a log axis the segment boundary is placed so the *visual* split equals the
+    charging/penalty proportion (e.g. 25/75 → bottom ¼ charging, top ¾ penalty);
+    charging is drawn in a lighter shade, penalty in the full policy colour.
+    """
+    totals  = np.asarray(totals,  float)
+    charge  = np.asarray(charge,  float)
+    penalty = np.asarray(penalty, float)
+    safe    = np.where(totals > 0, totals, 1.0)
+    frac_c  = np.clip(charge / safe, 0.0, 1.0)                       # charging share
+    light   = _rgba(color, 0.40)
+
+    if log_y:
+        tot = np.where(totals > y0, totals, y0)
+        B   = y0 * (tot / y0) ** frac_c                             # split boundary value
+        charge_base, charge_len = np.full_like(tot, y0), B - y0
+        pen_base,    pen_len    = B, tot - B
+    else:
+        charge_base, charge_len = np.zeros_like(totals), charge
+        pen_base,    pen_len    = charge, penalty
+
+    pct_c = (frac_c * 100)
+    pct_p = (100 - pct_c)
+    pos = dict(row=row, col=col) if row is not None else {}
+    fig.add_trace(go.Bar(
+        x=xs, base=charge_base, y=charge_len, name=name, legendgroup=name,
+        marker_color=light, showlegend=False, offsetgroup=offsetgroup,
+        customdata=np.stack([charge, pct_c], axis=-1),
+        hovertemplate="%{x}<br>charging %{customdata[0]:.3f} € (%{customdata[1]:.0f}%)"
+                      f"<extra>{name}</extra>",
+    ), **pos)
+    fig.add_trace(go.Bar(
+        x=xs, base=pen_base, y=pen_len, name=name, legendgroup=name,
+        marker_color=color, showlegend=showlegend, offsetgroup=offsetgroup,
+        error_y=dict(type="data", array=errs, visible=True, thickness=1.2, width=4),
+        customdata=np.stack([totals, penalty, pct_p], axis=-1),
+        hovertemplate="%{x}<br>total %{customdata[0]:.3f} €<br>"
+                      "penalty %{customdata[1]:.3f} € (%{customdata[2]:.0f}%)"
+                      f"<extra>{name}</extra>",
+    ), **pos)
+
+
+def _add_cost_split_key(fig) -> None:
+    """Two neutral legend swatches documenting the lighter=charging / solid=penalty split."""
+    for color, label in ((_rgba("#777777", 0.40), "charging share (lighter)"),
+                         ("#777777", "penalty share (solid)")):
+        fig.add_trace(go.Bar(
+            x=[None], y=[None], marker_color=color, name=label,
+            legendgroup="_split_key", showlegend=True, hoverinfo="skip",
+        ))
+
+
+def fig_cost_distribution(results: list[dict], log_y: bool = True,
                            x_label: str = "Swept value", error: str = "sem") -> go.Figure:
-    """Mean total cost bar per policy, grouped by swept value."""
+    """Mean total cost bar per policy, grouped by swept value (charging/penalty split)."""
     labels = [r["label"] for r in results]
-    fig = go.Figure()
+    series = []   # (policy, totals, charge, penalty, errs)
     for policy in POLICY_ORDER:
         if not all(policy in r["rollouts"] for r in results):
             continue
-        means, errs = [], []
+        totals, charge, penalty, errs = [], [], [], []
         for r in results:
             mlist = r["rollouts"][policy]
-            total = np.array([m["Charging cost (€)"] + m["Penalty cost (€)"] for m in mlist])
-            n = len(total)
-            sd = float(np.std(total, ddof=1)) if n > 1 else 0.0
-            means.append(float(total.mean()))
+            tot = np.array([m["Charging cost (€)"] + m["Penalty cost (€)"] for m in mlist])
+            n  = len(tot)
+            sd = float(np.std(tot, ddof=1)) if n > 1 else 0.0
+            totals.append(float(tot.mean()))
+            charge.append(float(np.mean([m["Charging cost (€)"] for m in mlist])))
+            penalty.append(float(np.mean([m["Penalty cost (€)"] for m in mlist])))
             errs.append(sd / np.sqrt(n) if (error == "sem" and n > 0) else sd)
+        series.append((policy, np.array(totals), np.array(charge), np.array(penalty), errs))
 
-        fig.add_trace(go.Bar(
-            x=labels, y=means, name=policy,
-            legendgroup=policy,
-            marker_color=POLICY_COLORS[policy],
-            showlegend=True,
-            error_y=dict(type="data", array=errs, visible=True, thickness=1.2, width=4),
-            hovertemplate="%{x}<br>%{y:.3f} €<extra>" + policy + "</extra>",
-        ))
+    all_totals = np.concatenate([s[1] for s in series]) if series else np.array([1.0])
+    y0 = _cost_floor(all_totals)
 
+    fig = go.Figure()
+    for policy, totals, charge, penalty, errs in series:
+        _add_stacked_cost_bars(fig, labels, totals, charge, penalty,
+                               POLICY_COLORS[policy], policy, errs,
+                               log_y=log_y, y0=y0, offsetgroup=policy)
+
+    _add_cost_split_key(fig)
     yaxis = dict(title="Mean cost (€)" + ("  [log]" if log_y else ""),
                  type="log" if log_y else "linear")
+    if log_y:
+        yaxis["range"] = [np.log10(y0), np.log10(all_totals.max() * 1.4)]
     fig.update_layout(
         template="plotly_white",
         plot_bgcolor="white",
@@ -399,29 +488,35 @@ def build_summary_df(results: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def fig_baseline_cost(full: dict, *, error: str = "sem", log_y: bool = False) -> go.Figure:
-    """Per-policy bar: total mean cost ±SEM."""
+def fig_baseline_cost(full: dict, *, error: str = "sem", log_y: bool = True) -> go.Figure:
+    """Per-policy bar: total mean cost ±SEM, split into charging/penalty shares."""
     names = [p for p in POLICY_ORDER if p in full and full[p]]
-    means, errs = [], []
+    totals, charge, penalty, errs = [], [], [], []
     for name in names:
         rollouts = full[name]
-        costs = np.array([r["charge_cost_traj"].sum() + r["penalty_cost_traj"].sum() for r in rollouts])
-        m = len(costs)
+        ccost = np.array([r["charge_cost_traj"].sum()  for r in rollouts])
+        pcost = np.array([r["penalty_cost_traj"].sum() for r in rollouts])
+        costs = ccost + pcost
+        m  = len(costs)
         sd = float(costs.std(ddof=1)) if m > 1 else 0.0
-        means.append(float(costs.mean()))
+        totals.append(float(costs.mean()))
+        charge.append(float(ccost.mean()))
+        penalty.append(float(pcost.mean()))
         errs.append(sd / np.sqrt(m) if (error == "sem" and m > 0) else sd)
 
+    totals_arr = np.array(totals) if totals else np.array([1.0])
+    y0 = _cost_floor(totals_arr)
+
     fig = go.Figure()
-    for name, mean, err in zip(names, means, errs):
-        color = POLICY_COLORS[name]
-        fig.add_trace(go.Bar(
-            x=[name], y=[mean], name=name,
-            marker_color=color, legendgroup=name, showlegend=True,
-            error_y=dict(type="data", array=[err], visible=True, thickness=1.2, width=4),
-            hovertemplate=f"%{{x}}<br>%{{y:.3f}} €<extra>{name}</extra>",
-        ))
+    for i, name in enumerate(names):
+        _add_stacked_cost_bars(fig, [name], [totals[i]], [charge[i]], [penalty[i]],
+                               POLICY_COLORS[name], name, [errs[i]],
+                               log_y=log_y, y0=y0, offsetgroup=name)
+    _add_cost_split_key(fig)
     yaxis = dict(title="Mean cost (€)" + ("  [log]" if log_y else ""),
                  type="log" if log_y else "linear")
+    if log_y:
+        yaxis["range"] = [np.log10(y0), np.log10(totals_arr.max() * 1.4)]
     fig.update_layout(
         template="plotly_white",
         plot_bgcolor="white",

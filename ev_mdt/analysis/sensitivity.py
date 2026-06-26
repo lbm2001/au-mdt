@@ -52,7 +52,6 @@ from ev_mdt.plots.viz import POLICY_ORDER
 # ── Sweep constants (single source of truth) ───────────────────────────────────
 
 PHI_VALUES       = [0, 0.05, 1, 50, 500, 5000]
-BETA_VALUES      = [0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
 HORIZON_HOURS    = [24, 48, 168]
 CRISIS_YEARS     = (2021, 2022, 2023)
 NEGBIN_LAMBDA_K  = 5.0
@@ -69,7 +68,6 @@ ALL_SWEEP_NAMES = [
     "pricing_daytype",
     "pricing_crisis",
     "penalty",
-    "beta",
     "horizon",
     "departure_profile",
     "mobility_model",
@@ -352,23 +350,6 @@ def sweep_penalty(model_label: str, N_rollouts: int, N_e: int, seed: int,
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         results.append(_run_sweep_step(
             model_label, f"{phi} €/h", params, pbp_fn, T=24 * 60, N_e=N_e,
-            N_rollouts=N_rollouts, seed=seed, _log=_log, **du_kwargs,
-        ))
-    if progress_cb: progress_cb(1.0, "Done.")
-    return results
-
-
-def sweep_beta(model_label: str, N_rollouts: int, N_e: int, seed: int,
-               progress_cb: Callable | None = None,
-               _log: Callable | None = None, **du_kwargs) -> list[dict]:
-    """Sweep the discount factor β ∈ BETA_VALUES over a 24 h horizon."""
-    results = []
-    for i, beta in enumerate(BETA_VALUES):
-        if progress_cb: progress_cb(i / len(BETA_VALUES), f"Solving β = {beta:g}…")
-        params = build_params(model_label, beta=float(beta))
-        pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
-        results.append(_run_sweep_step(
-            model_label, f"β={beta:g}", params, pbp_fn, T=24 * 60, N_e=N_e,
             N_rollouts=N_rollouts, seed=seed, _log=_log, **du_kwargs,
         ))
     if progress_cb: progress_cb(1.0, "Done.")
@@ -735,8 +716,6 @@ def run_all_sweeps(
             all_results[sweep] = sweep_pricing_crisis(sampler_excl, sampler_incl, sampler_crisis, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "penalty":
             all_results[sweep] = sweep_penalty(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log)
-        elif sweep == "beta":
-            all_results[sweep] = sweep_beta(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "horizon":
             all_results[sweep] = sweep_horizon(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "departure_profile":
@@ -757,7 +736,6 @@ _SWEEP_FOLDER = {
     "pricing_daytype":   "pricing_daytype",
     "pricing_crisis":    "pricing_crisis",
     "penalty":           "penalty",
-    "beta":              "beta",
     "horizon":           "horizon",
     "departure_profile": "departure_profile",
     "mobility_model":    "mobility_model",
@@ -766,7 +744,6 @@ _SWEEP_FOLDER = {
 # Heatmap-grid columns per sweep (single source of truth; app + CLI + figure export).
 HEATMAP_NCOLS = {
     "penalty": 3,
-    "beta": 3,
     "pricing_season": 2,
     "mobility_model": 2,
     "pricing_crisis": 3,

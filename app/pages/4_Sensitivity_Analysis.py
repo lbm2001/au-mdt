@@ -21,7 +21,6 @@ from ev_mdt.analysis.sensitivity import (
     sweep_pricing_daytype,
     sweep_pricing_crisis,
     sweep_penalty,
-    sweep_beta,
     sweep_horizon,
     sweep_departure_profiles,
     sweep_mobility_models,
@@ -30,7 +29,6 @@ from ev_mdt.analysis.sensitivity import (
     baseline_model_figures,
     HEATMAP_NCOLS,
     PHI_VALUES,
-    BETA_VALUES,
     HORIZON_HOURS,
     DEPARTURE_PROFILES,
     CRISIS_YEARS,
@@ -114,7 +112,6 @@ _SWEEP_RESULT_KEYS = [
     ("sa_pricing_daytype_results", "pricing_daytype"),
     ("sa_pricing_crisis_results",  "pricing_crisis"),
     ("sa_phi_results",             "penalty"),
-    ("sa_beta_results",            "beta"),
     ("sa_horizon_results",         "horizon"),
     ("sa_departure_results",       "departure_profile"),
     ("sa_mobility_results",        "mobility_model"),
@@ -268,13 +265,12 @@ years. Negative wholesale prices (~2.6% of hours) are floored to 0.
 > Default trip durations differ across models, so switching the model is **not** a controlled
 > comparison — read each model's sweeps on their own.
 
-**Six independent sweep dimensions** (others held at baseline):
+**Five independent sweep dimensions** (others held at baseline):
 1. **Pricing model / season / day-type / crisis** — on ENTSO-E DK1 data (Gaussian Bins · GMM · MDN)
 2. **Penalty** — φ ∈ {PHI_VALUES} €/h
-3. **Discount β** — {BETA_VALUES}
-4. **Horizon T** — {HORIZON_HOURS} h
-5. **Departure profile** — {list(DEPARTURE_PROFILES)}
-6. **Mobility model** — NegBin {{fixed-k, Poisson-k}} × {{k=5, k=10}}
+3. **Horizon T** — {HORIZON_HOURS} h
+4. **Departure profile** — {list(DEPARTURE_PROFILES)}
+5. **Mobility model** — NegBin {{fixed-k, Poisson-k}} × {{k=5, k=10}}
 
 > **Reading the Pricing tab:** each pricing model is solved *and* evaluated in its **own** price
 > world. Compare policies *within* a column (which policy wins, optimality gap, feasibility) — not
@@ -322,8 +318,6 @@ if st.session_state.pop("sa_run_all_triggered", False):
          lambda cb: sweep_pricing_crisis(_s_excl, _s_incl, _s_crisis, N_rollouts, N_e, seed, cb, **_du_kw)),
         ("Penalty",            "sa_phi_results",
          lambda cb: sweep_penalty(BASELINE_MODEL, N_rollouts, N_e, seed, cb, **_du_kw)),
-        ("Discount β",         "sa_beta_results",
-         lambda cb: sweep_beta(BASELINE_MODEL, N_rollouts, N_e, seed, cb, **_du_kw)),
         ("Horizon",            "sa_horizon_results",
          lambda cb: sweep_horizon(BASELINE_MODEL, N_rollouts, N_e, seed, cb, **_du_kw)),
         ("Departure",          "sa_departure_results",
@@ -392,8 +386,8 @@ if st.session_state.pop("sa_run_all_triggered", False):
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_price, tab_phi, tab_beta, tab_T, tab_departure, tab_mobility = st.tabs(
-    ["Pricing Model", "Penalty", "Discount β", "Horizon T", "Departure Profile", "Mobility Model"]
+tab_price, tab_phi, tab_T, tab_departure, tab_mobility = st.tabs(
+    ["Pricing Model", "Penalty", "Horizon T", "Departure Profile", "Mobility Model"]
 )
 
 # ─── Tab 1: Pricing model ─────────────────────────────────────────────────────
@@ -491,27 +485,7 @@ with tab_phi:
     else:
         st.info("Click **Run penalty sweep** to compute results.")
 
-# ─── Tab 3: Discount factor β ─────────────────────────────────────────────────
-with tab_beta:
-    st.markdown(
-        f"Sweeps the discount factor β ∈ {BETA_VALUES} over a 24 h horizon.  "
-        "Uses Gaussian parametric pricing.  All other params at baseline.  "
-        "(Horizon T is its own sweep in the **Horizon T** tab.)"
-    )
-    if st.button("Run discount-β sweep", key="sa_run_beta"):
-        st.session_state.pop("sa_beta_results", None)
-        bar = st.progress(0.0, text="Starting…")
-        with st.spinner("Running discount-β sweep…"):
-            st.session_state["sa_beta_results"] = sweep_beta(
-                BASELINE_MODEL, N_rollouts, N_e, seed,
-                progress_cb=lambda f, m: bar.progress(f, text=m))
-        bar.empty(); st.rerun()
-    if "sa_beta_results" in st.session_state:
-        _show_results(st.session_state["sa_beta_results"], "beta")
-    else:
-        st.info("Click **Run discount-β sweep** to compute results.")
-
-# ─── Tab 4: Horizon T ─────────────────────────────────────────────────────────
+# ─── Tab 3: Horizon T ─────────────────────────────────────────────────────────
 with tab_T:
     st.markdown(
         f"Compares horizon lengths T ∈ {HORIZON_HOURS} h.  "

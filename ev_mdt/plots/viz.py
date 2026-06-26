@@ -50,7 +50,6 @@ SWEEP_AXIS_LABEL = {
     "pricing_daytype":   "Day type",
     "pricing_crisis":    "Energy-crisis data",
     "penalty":           "Penalty (€/h)",
-    "beta":              "Discount factor β",
     "horizon":           "Horizon T (h)",
     "departure_profile": "Departure profile",
     "mobility_model":    "Mobility model",

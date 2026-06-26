@@ -1,9 +1,50 @@
 """Shared charging policies — work with any params that has the standard fields."""
 import numpy as np
 
+from functools import lru_cache
+
 from ev_mdt.models.common.model_utils import (
-    departure_prob, minutes_to_departure, price_bin, price_bin_probs,
+    expected_trip_minutes, mean_minutes_to_departure,
+    minutes_to_departure, price_bin, price_bin_probs,
 )
+
+# Empirically-swept baseline-optimal DU ceiling (kWh). Set from `target-sweep` at default
+# Baseline params; carried as a module-level constant so the policy is param-free.
+E_CEIL_BASE: float = 25.0
+
+# Best ceiling-scaling exponent γ per mobility model, from `gamma-sweep` (N=1000).
+# At Baseline the demand ratio is 1, so γ is irrelevant there (e_ceil ≡ E_CEIL_BASE);
+# γ only shapes the ceiling for the NegBin models via (e_daily / e_daily_ref) ** γ.
+DU_GAMMA_BASELINE:       float = 0.1
+DU_GAMMA_NEGBIN_FIXED:   float = 0.1  # TODO: set from gamma-sweep (NegBin fixed k=5)
+DU_GAMMA_NEGBIN_POISSON: float = 0.4   # TODO: set from gamma-sweep (NegBin Poisson k=5)
+
+
+def du_gamma_for_params(params) -> float:
+    """Resolve the per-model DU γ from the params type (NegBin fixed vs Poisson vs Baseline)."""
+    if not hasattr(params, "q"):
+        return DU_GAMMA_BASELINE
+    return DU_GAMMA_NEGBIN_POISSON if params.lambda_k is not None else DU_GAMMA_NEGBIN_FIXED
+
+
+def _du_e_daily(params) -> float:
+    """Expected daily energy demand (kWh) for the given mobility params.
+
+    E[N_trips/day] = 1440 / (mean_τ + E[T_trip])
+    e_daily        = E[N_trips] × E[T_trip] × μ × v × ω
+    """
+    e_trip_min = expected_trip_minutes(params)
+    mean_tau   = mean_minutes_to_departure(params)
+    n_trips    = 1440.0 / (mean_tau + e_trip_min) if (mean_tau + e_trip_min) > 0 else 0.0
+    # μ·v·ω cancels in e_daily/e_daily_ref; kept here so the return value is interpretable as kWh.
+    return n_trips * e_trip_min * params.mu * params.v * params.omega
+
+
+@lru_cache(maxsize=1)
+def _e_daily_ref() -> float:
+    """e_daily for the canonical Baseline params — computed once and cached."""
+    from ev_mdt.params import BaselineParams
+    return _du_e_daily(BaselineParams())
 
 
 def actual_charge_rate(chi: int, e: float, desired_u: float, params) -> float:
@@ -85,120 +126,96 @@ def dp_heuristic_policy(
     return float(params.u_max) if F_p <= thresh else 0.0
 
 
+
 def next_trip_policy(
     t: int, chi: int, e: float, lam: float, params,
-    *, price_bin_probs_fn=None, reserve_frac=0.25, target_frac=0.60, kappa=float("inf"),
+    *,
+    price_bin_probs_fn=None,
+    gamma: float = 0.5,
+    use_reserve: bool = True,
+    _ceil_override: float | None = None,
 ) -> float:
-    """Departure-aware urgency heuristic (Kempker-style order-statistic charging).
+    """Departure-aware urgency heuristic.
 
-    Two regimes, reflecting that the stranding penalty (ω·φ ≈ €16.7/min) dwarfs any
-    energy price, so safety must dominate price-picking:
+    e_trip  = E[T_trip] · μ · v · ω  — expected energy the next trip consumes (kWh).
+    tau     = E[minutes to next departure]  — from backward-recurrence hazard.
 
-    1. Mandatory reserve. Below e_reserve = reserve_frac·e_max, charge u_max
-       regardless of price — the buffer the cost asymmetry demands.
-    2. Opportunistic top-up. Between e_reserve and e_target = target_frac·e_max,
-       charge when the price is cheap *relative to urgency*, with urgency rising as
-       departure nears.  The decision compares the price percentile F_t(λ) to the
-       urgency ratio ρ_t = (e_target − e) / E_deliver, E_deliver = u_max·η_c·ω·τ(t):
+    Demand-scaled ceiling (anchored to the empirically-swept baseline optimum):
+        e_daily = E[N_trips] × e_trip    (active params)
+        e_ceil  = min(e_max, E_CEIL_BASE × (e_daily / e_daily_ref) ** gamma)
 
-           bang-bang (default, κ=∞):  u_t = u_max if F_t(λ) ≤ ρ_t else 0
-           soft (finite κ):           u_t = u_max · σ( κ · (ρ_t − F_t(λ)) )
+    Reserve: if use_reserve and e < e_trip, charge at u_max regardless of price.
 
-       The bang-bang rule is optimal under the *linear* charging cost (Kempker Thm 14.1:
-       the optimum fills the cheapest slots up to the requirement) and is what the
-       benchmark uses by default.  The logistic σ is its κ<∞ generalization, kept for
-       robustness to noisy τ/F_t and for charge-rate-dependent (convex) costs such as
-       V2G/degradation, where interior rates become genuinely optimal; it costs a little
-       here because it smears energy into pricier minutes.  Either way the map keys on
-       the price-vs-urgency *gap*, not ρ alone, so a relaxed state still charges full in
-       a genuinely cheap hour rather than dribbling.
+    Urgency ratio: ρ = (e_ceil − e) / deliverable, where
+        deliverable = u_max · η_c · ω · τ  (max kWh chargeable before departure).
+    ρ rises naturally as τ shrinks — no separate target interpolation needed.
 
-    Driving and full-battery guards mirror the other benchmarks; downstream clipping
-    to [0, u_max] still applies.
+    Charge u_max if F_t(λ) ≤ ρ, u_max/2 in marginal band (±1/τ), else 0.
     """
     if chi > 0 and e > params.e_min:
         return 0.0
     if e >= params.e_max:
         return 0.0
 
-    # 1. Mandatory safety reserve — price-independent.
-    e_reserve = reserve_frac * params.e_max
-    if e < e_reserve:
+    e_trip = expected_trip_minutes(params) * params.mu * params.v * params.omega
+
+    if use_reserve and e < e_trip:
         return float(params.u_max)
 
-    # 2. Opportunistic region [e_reserve, e_target]: logistic price-vs-urgency map.
-    e_target = max(e_reserve, target_frac * params.e_max)
-    slots = minutes_to_departure(t, params)                       # τ(t), exact forward expectation
-    deliverable = params.u_max * params.eta_c * params.omega * slots
-    rho = max(0.0, e_target - e) / deliverable if deliverable > 0 else np.inf
+    if _ceil_override is not None:
+        e_ceil = min(params.e_max, float(_ceil_override))
+    else:
+        e_daily = _du_e_daily(params)
+        ref     = _e_daily_ref()
+        ratio   = e_daily / ref if ref > 0 else 1.0
+        e_ceil  = min(params.e_max, E_CEIL_BASE * ratio ** gamma)
 
-    # F_t(λ): price percentile from the precomputed bin CDF (as in dp_heuristic_policy)
-    probs    = price_bin_probs(t, params) if price_bin_probs_fn is None else price_bin_probs_fn(t)
-    lam_grid = np.array([(j + 0.5) * params.lambda_max / params.K for j in range(params.K)])
-    F_p      = float(probs[lam_grid <= lam].sum())
-
-    gap = rho - F_p
-    if not np.isfinite(kappa):                                     # bang-bang (κ→∞ limit)
-        # Charge iff price percentile ≤ urgency (inclusive, as in dp_heuristic): at the
-        # cheapest bin F_p=0, so free/negative prices (clipped to 0, ~15% of samples)
-        # charge at full rate even when already at target.
-        return float(params.u_max) if gap >= 0.0 else 0.0
-    sigma = 1.0 / (1.0 + np.exp(-kappa * np.clip(gap, -50.0, 50.0)))
-    return float(params.u_max * sigma)
-
-
-def next_trip_policy_simple_tau(
-    t: int, chi: int, e: float, lam: float, params,
-    *, price_bin_probs_fn=None, reserve_frac=0.25, target_frac=0.60, kappa=float("inf"),
-) -> float:
-    """Like next_trip_policy but uses τ_t = 1/p_t^{P→D} (instantaneous rate inverse)
-    instead of the full Gauss-Seidel forward expectation."""
-    if chi > 0 and e > params.e_min:
-        return 0.0
-    if e >= params.e_max:
-        return 0.0
-
-    e_reserve = reserve_frac * params.e_max
-    if e < e_reserve:
-        return float(params.u_max)
-
-    e_target = max(e_reserve, target_frac * params.e_max)
-    p_dep = departure_prob(t, params)
-    slots = 1.0 / p_dep if p_dep > 0 else float("inf")
-    deliverable = params.u_max * params.eta_c * params.omega * slots
-    rho = max(0.0, e_target - e) / deliverable if deliverable > 0 else np.inf
+    tau         = minutes_to_departure(t, params)
+    deliverable = params.u_max * params.eta_c * params.omega * tau
+    rho = min(1.0, max(0.0, e_ceil - e) / deliverable) if deliverable > 0 else 1.0
 
     probs    = price_bin_probs(t, params) if price_bin_probs_fn is None else price_bin_probs_fn(t)
     lam_grid = np.array([(j + 0.5) * params.lambda_max / params.K for j in range(params.K)])
     F_p      = float(probs[lam_grid <= lam].sum())
 
-    gap = rho - F_p
-    if not np.isfinite(kappa):
-        return float(params.u_max) if gap >= 0.0 else 0.0
-    sigma = 1.0 / (1.0 + np.exp(-kappa * np.clip(gap, -50.0, 50.0)))
-    return float(params.u_max * sigma)
+    if F_p <= rho:
+        return float(params.u_max)
+    if F_p <= rho + (1.0 / tau if tau > 0 else 0.0):
+        return float(params.u_max / 2)
+    return 0.0
 
 
 def policy_registry(params, pbp_fn, *, pi, actions, e_grid,
-                    low_threshold=None, high_threshold=None, soc_threshold=None):
+                    low_threshold=None, high_threshold=None, soc_threshold=None,
+                    du_gamma=None, du_use_reserve=True):
     """Ordered ``(name, policy_fn, kwargs)`` for every benchmark policy (POLICY_ORDER).
 
     Single source of truth for the policy set compared everywhere (sensitivity
     sweeps, baseline-model exports, the Policy-Rollout page). Thresholds default
     to the canonical values: low/high = params.price_night/price_evening,
     soc = params.e_max * 0.25.
+
+    du_* kwargs control the Departure Urgency policy shown in all pages.
+    ``du_gamma=None`` auto-selects the per-model γ via ``du_gamma_for_params``.
     """
     low  = params.price_night   if low_threshold  is None else low_threshold
     high = params.price_evening if high_threshold is None else high_threshold
     soc  = params.e_max * 0.25  if soc_threshold  is None else soc_threshold
-    return [
+    du_kw = dict(
+        price_bin_probs_fn=pbp_fn,
+        gamma=du_gamma_for_params(params) if du_gamma is None else du_gamma,
+        use_reserve=du_use_reserve,
+    )
+    entries = [
         ("Backward Induction",    backward_induction_policy, dict(pi=pi, actions=actions, e_grid=e_grid)),
-        ("DP-Heuristic",          dp_heuristic_policy,       dict(price_bin_probs_fn=pbp_fn)),
-        ("Next-Trip Urgency",     next_trip_policy,            dict(price_bin_probs_fn=pbp_fn)),
-        ("Next-Trip (Simple τ)",  next_trip_policy_simple_tau, dict(price_bin_probs_fn=pbp_fn)),
+        ("Battery Level Urgency", dp_heuristic_policy,       dict(price_bin_probs_fn=pbp_fn)),
+        ("Departure Urgency",     next_trip_policy,          du_kw),
+    ]
+    entries += [
         ("Price-Oriented",        price_oriented_policy,     dict(low_threshold=low, high_threshold=high)),
         ("Night Charging",        night_charging_policy,     {}),
         ("Always-Maximum",        maximal_charging_policy,   {}),
         ("Minimum Battery Level", minimum_soc_policy,        dict(soc_threshold=soc)),
         ("Always-Minimum",        always_minimum_policy,     {}),
     ]
+    return entries

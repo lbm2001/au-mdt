@@ -37,13 +37,21 @@ from ev_mdt.params import (
 )
 from ev_mdt.models.common.backward_induction import (
     backward_induction as _backward_induction, evaluate_policy as _evaluate_policy,
+    scalar_policy_to_action_fn as _scalar_policy_to_action_fn,
 )
 from ev_mdt.models.baseline.model import transition_matrix as _baseline_tm
 from ev_mdt.models.baseline.rollout import simulate_policy_rollout as _baseline_rollout
 from ev_mdt.models.negbin.model import transition_matrix as _negbin_tm
 from ev_mdt.models.negbin.rollout import simulate_policy_rollout as _negbin_rollout
-from ev_mdt.models.common.model_utils import price_bin_probs as _gaussian_pbp, mean_price
-from ev_mdt.models.common.policies import backward_induction_policy, policy_registry
+from ev_mdt.models.common.model_utils import (
+    price_bin_probs as _gaussian_pbp, mean_price,
+    expected_trip_minutes as _expected_trip_minutes,
+    minutes_to_departure as _minutes_to_departure,
+)
+from ev_mdt.models.common.policies import (
+    backward_induction_policy, policy_registry, du_gamma_for_params,
+    _du_e_daily, _e_daily_ref, E_CEIL_BASE,
+)
 from ev_mdt.models.common.rollout_utils import rollout_metrics, run_policies
 from ev_mdt.plots.viz import POLICY_ORDER
 
@@ -51,7 +59,6 @@ from ev_mdt.plots.viz import POLICY_ORDER
 # ── Sweep constants (single source of truth) ───────────────────────────────────
 
 PHI_VALUES       = [0, 0.05, 1, 50, 500, 5000]
-BETA_VALUES      = [0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
 HORIZON_HOURS    = [24, 48, 168]
 CRISIS_YEARS     = (2021, 2022, 2023)
 NEGBIN_LAMBDA_K  = 5.0
@@ -68,7 +75,6 @@ ALL_SWEEP_NAMES = [
     "pricing_daytype",
     "pricing_crisis",
     "penalty",
-    "beta",
     "horizon",
     "departure_profile",
     "mobility_model",
@@ -128,6 +134,142 @@ def bi_expected_cost(result: dict, beta: float = 1.0) -> float:
     return float(np.mean(Jpi[0, 0] @ np.asarray(pbp_fn(0))))
 
 
+def _du_e_ceil(params, gamma: float | None = None) -> float:
+    """Demand-scaled DU ceiling (matches policies.next_trip_policy)."""
+    if gamma is None:
+        gamma = du_gamma_for_params(params)
+    ref   = _e_daily_ref()
+    ratio = _du_e_daily(params) / ref if ref > 0 else 1.0
+    return min(params.e_max, E_CEIL_BASE * ratio ** gamma)
+
+
+def _vectorized_action_grid(name: str, kwargs: dict, e_grid, lam_grid, params,
+                            T: int, probs, cumsum):
+    """(T, N_e, K) desired chi=0 charge rates for a benchmark policy, fully
+    vectorised — the λ-resolved counterpart of the per-cell scalar policy.
+
+    Returns ``None`` for policies without a vectorised form (the caller then
+    falls back to the scalar wrapper). The driving / battery-floor gate is
+    applied inside ``evaluate_policy``, exactly as for the scalar action_fn.
+    """
+    N_e, K = len(e_grid), len(lam_grid)
+    u_max, e_max = params.u_max, params.e_max
+
+    if name == "Always-Maximum":
+        return np.full((T, N_e, K), u_max)
+    if name == "Always-Minimum":
+        return np.full((T, N_e, K), params.u_min)
+    if name == "Night Charging":
+        rate_t = np.where(np.arange(T) % 1440 < 360, u_max, 0.0)
+        return np.broadcast_to(rate_t[:, None, None], (T, N_e, K)).copy()
+    if name == "Minimum Battery Level":
+        rate_e = np.where(e_grid < kwargs["soc_threshold"], u_max, 0.0)
+        return np.broadcast_to(rate_e[None, :, None], (T, N_e, K)).copy()
+    if name == "Price-Oriented":
+        low, high = kwargs["low_threshold"], kwargs["high_threshold"]
+        rate_k = np.where(lam_grid <= low, u_max,
+                          np.where(lam_grid <= high, u_max / 2, 0.0))
+        return np.broadcast_to(rate_k[None, None, :], (T, N_e, K)).copy()
+
+    if name == "Battery Level Urgency":
+        thresh = np.clip(1.0 - e_grid / e_max, 0.0, 1.0)              # (N_e,)
+        mask = cumsum[:, None, :] <= thresh[None, :, None]           # (T, N_e, K)
+        rate = np.where(mask, u_max, 0.0)
+        return np.where(e_grid[None, :, None] >= e_max, 0.0, rate)
+
+    if name == "Departure Urgency":
+        gamma       = kwargs.get("gamma", None)
+        use_reserve = kwargs.get("use_reserve", True)
+        e_trip = _expected_trip_minutes(params) * params.mu * params.v * params.omega
+        e_ceil = _du_e_ceil(params, gamma)
+
+        slots       = np.array([_minutes_to_departure(t, params) for t in range(T)])  # (T,)
+        deliverable = u_max * params.eta_c * params.omega * slots                     # (T,)
+        e_diff      = np.maximum(0.0, e_ceil - e_grid[None, :])                        # (1, N_e)
+        safe_del    = np.where(deliverable > 0, deliverable, 1.0)
+        rho  = np.where(deliverable[:, None] > 0, e_diff / safe_del[:, None], np.inf) # (T, N_e)
+        band = np.where(slots > 0, 1.0 / slots, 0.0)                                  # (T,)
+
+        F   = cumsum[:, None, :]                                      # (T, 1, K)
+        p1  = F <= rho[:, :, None]                                    # (T, N_e, K)
+        p12 = F <= (rho + band[:, None])[:, :, None]
+        rate = np.where(p1, u_max, np.where(p12, u_max / 2, 0.0))
+        if use_reserve:
+            rate = np.where(e_grid[None, :, None] < e_trip, u_max, rate)
+        return np.where(e_grid[None, :, None] >= e_max, 0.0, rate)
+
+    return None
+
+
+def policy_expected_cost(result: dict, policy_fn, beta: float = 1.0,
+                         progress_desc: str | None = None,
+                         name: str | None = None, **kwargs) -> float:
+    """Exact expected cost of a scalar benchmark policy for a given configuration.
+
+    Equivalent to bi_expected_cost but works for any scalar policy from the registry.
+    Uses scalar_policy_to_action_fn to vectorize the policy into the (N_e, K) form
+    that evaluate_policy expects.
+    """
+    model_label = result["model"]
+    params, pbp_fn = result["params"], result["pbp_fn"]
+    e_grid, lam_grid, T = result["e_grid"], result["lam_grid"], result["T"]
+    if model_label == BASELINE_MODEL:
+        tm_fn, n_chi = (lambda t: _baseline_tm(t, params)), 2
+    else:
+        tm_fn, n_chi = (lambda t: _negbin_tm(t, params)), params.k + 1
+    grid = None
+    if name is not None:
+        probs  = np.array([pbp_fn(t) for t in range(T)])
+        cumsum = probs.cumsum(axis=1)
+        grid = _vectorized_action_grid(name, kwargs, e_grid, lam_grid, params, T, probs, cumsum)
+    if grid is not None:
+        action_fn = lambda t, chi, _g=grid: _g[t]
+    else:
+        action_fn = _scalar_policy_to_action_fn(policy_fn, e_grid, lam_grid, params, **kwargs)
+    Jpi = _evaluate_policy(
+        params, transition_matrix_fn=tm_fn, price_bin_probs_fn=pbp_fn, n_chi=n_chi,
+        action_fn=action_fn, T=T, N_e=len(e_grid), beta=beta,
+        progress_desc=progress_desc,
+    )
+    return float(np.mean(Jpi[0, 0] @ np.asarray(pbp_fn(0))))
+
+
+def compute_all_exact_costs(result: dict, beta: float = 1.0,
+                            desc: str | None = None) -> dict[str, float]:
+    """Exact expected cost for every policy in the registry for a solved configuration.
+
+    Returns {policy_name: cost} for all policies in POLICY_ORDER.
+    The BI policy uses the fast vectorised index lookup; all others use
+    scalar_policy_to_action_fn (one backward pass per policy).
+
+    This is slow: each non-BI policy runs a full backward-pass policy evaluation
+    that rebuilds the (N_e × K) action grid via a pure-Python scalar-policy call
+    at every (t, χ) cell. Pass ``desc`` to show a per-policy progress bar.
+    """
+    params, pbp_fn = result["params"], result["pbp_fn"]
+    pi, actions, e_grid = result["pi"], result["actions"], result["e_grid"]
+    registry = policy_registry(params, pbp_fn, pi=pi, actions=actions, e_grid=e_grid)
+    bar = None
+    if desc is not None:
+        from tqdm import tqdm
+        bar = tqdm(total=len(registry), desc=desc, unit="policy", position=2, leave=False)
+    costs = {}
+    for name, fn, kwargs in registry:
+        if bar is not None:
+            bar.set_postfix_str(name)
+        if name == "Backward Induction":
+            costs[name] = bi_expected_cost(result, beta=beta)
+        else:
+            step_desc = f"      {name}" if desc is not None else None
+            costs[name] = policy_expected_cost(result, fn, beta=beta,
+                                               progress_desc=step_desc, name=name, **kwargs)
+        if bar is not None:
+            bar.update(1)
+    if bar is not None:
+        bar.close()
+    return costs
+
+
 def make_scenario(params, seed: int, horizon: int,
                   sampler=None, season: str = "winter", is_weekend: bool = False) -> dict:
     """Generate one rollout scenario with separate sub-seeds for mobility and prices."""
@@ -153,19 +295,21 @@ def make_scenario(params, seed: int, horizon: int,
 
 
 def run_rollouts(pi, actions, e_grid, params, scenarios: list, _rollout_fn, pbp_fn,
-                 desc: str | None = None) -> dict:
+                 desc: str | None = None, **du_kwargs) -> dict:
     """Run all policies on each scenario. Returns {policy_name: [metrics_dict, ...]}.
 
     If ``desc`` is given, shows a per-rollout progress bar (x/N) under the sweep bars.
     """
-    raw = run_rollouts_full(pi, actions, e_grid, params, scenarios, _rollout_fn, pbp_fn, desc=desc)
+    raw = run_rollouts_full(pi, actions, e_grid, params, scenarios, _rollout_fn, pbp_fn,
+                            desc=desc, **du_kwargs)
     return {name: [rollout_metrics(r, params) for r in rolls] for name, rolls in raw.items()}
 
 
 def run_rollouts_full(pi, actions, e_grid, params, scenarios, _rollout_fn, pbp_fn,
-                      desc: str | None = None) -> dict:
+                      desc: str | None = None, **du_kwargs) -> dict:
     """Like run_rollouts but keeps each raw rollout dict (u_traj/chi_traj/cost_traj)."""
-    registry = policy_registry(params, pbp_fn, pi=pi, actions=actions, e_grid=e_grid)
+    registry = policy_registry(params, pbp_fn, pi=pi, actions=actions, e_grid=e_grid,
+                               **du_kwargs)
     e0s = [float(sc["e0"]) for sc in scenarios]
     bar = progress = None
     if desc is not None:
@@ -193,7 +337,7 @@ def rollout_stats_table(rollouts_by_policy: dict, params):
 def _run_sweep_step(model_label: str, label: str, params, pbp_fn,
                     T: int, N_e: int, N_rollouts: int, seed: int,
                     sampler=None, season: str = "winter", is_weekend: bool = False,
-                    _log: Callable | None = None) -> dict:
+                    _log: Callable | None = None, **du_kwargs) -> dict:
     """Solve + run rollouts for one sweep configuration."""
     if _log: _log(f"  [{label}] solving (T={T//60}h, N_e={N_e})…")
     pi, actions, e_grid, lam_grid = solve(model_label, params, pbp_fn, T, N_e)
@@ -204,7 +348,7 @@ def _run_sweep_step(model_label: str, label: str, params, pbp_fn,
     ]
     _rf = rollout_fn(model_label)
     rollouts = run_rollouts(pi, actions, e_grid, params, scenarios, _rf, pbp_fn,
-                            desc=f"    [{label}] rollouts")
+                            desc=f"    [{label}] rollouts", **du_kwargs)
     sample_rollout = _rf(
         backward_induction_policy, scenarios[0], float(scenarios[0]["e0"]), 0, params,
         pi=pi, actions=actions, e_grid=e_grid,
@@ -225,13 +369,13 @@ def _run_sweep_step(model_label: str, label: str, params, pbp_fn,
 
 
 def _gbins_step(label: str, sampler, season: str, is_weekend: bool,
-                N_rollouts: int, N_e: int, seed: int, _log=None) -> dict:
+                N_rollouts: int, N_e: int, seed: int, _log=None, **du_kwargs) -> dict:
     params = build_params(BASELINE_MODEL)
     pbp_fn = _make_gbins_pbp(sampler, params, season, is_weekend)
     return _run_sweep_step(
         BASELINE_MODEL, label, params, pbp_fn, T=24 * 60, N_e=N_e,
         N_rollouts=N_rollouts, seed=seed,
-        sampler=sampler, season=season, is_weekend=is_weekend, _log=_log,
+        sampler=sampler, season=season, is_weekend=is_weekend, _log=_log, **du_kwargs,
     )
 
 
@@ -244,26 +388,26 @@ def _make_gbins_pbp(sampler, params, season, is_weekend):
 
 def sweep_pricing_season(sampler, N_rollouts: int, N_e: int, seed: int,
                           progress_cb: Callable | None = None,
-                          _log: Callable | None = None) -> list[dict]:
+                          _log: Callable | None = None, **du_kwargs) -> list[dict]:
     """Gaussian Bins (crisis-excluded): vary season, held at weekday."""
     seasons = ["winter", "spring", "summer", "autumn"]
     results = []
     for i, s in enumerate(seasons):
         if progress_cb: progress_cb(i / len(seasons), f"Solving {s}…")
-        results.append(_gbins_step(s.capitalize(), sampler, s, False, N_rollouts, N_e, seed, _log))
+        results.append(_gbins_step(s.capitalize(), sampler, s, False, N_rollouts, N_e, seed, _log, **du_kwargs))
     if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
 def sweep_pricing_daytype(sampler, N_rollouts: int, N_e: int, seed: int,
                            progress_cb: Callable | None = None,
-                           _log: Callable | None = None) -> list[dict]:
+                           _log: Callable | None = None, **du_kwargs) -> list[dict]:
     """Gaussian Bins (crisis-excluded): vary weekday/weekend, held at spring."""
     combos = [("Weekday", False), ("Weekend", True)]
     results = []
     for i, (label, we) in enumerate(combos):
         if progress_cb: progress_cb(i / len(combos), f"Solving {label}…")
-        results.append(_gbins_step(label, sampler, "spring", we, N_rollouts, N_e, seed, _log))
+        results.append(_gbins_step(label, sampler, "spring", we, N_rollouts, N_e, seed, _log, **du_kwargs))
     if progress_cb: progress_cb(1.0, "Done.")
     return results
 
@@ -271,7 +415,7 @@ def sweep_pricing_daytype(sampler, N_rollouts: int, N_e: int, seed: int,
 def sweep_pricing_crisis(sampler_excl, sampler_incl, sampler_crisis,
                           N_rollouts: int, N_e: int, seed: int,
                           progress_cb: Callable | None = None,
-                          _log: Callable | None = None) -> list[dict]:
+                          _log: Callable | None = None, **du_kwargs) -> list[dict]:
     """Gaussian Bins: vary crisis inclusion, held at spring + weekday."""
     items = [("Excluding crisis", sampler_excl),
              ("Including crisis", sampler_incl),
@@ -279,27 +423,27 @@ def sweep_pricing_crisis(sampler_excl, sampler_incl, sampler_crisis,
     results = []
     for i, (label, sampler) in enumerate(items):
         if progress_cb: progress_cb(i / len(items), f"Solving {label}…")
-        results.append(_gbins_step(label, sampler, "spring", False, N_rollouts, N_e, seed, _log))
+        results.append(_gbins_step(label, sampler, "spring", False, N_rollouts, N_e, seed, _log, **du_kwargs))
     if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
 def sweep_pricing_model(samplers: dict, N_rollouts: int, N_e: int, seed: int,
                          progress_cb: Callable | None = None,
-                         _log: Callable | None = None) -> list[dict]:
+                         _log: Callable | None = None, **du_kwargs) -> list[dict]:
     """Vary the price model (Gaussian Bins / GMM / MDN), held at spring · weekday · crisis-excluded."""
     items = list(samplers.items())
     results = []
     for i, (label, sampler) in enumerate(items):
         if progress_cb: progress_cb(i / len(items), f"Solving {label}…")
-        results.append(_gbins_step(label, sampler, "spring", False, N_rollouts, N_e, seed, _log))
+        results.append(_gbins_step(label, sampler, "spring", False, N_rollouts, N_e, seed, _log, **du_kwargs))
     if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
 def sweep_penalty(model_label: str, N_rollouts: int, N_e: int, seed: int,
                    progress_cb: Callable | None = None,
-                   _log: Callable | None = None) -> list[dict]:
+                   _log: Callable | None = None, **du_kwargs) -> list[dict]:
     """Sweep φ ∈ PHI_VALUES. Uses Gaussian parametric pricing."""
     results = []
     for i, phi in enumerate(PHI_VALUES):
@@ -308,24 +452,7 @@ def sweep_penalty(model_label: str, N_rollouts: int, N_e: int, seed: int,
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         results.append(_run_sweep_step(
             model_label, f"{phi} €/h", params, pbp_fn, T=24 * 60, N_e=N_e,
-            N_rollouts=N_rollouts, seed=seed, _log=_log,
-        ))
-    if progress_cb: progress_cb(1.0, "Done.")
-    return results
-
-
-def sweep_beta(model_label: str, N_rollouts: int, N_e: int, seed: int,
-               progress_cb: Callable | None = None,
-               _log: Callable | None = None) -> list[dict]:
-    """Sweep the discount factor β ∈ BETA_VALUES over a 24 h horizon."""
-    results = []
-    for i, beta in enumerate(BETA_VALUES):
-        if progress_cb: progress_cb(i / len(BETA_VALUES), f"Solving β = {beta:g}…")
-        params = build_params(model_label, beta=float(beta))
-        pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
-        results.append(_run_sweep_step(
-            model_label, f"β={beta:g}", params, pbp_fn, T=24 * 60, N_e=N_e,
-            N_rollouts=N_rollouts, seed=seed, _log=_log,
+            N_rollouts=N_rollouts, seed=seed, _log=_log, **du_kwargs,
         ))
     if progress_cb: progress_cb(1.0, "Done.")
     return results
@@ -333,7 +460,7 @@ def sweep_beta(model_label: str, N_rollouts: int, N_e: int, seed: int,
 
 def sweep_horizon(model_label: str, N_rollouts: int, N_e: int, seed: int,
                    progress_cb: Callable | None = None,
-                   _log: Callable | None = None) -> list[dict]:
+                   _log: Callable | None = None, **du_kwargs) -> list[dict]:
     """Compare T ∈ {24h, 48h, 168h}. Uses Gaussian parametric pricing."""
     results = []
     for i, T_h in enumerate(HORIZON_HOURS):
@@ -343,7 +470,7 @@ def sweep_horizon(model_label: str, N_rollouts: int, N_e: int, seed: int,
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         results.append(_run_sweep_step(
             model_label, f"{T_h} h", params, pbp_fn, T=T, N_e=N_e,
-            N_rollouts=N_rollouts, seed=seed, _log=_log,
+            N_rollouts=N_rollouts, seed=seed, _log=_log, **du_kwargs,
         ))
     if progress_cb: progress_cb(1.0, "Done.")
     return results
@@ -351,7 +478,7 @@ def sweep_horizon(model_label: str, N_rollouts: int, N_e: int, seed: int,
 
 def sweep_departure_profiles(model_label: str, N_rollouts: int, N_e: int, seed: int,
                                progress_cb: Callable | None = None,
-                               _log: Callable | None = None) -> list[dict]:
+                               _log: Callable | None = None, **du_kwargs) -> list[dict]:
     """Compare departure profiles (p_PD_* overrides) over a 24 h horizon."""
     results = []
     profiles = list(DEPARTURE_PROFILES.items())
@@ -361,7 +488,7 @@ def sweep_departure_profiles(model_label: str, N_rollouts: int, N_e: int, seed: 
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         results.append(_run_sweep_step(
             model_label, label, params, pbp_fn, T=24 * 60, N_e=N_e,
-            N_rollouts=N_rollouts, seed=seed, _log=_log,
+            N_rollouts=N_rollouts, seed=seed, _log=_log, **du_kwargs,
         ))
     if progress_cb: progress_cb(1.0, "Done.")
     return results
@@ -369,7 +496,7 @@ def sweep_departure_profiles(model_label: str, N_rollouts: int, N_e: int, seed: 
 
 def sweep_mobility_models(N_rollouts: int, N_e: int, seed: int,
                            progress_cb: Callable | None = None,
-                           _log: Callable | None = None) -> list[dict]:
+                           _log: Callable | None = None, **du_kwargs) -> list[dict]:
     """Compare NegBin mobility models: {fixed-k, Poisson-k} × {k=5, k=10} (4 configs)."""
     configs = [
         (NEGBIN_FIXED_MODEL,   "NegBin fixed k=5",    NegBinParams(k=5)),
@@ -383,9 +510,177 @@ def sweep_mobility_models(N_rollouts: int, N_e: int, seed: int,
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         results.append(_run_sweep_step(
             model, label, params, pbp_fn, T=24 * 60, N_e=N_e,
-            N_rollouts=N_rollouts, seed=seed, _log=_log,
+            N_rollouts=N_rollouts, seed=seed, _log=_log, **du_kwargs,
         ))
     if progress_cb: progress_cb(1.0, "Done.")
+    return results
+
+
+def sweep_target_ceiling(
+    model_label: str = BASELINE_MODEL,
+    N_rollouts: int = 500,
+    seed: int = 42,
+    step_kwh: float = 5.0,
+    progress_cb: Callable | None = None,
+    _log: Callable | None = None,
+) -> list[dict]:
+    """Sweep the Departure Urgency target ceiling from e_min+step to e_max.
+
+    Returns a list of dicts with keys:
+        target_kwh, target_frac, mean_cost, std_cost, mean_penalty, mean_charged, reserve_frac
+    """
+    from ev_mdt.models.common.policies import next_trip_policy
+    from ev_mdt.models.common.rollout_utils import generate_rollout_scenario, rollout_metrics
+
+    params    = build_params(model_label)
+    pbp_fn    = lambda t, p=params: _gaussian_pbp(t, p)
+    _rf       = rollout_fn(model_label)
+    T         = 24 * 60
+
+    ceil_values = np.arange(params.e_min + step_kwh, params.e_max + 1e-6, step_kwh)
+    ceil_values = ceil_values[ceil_values <= params.e_max]
+
+    rng       = np.random.default_rng(seed)
+    scenarios = [
+        generate_rollout_scenario(params, int(rng.integers(0, 1_000_000)), horizon=T)
+        for _ in range(N_rollouts)
+    ]
+    e0s = [float(rng.uniform(params.e_min, params.e_max)) for _ in range(N_rollouts)]
+
+    from tqdm import tqdm
+
+    outer = tqdm(list(ceil_values), desc="Target ceiling", unit="step", position=0)
+    rows  = []
+    for ceil_kwh in outer:
+        outer.set_postfix(ceiling=f"{ceil_kwh:.0f} kWh")
+        costs, penalties, charged, charge_costs, penalty_costs = [], [], [], [], []
+
+        inner = tqdm(list(zip(scenarios, e0s)), desc="  rollouts", unit="rollout",
+                     position=1, leave=False)
+        for sc, e0 in inner:
+            result = _rf(
+                next_trip_policy, sc, float(e0), 0, params,
+                price_bin_probs_fn=pbp_fn,
+                _ceil_override=float(ceil_kwh),
+            )
+            m = rollout_metrics(result, params)
+            costs.append(m["Total cost (€)"])
+            penalties.append(m["Penalty minutes"])
+            charged.append(m["Energy charged (kWh)"])
+            charge_costs.append(m["Charging cost (€)"])
+            penalty_costs.append(m["Penalty cost (€)"])
+        inner.close()
+
+        rows.append({
+            "target_kwh":        float(ceil_kwh),
+            "target_frac":       float(ceil_kwh) / params.e_max,
+            "mean_cost":         float(np.mean(costs)),
+            "std_cost":          float(np.std(costs)),
+            "mean_penalty":      float(np.mean(penalties)),
+            "mean_charged":      float(np.mean(charged)),
+            "mean_charge_cost":  float(np.mean(charge_costs)),
+            "mean_penalty_cost": float(np.mean(penalty_costs)),
+        })
+        i = len(rows)
+        if progress_cb: progress_cb(i / len(ceil_values), f"ceiling {ceil_kwh:.0f} kWh")
+
+    outer.close()
+    return rows
+
+
+def sweep_gamma(
+    N_rollouts: int = 500,
+    seed: int = 42,
+    use_reserve: bool = True,
+    gamma_values: list | None = None,
+    progress_cb: Callable | None = None,
+    _log: Callable | None = None,
+) -> dict[str, list[dict]]:
+    """Sweep γ ∈ gamma_values for each of the three mobility models.
+
+    For each (model, γ) the policy computes:
+        e_ceil = min(e_max, E_CEIL_BASE × (e_daily / e_daily_ref) ^ γ)
+    where E_CEIL_BASE = 25.0 kWh (from target-sweep at Baseline) and e_daily_ref
+    is the Baseline daily energy demand.
+
+    Returns {model_name: [row_dict, ...]} with keys:
+        gamma, target_kwh, mean_cost, std_cost,
+        mean_charge_cost, mean_penalty_cost, mean_penalty, mean_charged
+    """
+    from tqdm import tqdm
+    from ev_mdt.models.common.policies import next_trip_policy, _du_e_daily, E_CEIL_BASE, _e_daily_ref
+    from ev_mdt.models.common.rollout_utils import rollout_metrics, generate_rollout_scenario
+
+    if gamma_values is None:
+        gamma_values = [round(g, 2) for g in np.arange(0.1, 1.01, 0.1)]
+
+    e_daily_ref = _e_daily_ref()
+
+    model_configs = [
+        (BASELINE_MODEL,       "Baseline",            build_params(BASELINE_MODEL)),
+        (NEGBIN_FIXED_MODEL,   "NegBin fixed k=5",    NegBinParams(k=5)),
+        (NEGBIN_SAMPLED_MODEL, "NegBin Poisson k=5",  NegBinParams(lambda_k=5.0,
+                                                       k=NegBinParams.k_max_for_lambda(5.0))),
+    ]
+
+    total_steps = len(model_configs) * len(gamma_values)
+    step_i = 0
+    results: dict[str, list[dict]] = {}
+
+    outer = tqdm(model_configs, desc="Models", unit="model", position=0)
+    for model_label, model_name, params in outer:
+        outer.set_postfix(model=model_name)
+        _rf    = rollout_fn(model_label)
+        pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
+
+        # Pre-generate scenarios once per model
+        rng       = np.random.default_rng(seed)
+        scenarios = [
+            generate_rollout_scenario(params, int(rng.integers(0, 1_000_000)), horizon=24*60)
+            for _ in range(N_rollouts)
+        ]
+        e0s = [float(rng.uniform(params.e_min, params.e_max)) for _ in range(N_rollouts)]
+
+        e_daily = _du_e_daily(params)
+        ratio   = e_daily / e_daily_ref if e_daily_ref > 0 else 1.0
+
+        rows: list[dict] = []
+        inner = tqdm(gamma_values, desc=f"  γ sweep ({model_name})", unit="γ",
+                     position=1, leave=False)
+        for gamma in inner:
+            target_kwh = min(params.e_max, E_CEIL_BASE * ratio ** gamma)
+
+            costs, charge_costs, penalty_costs, penalties, charged = [], [], [], [], []
+            for sc, e0 in zip(scenarios, e0s):
+                result = _rf(
+                    next_trip_policy, sc, float(e0), 0, params,
+                    price_bin_probs_fn=pbp_fn,
+                    gamma=gamma,
+                    use_reserve=use_reserve,
+                )
+                m = rollout_metrics(result, params)
+                costs.append(m["Total cost (€)"])
+                charge_costs.append(m["Charging cost (€)"])
+                penalty_costs.append(m["Penalty cost (€)"])
+                penalties.append(m["Penalty minutes"])
+                charged.append(m["Energy charged (kWh)"])
+
+            rows.append({
+                "gamma":             gamma,
+                "target_kwh":        target_kwh,
+                "mean_cost":         float(np.mean(costs)),
+                "std_cost":          float(np.std(costs)),
+                "mean_charge_cost":  float(np.mean(charge_costs)),
+                "mean_penalty_cost": float(np.mean(penalty_costs)),
+                "mean_penalty":      float(np.mean(penalties)),
+                "mean_charged":      float(np.mean(charged)),
+            })
+            step_i += 1
+            if progress_cb:
+                progress_cb(step_i / total_steps, f"{model_name} γ={gamma:.1f}")
+        inner.close()
+        results[model_name] = rows
+    outer.close()
     return results
 
 
@@ -523,8 +818,6 @@ def run_all_sweeps(
             all_results[sweep] = sweep_pricing_crisis(sampler_excl, sampler_incl, sampler_crisis, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "penalty":
             all_results[sweep] = sweep_penalty(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log)
-        elif sweep == "beta":
-            all_results[sweep] = sweep_beta(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "horizon":
             all_results[sweep] = sweep_horizon(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log)
         elif sweep == "departure_profile":
@@ -545,7 +838,6 @@ _SWEEP_FOLDER = {
     "pricing_daytype":   "pricing_daytype",
     "pricing_crisis":    "pricing_crisis",
     "penalty":           "penalty",
-    "beta":              "beta",
     "horizon":           "horizon",
     "departure_profile": "departure_profile",
     "mobility_model":    "mobility_model",
@@ -554,7 +846,6 @@ _SWEEP_FOLDER = {
 # Heatmap-grid columns per sweep (single source of truth; app + CLI + figure export).
 HEATMAP_NCOLS = {
     "penalty": 3,
-    "beta": 3,
     "pricing_season": 2,
     "mobility_model": 2,
     "pricing_crisis": 3,
@@ -578,6 +869,8 @@ def save_figures(
     from ev_mdt.plots.sensitivity import (
         fig_heatmap_grid, fig_charge_boundary_grid, fig_cost_distribution, figure_to_png,
         fig_baseline_cost, fig_baseline_trajectories, fig_rollout_trajectories,
+        fig_benchmark_heatmap_grid, fig_baseline_policy_heatmaps,
+        fig_heatmap_grid_du, fig_charge_boundary_grid_du,
     )
     from ev_mdt.plots.trip_duration import compute_trip_durations, trip_duration_figure
 
@@ -591,9 +884,12 @@ def save_figures(
 
         ncols = HEATMAP_NCOLS.get(sweep_name, 1)
         figs = {
-            "policy_heatmaps": fig_heatmap_grid(results, ncols=ncols),
-            "charge_border":   fig_charge_boundary_grid(results),
-            "cost":            fig_cost_distribution(results),
+            "policy_heatmaps":           fig_heatmap_grid(results, ncols=ncols),
+            "policy_heatmaps_du":        fig_heatmap_grid_du(results, ncols=ncols),
+            "benchmark_policy_heatmaps": fig_benchmark_heatmap_grid(results),
+            "charge_border":             fig_charge_boundary_grid(results),
+            "charge_border_du":          fig_charge_boundary_grid_du(results),
+            "cost":                      fig_cost_distribution(results),
         }
         for name, fig in figs.items():
             p = dest / f"{name}.png"
@@ -625,9 +921,20 @@ def save_figures(
                                      params, scenarios, rollout_fn(model_label), pbp_fn)
 
             for name, fig in (("cost", fig_baseline_cost(full)),
-                              ("optimal_policy", fig_heatmap_grid([result], show_titles=False))):
+                              ("optimal_policy", fig_heatmap_grid([result], show_titles=False)),
+                              ("optimal_policy_du", fig_heatmap_grid_du([result], show_titles=False))):
                 p = bm_dir / f"{prefix}_{name}.png"
                 p.write_bytes(figure_to_png(fig))
+                saved.append(p)
+
+            if model_label == BASELINE_MODEL:
+                fig_nonopt = fig_baseline_policy_heatmaps(
+                    result["params"], result["e_grid"], result["lam_grid"],
+                    result["T"], result["pbp_fn"],
+                    pi=result["pi"], actions=result["actions"],
+                )
+                p = bm_dir / "non_optimal_policy_heatmaps.png"
+                p.write_bytes(figure_to_png(fig_nonopt))
                 saved.append(p)
 
             if model_label == BASELINE_MODEL:
@@ -679,9 +986,14 @@ def save_tables(
     seed: int = 42,
     N_e: int = 500,
     include_baseline: bool = True,
+    compute_exact: bool = True,
     _log: Callable | None = None,
 ) -> list[Path]:
     """Write the per-sweep and (optionally) baseline-model summary tables as CSV.
+
+    ``compute_exact=False`` skips the slow analytical exact-cost step for the
+    baseline-model table (the ``Exact cost (€)`` column is omitted); the
+    rollout-based metrics are unaffected.
 
     Mirrors save_figures' directory layout under out_dir:
         sensitivity_figures/<sweep>/summary.csv   — one row per (swept value, policy)
@@ -694,12 +1006,14 @@ def save_tables(
     out_dir = Path(out_dir)
     saved: list[Path] = []
 
+    import pandas as pd
     for sweep_name, results in all_results.items():
         folder = _SWEEP_FOLDER.get(sweep_name, sweep_name)
         dest = out_dir / "sensitivity_figures" / folder
         dest.mkdir(parents=True, exist_ok=True)
         p = dest / "summary.csv"
-        build_summary_df(results).to_csv(p, index=False)
+        df = build_summary_df(results)
+        df.to_csv(p, index=False)
         saved.append(p)
         if _log: _log(f"  Saved table: {p}")
 
@@ -716,9 +1030,27 @@ def save_tables(
             rollouts = run_rollouts(
                 result["pi"], result["actions"], result["e_grid"], params,
                 scenarios, rollout_fn(model_label), pbp_fn, desc=f"    [{label}] rollouts")
-            model_results.append({"rollouts": rollouts, "label": label})
+            if compute_exact:
+                if _log: _log(f"  [{label}] computing exact costs…")
+                result["exact_costs"] = compute_all_exact_costs(
+                    result, desc=f"    [{label}] exact costs")
+            else:
+                result["exact_costs"] = {}
+            model_results.append({"rollouts": rollouts, "label": label,
+                                  "exact_costs": result["exact_costs"]})
         import pandas as pd
-        df = pd.concat([build_summary_df([r]) for r in model_results], ignore_index=True)
+        rollout_df = pd.concat([build_summary_df([r]) for r in model_results], ignore_index=True)
+        rollout_df = rollout_df.rename(columns={"Swept value": "Model"})
+        if compute_exact:
+            exact_rows = [
+                {"Model": r["label"], "Policy": policy, "Exact cost (€)": cost}
+                for r in model_results
+                for policy, cost in r["exact_costs"].items()
+            ]
+            exact_df = pd.DataFrame(exact_rows)
+            df = exact_df.merge(rollout_df, on=["Model", "Policy"], how="right")
+        else:
+            df = rollout_df
         p = bm_dir / "summary.csv"
         df.to_csv(p, index=False)
         saved.append(p)

@@ -9,6 +9,13 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from ev_mdt.models.common.model_utils import (
+    expected_trip_minutes, max_minutes_to_departure,
+    mean_minutes_to_departure, minutes_to_departure,
+)
+from ev_mdt.models.common.policies import (
+    E_CEIL_BASE, _du_e_daily, _e_daily_ref, du_gamma_for_params,
+)
 from ev_mdt.plots.viz import POLICY_COLORS, POLICY_ORDER, rgba as _rgba
 
 
@@ -74,6 +81,87 @@ def _charge_battery_ceiling(pi, actions, e_grid, t: int) -> np.ndarray:
     top_e    = (charging * e_rank).max(axis=0) - 1                # (K,) highest charging e-index
     return np.where(charging.any(axis=0),
                     e_grid[np.clip(top_e, 0, len(e_grid) - 1)], np.nan)
+
+
+def _du_e_ceil(params, gamma=None) -> float:
+    """Demand-scaled DU ceiling for the given params and gamma (None → per-model γ)."""
+    if gamma is None:
+        gamma = du_gamma_for_params(params)
+    e_daily = _du_e_daily(params)
+    ref     = _e_daily_ref()
+    ratio   = e_daily / ref if ref > 0 else 1.0
+    return min(params.e_max, E_CEIL_BASE * ratio ** gamma)
+
+
+def _du_rates_averaged(params, pbp_fn, T: int, e_grid, lam_grid, chi: int = 0,
+                       gamma=None, use_reserve: bool = True) -> np.ndarray:
+    """Price-averaged Departure Urgency charge rate u_DU(t, e) (gamma None → per-model γ)."""
+    e_trip  = expected_trip_minutes(params) * params.mu * params.v * params.omega
+    e_ceil  = _du_e_ceil(params, gamma)
+
+    rates = np.zeros((T, len(e_grid)))
+    for t in range(T):
+        probs = np.asarray(pbp_fn(t))                              # (K,)
+        tau   = minutes_to_departure(t, params)
+
+        deliverable = params.u_max * params.eta_c * params.omega * tau
+        rho = np.clip((e_ceil - e_grid) / deliverable, 0.0, 1.0) if deliverable > 0 else np.ones(len(e_grid))
+
+        cumprobs = np.cumsum(probs)                                # (K,) — CDF at each bin
+        extra    = 1.0 / tau if tau > 0 else 0.0
+
+        rho_2d = rho[:, np.newaxis]                                # (N_e, 1)
+        cum_2d = cumprobs[np.newaxis, :]                           # (1, K)
+        u = np.where(cum_2d <= rho_2d,
+                     params.u_max,
+                     np.where(cum_2d <= rho_2d + extra, params.u_max / 2.0, 0.0))  # (N_e, K)
+
+        if use_reserve:
+            u[e_grid < e_trip, :] = params.u_max
+        if chi > 0:
+            u[e_grid > params.e_min, :] = 0.0
+        u[e_grid >= params.e_max, :] = 0.0
+
+        rates[t] = (u * probs[np.newaxis, :]).sum(axis=1)
+
+    return np.clip(rates, 0.0, params.u_max)
+
+
+def _du_charge_battery_ceiling(params, pbp_fn, e_grid, t: int,
+                                gamma=None, use_reserve: bool = True) -> np.ndarray:
+    """(K,) highest battery at which DU still charges per price bin at t (gamma None → per-model γ)."""
+    probs   = np.asarray(pbp_fn(t))                                # (K,)
+    tau     = minutes_to_departure(t, params)
+    e_trip  = expected_trip_minutes(params) * params.mu * params.v * params.omega
+    e_ceil  = _du_e_ceil(params, gamma)
+
+    deliverable = params.u_max * params.eta_c * params.omega * tau
+    rho = np.clip((e_ceil - e_grid) / deliverable, 0.0, 1.0) if deliverable > 0 else np.ones(len(e_grid))
+
+    cumprobs = np.cumsum(probs)                                    # (K,)
+    extra    = 1.0 / tau if tau > 0 else 0.0
+
+    rho_2d = rho[:, np.newaxis]                                    # (N_e, 1)
+    cum_2d = cumprobs[np.newaxis, :]                               # (1, K)
+
+    charging = (cum_2d <= rho_2d + extra) & (e_grid[:, np.newaxis] < params.e_max)  # (N_e, K)
+    if use_reserve:
+        charging[e_grid < e_trip, :] = True
+    charging[e_grid >= params.e_max, :] = False
+
+    e_rank = (np.arange(len(e_grid)) + 1)[:, np.newaxis]
+    top_e  = (charging * e_rank).max(axis=0) - 1                  # (K,)
+    return np.where(charging.any(axis=0),
+                    e_grid[np.clip(top_e, 0, len(e_grid) - 1)], np.nan)
+
+
+def _blu_charge_battery_ceiling(params, pbp_fn, t: int) -> np.ndarray:
+    """(K,) highest battery at which Battery Level Urgency still charges per price bin at time t.
+
+    BLU charges u_max iff F_t(λ) ≤ 1 − e/e_max, i.e. e ≤ e_max·(1 − F_t(λ)).
+    """
+    cumprobs = np.cumsum(np.asarray(pbp_fn(t)))                   # F_t at each bin
+    return np.clip(params.e_max * (1.0 - cumprobs), 0.0, params.e_max)
 
 
 # ── Public figure factories ────────────────────────────────────────────────────
@@ -156,45 +244,240 @@ def fig_charge_boundary_grid(results: list[dict]) -> go.Figure:
         template="plotly_white",
         plot_bgcolor="white",
         paper_bgcolor="white",
-        height=350 * rows + 60, 
+        height=350 * rows + 60,
         margin=dict(l=60, r=60, t=40, b=60)
     )
     return fig
 
 
+def fig_heatmap_grid_du(results: list[dict], ncols: int = 1, time_bin_min: int = 1,
+                         battery_bin_kwh: float = 0.5, show_titles: bool = True) -> go.Figure:
+    """Departure Urgency policy heatmap (price-averaged). Same layout as fig_heatmap_grid."""
+    n    = len(results)
+    rows = int(np.ceil(n / ncols))
+    fig  = make_subplots(
+        rows=rows, cols=ncols,
+        subplot_titles=[r["label"] for r in results] if show_titles else None,
+        horizontal_spacing=0.08 if ncols > 1 else 0.0,
+        vertical_spacing=0.14 if rows > 1 else 0.0,
+    )
+    for idx, r in enumerate(results):
+        row = idx // ncols + 1
+        col = idx %  ncols + 1
+        T   = r["T"]
+        rates = _du_rates_averaged(r["params"], r["pbp_fn"], T, r["e_grid"], r["lam_grid"])
+        z, t_centers, b_centers = _bin_heatmap(
+            rates, r["e_grid"], T, time_bin_min, battery_bin_kwh,
+            r["params"].e_min, r["params"].e_max,
+        )
+        fig.add_trace(go.Heatmap(
+            x=t_centers, y=b_centers, z=z,
+            zmin=0, zmax=r["params"].u_max,
+            colorscale="RdYlBu_r",
+            showscale=(idx == 0),
+            colorbar=dict(title="u (kW)", x=1.01) if idx == 0 else None,
+            hovertemplate="Hour: %{x:.2f} h<br>Battery: %{y:.2f} kWh<br>u_DU: %{z:.2f} kW<extra></extra>",
+        ), row=row, col=col)
+        fig.update_xaxes(title_text="Hour (h)" if row == rows else "", range=[0, T // 60],
+                         title_standoff=12, showticklabels=(row == rows), row=row, col=col)
+        fig.update_yaxes(title_text="Battery (kWh)" if col == 1 else "",
+                         title_standoff=16, row=row, col=col)
+    fig.update_layout(
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=280 * rows + 70,
+        margin=dict(l=70, r=60, t=55, b=50),
+    )
+    for ann in fig.layout.annotations:
+        ann.yshift = 10
+    return fig
+
+
+def fig_charge_boundary_grid_du(results: list[dict]) -> go.Figure:
+    """Benchmark charge/no-charge borders across sweep values.
+
+    Layout mirrors fig_benchmark_heatmap_grid: rows = sweep values, cols = 2
+    (Battery Level Urgency, Departure Urgency). One curve per hour of the day.
+    """
+    from plotly.colors import sample_colorscale
+    n = len(results)
+    ncols = 2
+    titles = [f"{r['label']} — {p}" for r in results for p in _BENCHMARK_POLICY_NAMES]
+    fig = make_subplots(rows=n, cols=ncols, subplot_titles=titles,
+                        horizontal_spacing=0.10, vertical_spacing=0.14 if n > 1 else 0.0)
+    for i, r in enumerate(results):
+        row = i + 1
+        n_h = min(24, r["T"] // 60)
+        for j, pname in enumerate(_BENCHMARK_POLICY_NAMES):
+            col = j + 1
+            for h in range(n_h):
+                if pname == "Battery Level Urgency":
+                    ceil = _blu_charge_battery_ceiling(r["params"], r["pbp_fn"], h * 60)
+                else:
+                    ceil = _du_charge_battery_ceiling(r["params"], r["pbp_fn"], r["e_grid"], h * 60)
+                color = sample_colorscale("Viridis", [h / max(1, n_h - 1)])[0]
+                fig.add_trace(go.Scatter(
+                    x=r["lam_grid"], y=ceil, mode="lines", line=dict(color=color, width=1.3),
+                    showlegend=False,
+                    hovertemplate=f"{pname}<br>Hour {h:02d}:00<br>Price %{{x:.3f}} €/kWh<br>"
+                                  "charge if battery ≤ %{y:.1f} kWh<extra></extra>",
+                ), row=row, col=col)
+            fig.update_xaxes(title_text="Price (€/kWh)" if row == n else "",
+                             title_standoff=12, showticklabels=(row == n), row=row, col=col)
+            fig.update_yaxes(title_text="Battery (kWh)" if col == 1 else "",
+                             title_standoff=12,
+                             range=[0, r["params"].e_max], row=row, col=col)
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None], mode="markers",
+        marker=dict(colorscale="Viridis", cmin=0, cmax=23, color=[0], showscale=True,
+                    colorbar=dict(title="Hour", x=1.01)),
+        showlegend=False, hoverinfo="skip",
+    ), row=1, col=1)
+    fig.update_layout(
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=320 * n + 60,
+        margin=dict(l=60, r=60, t=50, b=60),
+    )
+    for ann in fig.layout.annotations:
+        ann.yshift = 10
+    return fig
+
+
+def _cost_floor(totals: np.ndarray) -> float:
+    """Common log-axis floor below all positive totals (anchors the proportional split)."""
+    pos = totals[totals > 0]
+    return float(pos.min() / 3.0) if pos.size else 1e-3
+
+
+def _log_err_arms(totals, errs):
+    """Log-symmetric error arms for ±err around totals (delta method).
+
+    A symmetric linear ±SEM looks lopsided on a log axis (the lower arm plunges and
+    can cross zero). Converting to a half-width in log10 units, d = (err/total)/ln10,
+    gives caps at total·10^±d — balanced on the log axis and always positive. Returns
+    (array_up, array_minus_down) suitable for a plotly error_y with symmetric=False.
+    """
+    totals = np.asarray(totals, float)
+    errs   = np.asarray(errs,   float)
+    safe   = np.where(totals > 0, totals, 1.0)
+    d  = (errs / safe) / np.log(10.0)
+    up = totals * (10.0 ** d - 1.0)
+    dn = totals * (1.0 - 10.0 ** (-d))
+    return up, dn
+
+
+def _add_stacked_cost_bars(fig, xs, totals, charge, penalty, color, name, errs, *,
+                           log_y: bool, y0: float, offsetgroup=None,
+                           showlegend: bool = True, row=None, col=None) -> None:
+    """Stacked charging+penalty bar per x: total height = total cost, split by cost %.
+
+    On a log axis the segment boundary is placed so the *visual* split equals the
+    charging/penalty proportion (e.g. 25/75 → bottom ¼ charging, top ¾ penalty);
+    charging is the full solid policy colour, penalty is a 50%-saturated fill of the
+    same colour hatched (gestreift) with diagonal stripes in the full colour.
+    """
+    totals  = np.asarray(totals,  float)
+    charge  = np.asarray(charge,  float)
+    penalty = np.asarray(penalty, float)
+    safe    = np.where(totals > 0, totals, 1.0)
+    frac_c  = np.clip(charge / safe, 0.0, 1.0)                       # charging share
+    pen_fill = _rgba(color, 0.50)                                   # penalty fill (50%)
+
+    if log_y:
+        tot = np.where(totals > y0, totals, y0)
+        B   = y0 * (tot / y0) ** frac_c                             # split boundary value
+        charge_base, charge_len = np.full_like(tot, y0), B - y0
+        pen_base,    pen_len    = B, tot - B
+    else:
+        charge_base, charge_len = np.zeros_like(totals), charge
+        pen_base,    pen_len    = charge, penalty
+
+    pct_c = (frac_c * 100)
+    pct_p = (100 - pct_c)
+    pos = dict(row=row, col=col) if row is not None else {}
+    # Charging share: full solid policy colour.
+    fig.add_trace(go.Bar(
+        x=xs, base=charge_base, y=charge_len, name=name, legendgroup=name,
+        marker_color=color, showlegend=showlegend, offsetgroup=offsetgroup,
+        customdata=np.stack([charge, pct_c], axis=-1),
+        hovertemplate="%{x}<br>charging %{customdata[0]:.3f} € (%{customdata[1]:.0f}%)"
+                      f"<extra>{name}</extra>",
+    ), **pos)
+    # Penalty share: 50%-saturated fill, diagonal hatch (gestreift) in the full colour.
+    fig.add_trace(go.Bar(
+        x=xs, base=pen_base, y=pen_len, name=name, legendgroup=name,
+        marker=dict(color=pen_fill, pattern=dict(shape="/", fgcolor=color,
+                                                 size=8, solidity=0.42)),
+        showlegend=False, offsetgroup=offsetgroup,
+        customdata=np.stack([totals, penalty, pct_p], axis=-1),
+        hovertemplate="%{x}<br>total %{customdata[0]:.3f} €<br>"
+                      "penalty %{customdata[1]:.3f} € (%{customdata[2]:.0f}%)"
+                      f"<extra>{name}</extra>",
+    ), **pos)
+    # Error bars (±SEM/Std on total): carried by a transparent full-height bar so the
+    # whisker is centred at the *total* (Plotly centres error_y at the bar's y-length,
+    # which for the based segments above would land mid-bar). Same offsetgroup keeps it
+    # aligned within the policy's grouped slot. On a log axis use log-symmetric arms so
+    # the whisker is balanced and never plunges below zero.
+    if log_y:
+        up, dn = _log_err_arms(totals, errs)
+        err_kw = dict(type="data", symmetric=False, array=up, arrayminus=dn)
+    else:
+        err_kw = dict(type="data", array=np.asarray(errs, float))
+    fig.add_trace(go.Bar(
+        x=xs, y=totals, offsetgroup=offsetgroup, legendgroup=name,
+        marker=dict(color="rgba(0,0,0,0)"), showlegend=False, hoverinfo="skip",
+        error_y=dict(visible=True, thickness=1.2, width=4, color="#333333", **err_kw),
+    ), **pos)
+
+
 def fig_cost_distribution(results: list[dict], log_y: bool = True,
                            x_label: str = "Swept value", error: str = "sem") -> go.Figure:
-    """Mean total cost (incl. penalty) over sampled rollouts, grouped bars per swept value."""
+    """Mean total cost bar per policy, grouped by swept value (charging/penalty split)."""
     labels = [r["label"] for r in results]
-    fig = go.Figure()
+    series = []   # (policy, totals, charge, penalty, errs)
     for policy in POLICY_ORDER:
-        means, errs = [], []
+        if not all(policy in r["rollouts"] for r in results):
+            continue
+        totals, charge, penalty, errs = [], [], [], []
         for r in results:
-            costs = _costs(r["rollouts"], policy)
-            n = len(costs)
-            sd = float(np.std(costs, ddof=1)) if n > 1 else 0.0
-            means.append(float(np.mean(costs)))
+            mlist = r["rollouts"][policy]
+            tot = np.array([m["Charging cost (€)"] + m["Penalty cost (€)"] for m in mlist])
+            n  = len(tot)
+            sd = float(np.std(tot, ddof=1)) if n > 1 else 0.0
+            totals.append(float(tot.mean()))
+            charge.append(float(np.mean([m["Charging cost (€)"] for m in mlist])))
+            penalty.append(float(np.mean([m["Penalty cost (€)"] for m in mlist])))
             errs.append(sd / np.sqrt(n) if (error == "sem" and n > 0) else sd)
-        minus = [min(e, m) for m, e in zip(means, errs)]
-        fig.add_trace(go.Bar(
-            x=labels, y=means, name=policy, marker_color=POLICY_COLORS[policy],
-            error_y=dict(type="data", symmetric=False, array=errs, arrayminus=minus,
-                         visible=True, thickness=1.2, width=4),
-            hovertemplate="%{x}<br>mean %{y:.3f} € (± %{error_y.array:.3f})<extra>" + policy + "</extra>",
-        ))
-    yaxis = dict(title="Mean total cost incl. penalty (€)" + ("  [log]" if log_y else ""),
+        series.append((policy, np.array(totals), np.array(charge), np.array(penalty), errs))
+
+    all_totals = np.concatenate([s[1] for s in series]) if series else np.array([1.0])
+    all_errs   = np.concatenate([np.asarray(s[4], float) for s in series]) if series else np.array([0.0])
+    y0 = _cost_floor(all_totals)
+
+    fig = go.Figure()
+    for policy, totals, charge, penalty, errs in series:
+        _add_stacked_cost_bars(fig, labels, totals, charge, penalty,
+                               POLICY_COLORS[policy], policy, errs,
+                               log_y=log_y, y0=y0, offsetgroup=policy)
+
+    yaxis = dict(title="Mean cost (€)" + ("  [log]" if log_y else ""),
                  type="log" if log_y else "linear")
     if log_y:
-        yaxis["dtick"] = 1
+        top = (all_totals + _log_err_arms(all_totals, all_errs)[0]).max()  # include upper whisker
+        yaxis["range"] = [np.log10(y0), np.log10(top * 1.1)]
+        yaxis["dtick"] = 1          # decade ticks only: 0.1, 1, 10, …
     fig.update_layout(
         template="plotly_white",
         plot_bgcolor="white",
         paper_bgcolor="white",
         barmode="group", yaxis=yaxis, height=440,
         margin=dict(l=80, r=20, t=40, b=40),
-        # Compact single-row legend: 7 policies still fit one line at this size.
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
-                    font=dict(size=14), itemsizing="constant"),
+                    font=dict(size=11), itemsizing="constant"),
     )
     return fig
 
@@ -205,6 +488,8 @@ SUMMARY_METRIC_FORMATS = {
     "Mean cost (€)":             "{:.3f}",
     "SEM cost (€)":              "{:.3f}",
     "Std cost (€)":              "{:.3f}",
+    "Mean charging (€)":         "{:.3f}",
+    "Mean penalty (€)":          "{:.3f}",
     "Mean penalty min":          "{:.1f}",
     "% scenarios with penalty":  "{:.1f}%",
     "Mean energy charged (kWh)": "{:.2f}",
@@ -212,16 +497,24 @@ SUMMARY_METRIC_FORMATS = {
 
 
 def _cost_summary(mlist: list[dict]) -> dict:
-    """The six per-policy summary metrics from a list of per-rollout metric dicts."""
-    costs  = np.array([m["Total cost (€)"]      for m in mlist])
-    pen    = np.array([m["Penalty minutes"]      for m in mlist])
-    energy = np.array([m["Energy charged (kWh)"] for m in mlist])
+    """Per-policy summary metrics from a list of per-rollout metric dicts.
+
+    Includes the charging-€ / penalty-€ split so the stacked cost bars can be
+    rebuilt from the saved CSV without re-running the rollouts.
+    """
+    costs   = np.array([m["Total cost (€)"]      for m in mlist])
+    charge  = np.array([m["Charging cost (€)"]   for m in mlist])
+    pencost = np.array([m["Penalty cost (€)"]    for m in mlist])
+    pen     = np.array([m["Penalty minutes"]      for m in mlist])
+    energy  = np.array([m["Energy charged (kWh)"] for m in mlist])
     n  = len(costs)
     sd = float(costs.std(ddof=1)) if n > 1 else 0.0
     return {
         "Mean cost (€)":             float(costs.mean()),
         "SEM cost (€)":              sd / np.sqrt(n) if n > 0 else 0.0,
         "Std cost (€)":              sd,
+        "Mean charging (€)":         float(charge.mean()),
+        "Mean penalty (€)":          float(pencost.mean()),
         "Mean penalty min":          float(pen.mean()),
         "% scenarios with penalty":  float((pen > 0).mean() * 100),
         "Mean energy charged (kWh)": float(energy.mean()),
@@ -238,33 +531,50 @@ def build_summary_df(results: list[dict]) -> pd.DataFrame:
 
 
 def fig_baseline_cost(full: dict, *, error: str = "sem", log_y: bool = True) -> go.Figure:
-    """Per-policy mean total cost (incl. penalty), ordered by POLICY_ORDER, ±SEM/Std."""
-    names = [p for p in POLICY_ORDER if p in full]
-    means, errs = [], []
+    """Per-policy bar: total mean cost ±SEM, split into charging/penalty shares."""
+    names = [p for p in POLICY_ORDER if p in full and full[p]]
+    totals, charge, penalty, errs = [], [], [], []
     for name in names:
-        costs = np.array([r["cost_traj"].sum() for r in full[name]])
+        rollouts = full[name]
+        ccost = np.array([r["charge_cost_traj"].sum()  for r in rollouts])
+        pcost = np.array([r["penalty_cost_traj"].sum() for r in rollouts])
+        costs = ccost + pcost
         m  = len(costs)
         sd = float(costs.std(ddof=1)) if m > 1 else 0.0
-        means.append(float(costs.mean()))
+        totals.append(float(costs.mean()))
+        charge.append(float(ccost.mean()))
+        penalty.append(float(pcost.mean()))
         errs.append(sd / np.sqrt(m) if (error == "sem" and m > 0) else sd)
-    minus = [min(e, mu) for mu, e in zip(means, errs)]
-    fig = go.Figure(go.Bar(
-        x=names, y=means, marker_color=[POLICY_COLORS[n] for n in names],
-        error_y=dict(type="data", symmetric=False, array=errs, arrayminus=minus,
-                     visible=True, thickness=1.2, width=4)))
-    yaxis = dict(title="Mean total cost incl. penalty (€)" + ("  [log]" if log_y else ""),
+
+    totals_arr = np.array(totals) if totals else np.array([1.0])
+    errs_arr   = np.array(errs)   if errs   else np.array([0.0])
+    y0 = _cost_floor(totals_arr)
+
+    fig = go.Figure()
+    for i, name in enumerate(names):
+        # Shared offsetgroup → one slot per policy category so bars stay full-width
+        # (a unique offsetgroup per policy would split each category into len(names) slots).
+        _add_stacked_cost_bars(fig, [name], [totals[i]], [charge[i]], [penalty[i]],
+                               POLICY_COLORS[name], name, [errs[i]],
+                               log_y=log_y, y0=y0, offsetgroup="cost")
+    yaxis = dict(title="Mean cost (€)" + ("  [log]" if log_y else ""),
                  type="log" if log_y else "linear")
     if log_y:
-        yaxis["dtick"] = 1
+        top = (totals_arr + _log_err_arms(totals_arr, errs_arr)[0]).max()  # include upper whisker
+        yaxis["range"] = [np.log10(y0), np.log10(top * 1.1)]
+        yaxis["dtick"] = 1          # decade ticks only: 0.1, 1, 10, …
+    # baseline_models figure: no legend and no per-bar policy captions (bars are
+    # identified elsewhere); keeps the figure clean for the thesis layout.
     fig.update_layout(
         template="plotly_white",
         plot_bgcolor="white",
         paper_bgcolor="white",
         yaxis=yaxis,
-        xaxis_title="Policy", height=460, margin=dict(l=40, r=20, t=20, b=110),
         showlegend=False,
+        height=460, margin=dict(l=40, r=20, t=20, b=20),
     )
-    fig.update_xaxes(categoryorder="array", categoryarray=POLICY_ORDER)
+    fig.update_xaxes(categoryorder="array", categoryarray=POLICY_ORDER,
+                     showticklabels=False, title_text="")
     return fig
 
 
@@ -398,6 +708,242 @@ def fig_policy_price_map(pi, actions, e_grid, lam_grid, params, chi: int = 0, t:
         xaxis_title="Price (€/kWh)", yaxis_title="Battery (kWh)", height=430,
         margin=dict(l=30, r=30, t=55, b=35),
     )
+    return fig
+
+
+def _price_charge_prob(
+    cumsum: np.ndarray, probs: np.ndarray, rho: np.ndarray
+) -> np.ndarray:
+    """P(F_t(λ) ≤ rho[t,e]) for each (t,e) pair.
+
+    cumsum : (T, K) — cumulative price-bin probabilities
+    probs  : (T, K) — price-bin probabilities
+    rho    : (T, N_e)
+    returns: (T, N_e)
+    """
+    mask = cumsum[:, :, np.newaxis] <= rho[:, np.newaxis, :]   # (T, K, N_e)
+    return (probs[:, :, np.newaxis] * mask).sum(axis=1)         # (T, N_e)
+
+
+def _baseline_policy_rates(
+    name: str, kwargs: dict,
+    e_grid: np.ndarray, lam_grid: np.ndarray, params,
+    T: int, probs: np.ndarray, cumsum: np.ndarray,
+) -> np.ndarray:
+    """(T, N_e) price-averaged parked-state (chi=0) charge rates for one baseline policy.
+
+    Vectorised over the grid so the whole batch is fast enough to compute
+    without a Python loop over the T × N_e × K state space.
+    """
+    N_e = len(e_grid)
+
+    if name == "Always-Maximum":
+        return np.full((T, N_e), params.u_max)
+
+    if name == "Always-Minimum":
+        return np.full((T, N_e), params.u_min)
+
+    if name == "Night Charging":
+        rate_t = np.where(np.arange(T) % 1440 < 360, params.u_max, 0.0)
+        return np.broadcast_to(rate_t[:, np.newaxis], (T, N_e)).copy()
+
+    if name == "Minimum Battery Level":
+        soc = kwargs["soc_threshold"]
+        rate_e = np.where(e_grid < soc, params.u_max, 0.0)
+        return np.broadcast_to(rate_e[np.newaxis, :], (T, N_e)).copy()
+
+    if name == "Price-Oriented":
+        low, high = kwargs["low_threshold"], kwargs["high_threshold"]
+        mask_low = lam_grid[np.newaxis, :] <= low                            # (1, K)
+        mask_mid = (lam_grid[np.newaxis, :] > low) & (lam_grid[np.newaxis, :] <= high)
+        rate_t = (params.u_max       * (probs * mask_low).sum(axis=1)
+                  + params.u_max / 2 * (probs * mask_mid).sum(axis=1))       # (T,)
+        return np.broadcast_to(rate_t[:, np.newaxis], (T, N_e)).copy()
+
+    if name == "Battery Level Urgency":
+        # Charge u_max when F_t(λ) ≤ 1 − e/e_max (price is cheap relative to urgency).
+        thresh = np.clip(1.0 - e_grid / params.e_max, 0.0, 1.0)             # (N_e,)
+        mask = cumsum[:, :, np.newaxis] <= thresh[np.newaxis, np.newaxis, :] # (T, K, N_e)
+        rate = params.u_max * (probs[:, :, np.newaxis] * mask).sum(axis=1)  # (T, N_e)
+        return np.where(e_grid[np.newaxis, :] >= params.e_max, 0.0, rate)
+
+    if name == "Departure Urgency":
+        gamma       = kwargs.get("gamma", None)        # None → per-model γ
+        use_reserve = kwargs.get("use_reserve", True)
+        e_trip      = expected_trip_minutes(params) * params.mu * params.v * params.omega
+        e_ceil      = _du_e_ceil(params, gamma)
+
+        slots = np.array([minutes_to_departure(t, params) for t in range(T)])  # (T,)
+
+        deliverable = params.u_max * params.eta_c * params.omega * slots        # (T,)
+        e_diff      = np.maximum(0.0, e_ceil - e_grid[np.newaxis, :])           # (T, N_e)
+        safe_del    = np.where(deliverable > 0, deliverable, 1.0)
+        rho = np.where(
+            deliverable[:, np.newaxis] > 0,
+            e_diff / safe_del[:, np.newaxis],
+            np.inf,
+        )                                                                        # (T, N_e)
+        band = np.where(slots > 0, 1.0 / slots, 0.0)                           # (T,)
+
+        p1  = _price_charge_prob(cumsum, probs, rho)
+        p12 = _price_charge_prob(cumsum, probs, rho + band[:, np.newaxis])
+        rate = params.u_max * p1 + (params.u_max / 2) * (p12 - p1)
+
+        if use_reserve:
+            rate = np.where(e_grid[np.newaxis, :] < e_trip, params.u_max, rate)
+        rate = np.where(e_grid[np.newaxis, :] >= params.e_max, 0.0, rate)
+        return rate
+
+    raise ValueError(f"No vectorised implementation for policy '{name}'")
+
+
+def fig_baseline_policy_heatmaps(
+    params, e_grid: np.ndarray, lam_grid: np.ndarray, T: int, pbp_fn, *,
+    pi=None, actions=None,
+    low_threshold: float | None = None,
+    high_threshold: float | None = None,
+    soc_threshold: float | None = None,
+    du_gamma=None,
+    du_use_reserve: bool = True,
+    time_bin_min: int = 10,
+    battery_bin_kwh: float = 1.0,
+) -> go.Figure:
+    """Price-averaged policy heatmaps for all baseline (non-BI) policies.
+
+    Accepts the same grid/param args as the other sensitivity figure factories
+    so the app can pass session-state data directly. ``pi`` and ``actions`` are
+    accepted (and forwarded to ``policy_registry``) but only used to generate
+    the registry — BI is dropped from the grid. ``du_gamma=None`` → per-model γ.
+    """
+    from ev_mdt.models.common.policies import policy_registry
+
+    if du_gamma is None:
+        du_gamma = du_gamma_for_params(params)
+    registry = policy_registry(
+        params, pbp_fn,
+        pi=pi, actions=actions, e_grid=e_grid,
+        low_threshold=low_threshold,
+        high_threshold=high_threshold,
+        soc_threshold=soc_threshold,
+        du_gamma=du_gamma,
+        du_use_reserve=du_use_reserve,
+    )
+    policies = [(name, fn, kw) for name, fn, kw in registry if name != "Backward Induction"]
+
+    probs  = np.array([pbp_fn(t) for t in range(T)])   # (T, K)
+    cumsum = probs.cumsum(axis=1)                        # (T, K)
+
+    ncols  = 2
+    nrows  = int(np.ceil(len(policies) / ncols))
+    fig = make_subplots(
+        rows=nrows, cols=ncols,
+        subplot_titles=[name for name, _, _ in policies],
+        horizontal_spacing=0.10,
+        vertical_spacing=0.10,
+    )
+    T_hours = T // 60
+    for idx, (name, _fn, kw) in enumerate(policies):
+        row = idx // ncols + 1
+        col = idx %  ncols + 1
+        rates = _baseline_policy_rates(name, kw, e_grid, lam_grid, params, T, probs, cumsum)
+        rates = np.clip(rates, 0.0, params.u_max)
+        z, t_c, b_c = _bin_heatmap(
+            rates, e_grid, T, time_bin_min, battery_bin_kwh, params.e_min, params.e_max,
+        )
+        fig.add_trace(go.Heatmap(
+            x=t_c, y=b_c, z=z, zmin=0, zmax=params.u_max,
+            colorscale="RdYlBu_r",
+            showscale=(idx == 0),
+            colorbar=dict(title="u (kW)", x=1.02) if idx == 0 else None,
+            hovertemplate="Hour: %{x:.1f} h<br>Battery: %{y:.1f} kWh<br>u: %{z:.2f} kW<extra></extra>",
+        ), row=row, col=col)
+        fig.update_xaxes(
+            title_text="Hour (h)" if row == nrows else "",
+            range=[0, T_hours], title_standoff=10,
+            showticklabels=(row == nrows),
+            row=row, col=col,
+        )
+        fig.update_yaxes(
+            title_text="Battery (kWh)" if col == 1 else "",
+            title_standoff=14, row=row, col=col,
+        )
+    fig.update_layout(
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=260 * nrows + 80,
+        margin=dict(l=70, r=60, t=55, b=50),
+    )
+    for ann in fig.layout.annotations:
+        ann.yshift = 10
+    return fig
+
+
+_BENCHMARK_POLICY_NAMES = ["Departure Urgency", "Battery Level Urgency"]
+
+
+def fig_benchmark_heatmap_grid(
+    results: list[dict],
+    time_bin_min: int = 1,
+    battery_bin_kwh: float = 0.5,
+) -> go.Figure:
+    """Battery Level Urgency and Departure Urgency heatmaps across sweep values.
+
+    Layout: rows = len(results) (one per sweep value), cols = 2 (one per policy).
+    Mirrors fig_heatmap_grid but uses the two main benchmark policies instead of BI.
+    """
+    n = len(results)
+    ncols = 2
+    titles = [f"{r['label']} — {p}" for r in results for p in _BENCHMARK_POLICY_NAMES]
+    fig = make_subplots(
+        rows=n, cols=ncols,
+        subplot_titles=titles,
+        horizontal_spacing=0.10,
+        vertical_spacing=0.14 if n > 1 else 0.0,
+    )
+    for i, r in enumerate(results):
+        row = i + 1
+        T, params, e_grid = r["T"], r["params"], r["e_grid"]
+        lam_grid, pbp_fn = r["lam_grid"], r["pbp_fn"]
+        probs  = np.array([pbp_fn(t) for t in range(T)])
+        cumsum = probs.cumsum(axis=1)
+        for j, pname in enumerate(_BENCHMARK_POLICY_NAMES):
+            col = j + 1
+            rates = _baseline_policy_rates(pname, {}, e_grid, lam_grid, params, T, probs, cumsum)
+            rates = np.clip(rates, 0.0, params.u_max)
+            z, t_c, b_c = _bin_heatmap(
+                rates, e_grid, T, time_bin_min, battery_bin_kwh, params.e_min, params.e_max,
+            )
+            show_scale = (i == 0 and j == ncols - 1)
+            fig.add_trace(go.Heatmap(
+                x=t_c, y=b_c, z=z,
+                zmin=0, zmax=params.u_max,
+                colorscale="RdYlBu_r",
+                showscale=show_scale,
+                colorbar=dict(title="u (kW)", x=1.02) if show_scale else None,
+                hovertemplate="Hour: %{x:.2f} h<br>Battery: %{y:.2f} kWh<br>u: %{z:.2f} kW<extra></extra>",
+            ), row=row, col=col)
+            fig.update_xaxes(
+                title_text="Hour (h)" if row == n else "",
+                range=[0, T // 60],
+                title_standoff=12,
+                showticklabels=(row == n),
+                row=row, col=col,
+            )
+            fig.update_yaxes(
+                title_text="Battery (kWh)" if col == 1 else "",
+                title_standoff=16,
+                row=row, col=col,
+            )
+    fig.update_layout(
+        template="plotly_white",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=280 * n + 70,
+        margin=dict(l=70, r=60, t=55, b=50),
+    )
+    for ann in fig.layout.annotations:
+        ann.yshift = 10
     return fig
 
 

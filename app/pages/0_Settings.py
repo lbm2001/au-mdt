@@ -191,6 +191,83 @@ with col3:
 
 st.divider()
 
+# ── Departure Urgency policy options ──────────────────────────────────────────
+
+st.subheader("Departure Urgency Policy")
+st.caption(
+    "Controls the single **Departure Urgency** benchmark shown in all pages. "
+    "τ(t) = E[minutes to next departure] is computed via Gauss–Seidel backward recursion."
+)
+
+_du_col1, _du_col2 = st.columns(2)
+
+with _du_col1:
+    st.markdown("**Demand-scaled ceiling**")
+
+    from ev_mdt.models.common.policies import E_CEIL_BASE, _du_e_daily, _e_daily_ref as _e_daily_ref_fn
+
+    _e_max_cur_target = st.session_state.get("e_max", _DEFAULTS["e_max"])
+
+    _gamma = st.slider(
+        "Scaling exponent γ", min_value=0.0, max_value=1.0,
+        value=float(st.session_state.get("du_gamma", 0.5)), step=0.05, format="%.2f",
+        help=(
+            "e_ceil = min(e_max, 25 × (e_daily / e_daily_ref)^γ). "
+            "γ=0 → ceiling = 25 kWh always. γ=1 → linear in e_daily ratio. "
+            "γ=0.5 → sqrt dampening. Calibrated via `target-sweep` at Baseline."
+        ),
+    )
+    st.session_state["du_gamma"] = _gamma
+
+    # Live preview of the ceiling computation using current (or default) params
+    class _FakeParams:
+        p_pd_morning = st.session_state.get("p_pd_morning", _DEFAULTS["p_pd_morning"])
+        p_pd_lunch   = st.session_state.get("p_pd_lunch",   _DEFAULTS["p_pd_lunch"])
+        p_pd_evening = st.session_state.get("p_pd_evening", _DEFAULTS["p_pd_evening"])
+        p_pd_default = st.session_state.get("p_pd_default", _DEFAULTS["p_pd_default"])
+        p_dp_morning = st.session_state.get("p_dp_morning", _DEFAULTS.get("p_dp_morning", 0.5))
+        p_dp_lunch   = st.session_state.get("p_dp_lunch",   _DEFAULTS.get("p_dp_lunch",   0.5))
+        p_dp_evening = st.session_state.get("p_dp_evening", _DEFAULTS.get("p_dp_evening", 0.5))
+        p_dp_default = st.session_state.get("p_dp_default", _DEFAULTS["p_dp_default"])
+        mu    = st.session_state.get("mu",  _DEFAULTS["mu"])
+        v     = st.session_state.get("v",   _DEFAULTS["v"])
+        omega = _bp.omega
+        if model != BASELINE_MODEL:
+            q        = st.session_state.get("nb_q") or _DEFAULTS["nb_q"]
+            lambda_k = st.session_state.get("nb_lambda_k")
+            k        = st.session_state.get("nb_k") or _DEFAULTS["nb_k"]
+
+    _e_daily_cur = _du_e_daily(_FakeParams())
+    _e_daily_ref = _e_daily_ref_fn()
+    _ratio   = _e_daily_cur / _e_daily_ref if _e_daily_ref > 0 else 1.0
+    _e_ceil  = min(_e_max_cur_target, E_CEIL_BASE * _ratio ** _gamma)
+    st.caption(
+        f"e_daily = {_e_daily_cur:.2f} kWh (ref {_e_daily_ref:.2f} kWh),  "
+        f"ratio^γ = {_ratio**_gamma:.3f}  →  **e_ceil = {_e_ceil:.1f} kWh**  "
+        f"({_e_ceil/_e_max_cur_target:.0%} of e_max)"
+    )
+
+with _du_col2:
+    st.markdown("**Reserve floor**")
+
+    from ev_mdt.models.common.model_utils import expected_trip_minutes as _etm
+    _e_trip_kwh = _etm(_FakeParams()) * _FakeParams.mu * _FakeParams.v * _bp.omega
+
+    du_use_reserve = st.toggle(
+        "Enable reserve floor (e < e_trip → charge at u_max)",
+        value=bool(st.session_state.get("du_use_reserve", True)),
+        help="When e < e_trip, charge at u_max regardless of price. "
+             "e_trip = E[T_trip] · μ · v · ω is the expected energy the next trip consumes.",
+    )
+    st.session_state["du_use_reserve"] = du_use_reserve
+
+    st.caption(
+        f"e_trip = **{_e_trip_kwh:.3f} kWh** "
+        f"({'active' if du_use_reserve else 'disabled'})"
+    )
+
+st.divider()
+
 col_btn, col_status = st.columns([1, 3])
 with col_btn:
     run_btn = st.button("▶ Run Backward Induction", type="primary", use_container_width=True)
@@ -291,13 +368,15 @@ if run_btn:
     if is_negbin:
         from ev_mdt.params import NegBinParams
         from ev_mdt.models.negbin.model import transition_matrix as _tm
+        from ev_mdt.models.common.model_utils import price_bin_probs as _gaussian_pbp
         params = NegBinParams(**common_kwargs, k=int(nb_k), q=float(nb_q),
                               lambda_k=float(nb_lambda_k) if nb_lambda_k is not None else None)
         mode_label = f"λ_k={nb_lambda_k:.1f}" if nb_lambda_k is not None else f"k={nb_k}"
+        _pbp_fn_negbin = _pbp_fn if _pbp_fn is not None else (lambda t: _gaussian_pbp(t, params))
         with st.spinner(f"Running backward induction (Negative Binomial {mode_label}, q={nb_q:.2f}, T={T} min, N_e={N_e})…"):
-            _J, pi, actions, e_grid, lam_grid = _bi(
+            _, pi, actions, e_grid, lam_grid = _bi(
                 params, transition_matrix_fn=lambda t: _tm(t, params),
-                price_bin_probs_fn=_pbp_fn, n_chi=params.k + 1, T=T, N_e=N_e, N_a=N_a)
+                price_bin_probs_fn=_pbp_fn_negbin, n_chi=params.k + 1, T=T, N_e=N_e, N_a=N_a)
     else:
         from ev_mdt.params import BaselineParams
         from ev_mdt.models.baseline.model import transition_matrix as _tm
@@ -310,7 +389,7 @@ if run_btn:
         _pbp_fn_baseline = _pbp_fn if _pbp_fn is not None else (lambda t: _gaussian_pbp(t, params))
         n_a_label = "Default" if N_a is None else str(N_a)
         with st.spinner(f"Running backward induction (Baseline, T={T} min, N_e={N_e}, N_a={n_a_label})…"):
-            _J, pi, actions, e_grid, lam_grid = _bi(
+            _, pi, actions, e_grid, lam_grid = _bi(
                 params,
                 transition_matrix_fn=lambda t: _tm(t, params),
                 price_bin_probs_fn=_pbp_fn_baseline,

@@ -5,6 +5,8 @@ from ev_mdt.plots.sensitivity import (
     fig_cost_distribution,
     fig_baseline_cost,
     fig_baseline_trajectories,
+    fig_baseline_policy_heatmaps,
+    fig_benchmark_heatmap_grid,
     build_summary_df,
     figure_to_png,
 )

@@ -44,7 +44,7 @@ high_threshold = float(st.session_state.get("benchmark_high_threshold", params.p
 soc_threshold  = float(st.session_state.get("soc_threshold",            params.e_max * 0.25))
 
 # Price world the policy was solved in (Settings) — draw rollout prices and the
-# DP-Heuristic's price distribution from it (None → Gaussian parametric).
+# Battery Level Urgency's price distribution from it (None → Gaussian parametric).
 _price_sampler   = st.session_state.get("price_sampler")
 _price_season    = st.session_state.get("price_season") or "winter"
 _price_isweekend = bool(st.session_state.get("price_is_weekend", False))
@@ -73,7 +73,9 @@ nd_chi0_int = 0 if nd_chi0 == "Parked" else 1
 
 # Cache the rollouts so re-renders (e.g. toggling a plot option) don't recompute them.
 _nd_key = (n_days, nd_chi0_int, int(nd_seed),
-           low_threshold, high_threshold, soc_threshold, T, id(pi))
+           low_threshold, high_threshold, soc_threshold, T, id(pi),
+           st.session_state.get("du_gamma", 0.5),
+           st.session_state.get("du_use_reserve", True))
 if st.session_state.get("_nd_key") != _nd_key:
     with st.spinner(f"Rolling out all policies over {n_days} scenarios…"):
         rng_nd = np.random.default_rng(int(nd_seed))
@@ -84,7 +86,10 @@ if st.session_state.get("_nd_key") != _nd_key:
         nd_e0s = [float(rng_nd.uniform(params.e_min, params.e_max)) for _ in range(n_days)]
         registry = policy_registry(
             params, _pbp_fn, pi=pi, actions=actions, e_grid=e_grid,
-            low_threshold=low_threshold, high_threshold=high_threshold, soc_threshold=soc_threshold)
+            low_threshold=low_threshold, high_threshold=high_threshold, soc_threshold=soc_threshold,
+            du_gamma=st.session_state.get("du_gamma", 0.5),
+            du_use_reserve=st.session_state.get("du_use_reserve", True),
+        )
         nd_rollouts = run_policies(registry, nd_scenarios, nd_e0s, nd_chi0_int, params, _rf)
 
         # Mobility of the "other" NegBin variant (same scenarios, sibling k model).

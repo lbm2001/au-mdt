@@ -14,6 +14,7 @@ pg = st.navigation([
     st.Page("pages/0_Settings.py",                title="Settings",            icon="⚙️"),
     st.Page("pages/1_Policy_Explorer.py",          title="Policy Explorer",     icon="📊"),
     st.Page("pages/2_Policy_Rollout.py",           title="Policy Rollout",      icon="🎲"),
+    st.Page("pages/3_Target_Sweep.py",             title="Target Sweep",         icon="🎯"),
     st.Page("pages/4_Sensitivity_Analysis.py",     title="Sensitivity Analysis", icon="📐"),
     st.Page("pages/5_Price_Explorer.py",            title="Price Explorer",       icon="💶"),
 ])

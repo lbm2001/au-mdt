@@ -128,15 +128,24 @@ st.subheader("Mean cost")
 st.caption("Mean total cost per scenario — **including the unserved-driving penalty** — "
            "one bar per policy. SEM = uncertainty of the mean (std/√N); Std = spread across "
            "scenarios. Lower bar clamped at 0.")
-cc1, cc2 = st.columns(2)
+cc1, cc2, cc3 = st.columns(3)
 with cc1:
     nd_cost_axis = st.radio("Cost axis", ["Log", "Linear"], horizontal=True, key="nd_cost_axis")
 with cc2:
-    nd_err = st.radio("Error bars", ["SEM", "Std"], horizontal=True, key="nd_cost_err")
-st.plotly_chart(
-    fig_baseline_cost(nd_rollouts, error=nd_err.lower(), log_y=(nd_cost_axis == "Log")),
-    use_container_width=True,
-)
+    nd_src = st.radio("Cost source", ["Rollout", "Exact"], horizontal=True, key="nd_cost_src")
+with cc3:
+    nd_err = st.radio("Error bars", ["SEM", "Std"], horizontal=True, key="nd_cost_err",
+                      disabled=(nd_src == "Exact"))
+if nd_src == "Exact":
+    _lam_grid = np.array([(j + 0.5) * params.lambda_max / params.K for j in range(params.K)])
+    _exact_result = dict(model=_solved_model, params=params, pbp_fn=_pbp_fn,
+                         pi=pi, actions=actions, e_grid=e_grid, lam_grid=_lam_grid, T=T)
+    _cost_fig = fig_baseline_cost(nd_rollouts, log_y=(nd_cost_axis == "Log"),
+                                  source="exact", result=_exact_result)
+else:
+    _cost_fig = fig_baseline_cost(nd_rollouts, error=nd_err.lower(),
+                                  log_y=(nd_cost_axis == "Log"))
+st.plotly_chart(_cost_fig, use_container_width=True)
 
 # ── Mean trajectories ─────────────────────────────────────────────────────────
 

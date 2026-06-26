@@ -137,6 +137,7 @@ def evaluate_policy(
     beta: float | None = None,
     consumption_fn: Callable[[int], float] | None = None,
     progress_desc: str | None = None,
+    cost_components: bool = False,
 ):
     """Exact policy evaluation: expected cost-to-go Jπ for a fixed deterministic policy.
 
@@ -149,7 +150,11 @@ def evaluate_policy(
     Pass ``progress_desc`` to show a per-timestep tqdm bar over the T backward
     steps (useful since each step calls a potentially slow scalar ``action_fn``).
 
-    Returns Jπ of shape (T+1, n_chi, N_e, K).
+    Returns the t=0 slice Jπ of shape (n_chi, N_e, K) — only J[0] is needed to
+    compute the expected cost, so a rolling 2-slice buffer is used instead of
+    storing the full (T+1, n_chi, N_e, K) trajectory.  With ``cost_components=True``
+    returns ``(Jπ, Jc, Jp, Je, Jm)`` where Jc/Jp are the charging/penalty cost
+    components, Je is expected kWh charged, and Jm is expected penalty minutes.
     """
     beta = params.beta if beta is None else beta
     K      = params.K
@@ -158,7 +163,17 @@ def evaluate_policy(
     if consumption_fn is None:
         consumption_fn = lambda chi: _consumption(chi, params)
 
-    J = np.zeros((T + 1, n_chi, N_e, K))
+    # Rolling 2-slice buffers: only the current and next timestep slices are kept,
+    # reducing memory from O(T·n_chi·N_e·K) to O(n_chi·N_e·K) per accumulator.
+    # Critical for large n_chi (NegBin k=10 → 11 states → ~6 GB per full array).
+    J_next = np.zeros((n_chi, N_e, K))
+    J_cur  = np.zeros((n_chi, N_e, K))
+    if cost_components:
+        Jc_next, Jc_cur = np.zeros((n_chi, N_e, K)), np.zeros((n_chi, N_e, K))
+        Jp_next, Jp_cur = np.zeros((n_chi, N_e, K)), np.zeros((n_chi, N_e, K))
+        Je_next, Je_cur = np.zeros((n_chi, N_e, K)), np.zeros((n_chi, N_e, K))
+        Jm_next, Jm_cur = np.zeros((n_chi, N_e, K)), np.zeros((n_chi, N_e, K))
+
     all_p_next = np.array([price_bin_probs_fn(t + 1) for t in range(T)])
     E = e_grid[:, np.newaxis]    # (N_e, 1)
 
@@ -169,7 +184,12 @@ def evaluate_policy(
                      position=3, leave=False)
     for t in steps:
         P     = transition_matrix_fn(t)
-        J_bar = J[t + 1] @ all_p_next[t]       # (n_chi, N_e)
+        J_bar = J_next @ all_p_next[t]       # (n_chi, N_e)
+        if cost_components:
+            Jc_bar = Jc_next @ all_p_next[t]
+            Jp_bar = Jp_next @ all_p_next[t]
+            Je_bar = Je_next @ all_p_next[t]
+            Jm_bar = Jm_next @ all_p_next[t]
 
         for chi in range(n_chi):
             driving = chi > 0
@@ -177,10 +197,13 @@ def evaluate_policy(
             if driving:
                 u = np.where(E > params.e_min, 0.0, u)          # on the road → u = 0
 
-            cost = u * params.omega * lam_grid[np.newaxis, :]   # (N_e, K)
+            charge_cost = u * params.omega * lam_grid[np.newaxis, :]   # (N_e, K)
+            charge_energy = u * params.eta_c * params.omega             # (N_e, K) kWh
+            pen_cost = np.zeros_like(charge_cost)
             if driving:
-                penalty = np.where(E > params.e_min, 0.0, params.omega * params.phi)
-                cost = cost + penalty
+                pen = np.where(E > params.e_min, 0.0, params.omega * params.phi)
+                pen_cost = pen_cost + pen
+            cost = charge_cost + pen_cost
 
             cons   = consumption_fn(chi)
             e_next = np.clip(E + params.eta_c * params.omega * u - cons,
@@ -191,16 +214,44 @@ def evaluate_policy(
             w_hi = e_next_f - e_lo
             w_lo = 1.0 - w_hi
 
+            pen_minutes = np.zeros_like(charge_cost)
+            if driving:
+                pen_minutes = np.where(E > params.e_min, 0.0, np.ones_like(charge_cost))
+
             EJ = np.zeros((N_e, K))
+            EJc = np.zeros((N_e, K)) if cost_components else None
+            EJp = np.zeros((N_e, K)) if cost_components else None
+            EJe = np.zeros((N_e, K)) if cost_components else None
+            EJm = np.zeros((N_e, K)) if cost_components else None
             for chi_next in range(n_chi):
                 p = P[chi, chi_next]
                 if p == 0.0:
                     continue
                 EJ += p * (w_lo * J_bar[chi_next][e_lo] + w_hi * J_bar[chi_next][e_hi])
+                if cost_components:
+                    EJc += p * (w_lo * Jc_bar[chi_next][e_lo] + w_hi * Jc_bar[chi_next][e_hi])
+                    EJp += p * (w_lo * Jp_bar[chi_next][e_lo] + w_hi * Jp_bar[chi_next][e_hi])
+                    EJe += p * (w_lo * Je_bar[chi_next][e_lo] + w_hi * Je_bar[chi_next][e_hi])
+                    EJm += p * (w_lo * Jm_bar[chi_next][e_lo] + w_hi * Jm_bar[chi_next][e_hi])
 
-            J[t, chi] = cost + beta * EJ
+            J_cur[chi] = cost + beta * EJ
+            if cost_components:
+                Jc_cur[chi] = charge_cost + beta * EJc
+                Jp_cur[chi] = pen_cost + beta * EJp
+                Je_cur[chi] = charge_energy + beta * EJe
+                Jm_cur[chi] = pen_minutes + beta * EJm
 
-    return J
+        J_next, J_cur = J_cur, J_next
+        if cost_components:
+            Jc_next, Jc_cur = Jc_cur, Jc_next
+            Jp_next, Jp_cur = Jp_cur, Jp_next
+            Je_next, Je_cur = Je_cur, Je_next
+            Jm_next, Jm_cur = Jm_cur, Jm_next
+
+    # J_next now holds J[0] — the only slice needed for the expected cost.
+    if cost_components:
+        return J_next, Jc_next, Jp_next, Je_next, Jm_next
+    return J_next
 
 
 def scalar_policy_to_action_fn(

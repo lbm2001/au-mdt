@@ -421,7 +421,10 @@ def _add_stacked_cost_bars(fig, xs, totals, charge, penalty, color, name, errs, 
     # whisker is centred at the *total* (Plotly centres error_y at the bar's y-length,
     # which for the based segments above would land mid-bar). Same offsetgroup keeps it
     # aligned within the policy's grouped slot. On a log axis use log-symmetric arms so
-    # the whisker is balanced and never plunges below zero.
+    # the whisker is balanced and never plunges below zero. ``errs=None`` (exact mode)
+    # draws no whisker at all.
+    if errs is None:
+        return
     if log_y:
         up, dn = _log_err_arms(totals, errs)
         err_kw = dict(type="data", symmetric=False, array=up, arrayminus=dn)
@@ -435,11 +438,29 @@ def _add_stacked_cost_bars(fig, xs, totals, charge, penalty, color, name, errs, 
 
 
 def fig_cost_distribution(results: list[dict], log_y: bool = True,
-                           x_label: str = "Swept value", error: str = "sem") -> go.Figure:
-    """Mean total cost bar per policy, grouped by swept value (charging/penalty split)."""
+                           x_label: str = "Swept value", error: str = "sem",
+                           source: str = "rollout") -> go.Figure:
+    """Mean total cost bar per policy, grouped by swept value (charging/penalty split).
+
+    ``source="rollout"`` (default) uses the Monte-Carlo rollout means with ±SEM/Std
+    whiskers; ``source="exact"`` uses the analytical expected costs (no whiskers).
+    """
     labels = [r["label"] for r in results]
+    exact = None
+    if source == "exact":
+        from ev_mdt.analysis.sensitivity import compute_all_exact_costs_breakdown
+        exact = [r.get("exact_breakdown") or compute_all_exact_costs_breakdown(r) for r in results]
+
     series = []   # (policy, totals, charge, penalty, errs)
     for policy in POLICY_ORDER:
+        if source == "exact":
+            if not all(policy in e for e in exact):
+                continue
+            totals = np.array([e[policy]["total"]    for e in exact])
+            charge = np.array([e[policy]["charging"] for e in exact])
+            penalty = np.array([e[policy]["penalty"] for e in exact])
+            series.append((policy, totals, charge, penalty, None))
+            continue
         if not all(policy in r["rollouts"] for r in results):
             continue
         totals, charge, penalty, errs = [], [], [], []
@@ -455,7 +476,8 @@ def fig_cost_distribution(results: list[dict], log_y: bool = True,
         series.append((policy, np.array(totals), np.array(charge), np.array(penalty), errs))
 
     all_totals = np.concatenate([s[1] for s in series]) if series else np.array([1.0])
-    all_errs   = np.concatenate([np.asarray(s[4], float) for s in series]) if series else np.array([0.0])
+    all_errs   = (np.concatenate([np.asarray(s[4], float) for s in series])
+                  if (series and series[0][4] is not None) else np.array([0.0]))
     y0 = _cost_floor(all_totals)
 
     fig = go.Figure()
@@ -490,10 +512,18 @@ SUMMARY_METRIC_FORMATS = {
     "Std cost (€)":              "{:.3f}",
     "Mean charging (€)":         "{:.3f}",
     "Mean penalty (€)":          "{:.3f}",
+    "Penalty %":                 "{:.1f}%",
+    "Optimality gap %":          "{:.2f}%",
     "Mean penalty min":          "{:.1f}",
     "% scenarios with penalty":  "{:.1f}%",
     "Mean energy charged (kWh)": "{:.2f}",
 }
+
+
+def _penalty_pct(charge: float, penalty: float) -> float:
+    """Penalty's share of total cost (charging + penalty), in percent."""
+    tot = charge + penalty
+    return float(penalty / tot * 100) if tot > 0 else 0.0
 
 
 def _cost_summary(mlist: list[dict]) -> dict:
@@ -515,14 +545,49 @@ def _cost_summary(mlist: list[dict]) -> dict:
         "Std cost (€)":              sd,
         "Mean charging (€)":         float(charge.mean()),
         "Mean penalty (€)":          float(pencost.mean()),
+        "Penalty %":                 _penalty_pct(float(charge.mean()), float(pencost.mean())),
         "Mean penalty min":          float(pen.mean()),
         "% scenarios with penalty":  float((pen > 0).mean() * 100),
         "Mean energy charged (kWh)": float(energy.mean()),
     }
 
 
-def build_summary_df(results: list[dict]) -> pd.DataFrame:
-    """One row per (swept_value, policy) with the same metrics as the Policy-Rollout table."""
+def _exact_summary(bd: dict) -> dict:
+    """Per-policy summary from an exact cost breakdown ``{total,charging,penalty,energy_kwh}``.
+
+    The distributional metrics (SEM / Std / penalty-minutes / % scenarios) have no
+    exact analogue and are omitted; the cost columns are the noise-free expectations.
+    """
+    return {
+        "Mean cost (€)":             bd["total"],
+        "Mean charging (€)":         bd["charging"],
+        "Mean penalty (€)":          bd["penalty"],
+        "Penalty %":                 _penalty_pct(bd["charging"], bd["penalty"]),
+        "Mean penalty min":          bd["penalty_min"],
+        "Mean energy charged (kWh)": bd["energy_kwh"],
+    }
+
+
+def build_summary_df(results: list[dict], *, source: str = "rollout") -> pd.DataFrame:
+    """One row per (swept_value, policy) with the same metrics as the Policy-Rollout table.
+
+    ``source="rollout"`` (default) uses the Monte-Carlo rollout metrics; ``source="exact"``
+    uses the analytical expected costs (no SEM/Std/penalty-minute columns).
+    """
+    if source == "exact":
+        from ev_mdt.analysis.sensitivity import compute_all_exact_costs_breakdown
+        rows = []
+        for r in results:
+            bd = r.get("exact_breakdown") or compute_all_exact_costs_breakdown(r)
+            bi_cost = bd.get("Backward Induction", {}).get("total", None)
+            for policy in POLICY_ORDER:
+                if policy not in bd:
+                    continue
+                row = {"Swept value": r["label"], "Policy": policy, **_exact_summary(bd[policy])}
+                if bi_cost is not None and bi_cost > 0:
+                    row["Optimality gap %"] = (bd[policy]["total"] - bi_cost) / bi_cost * 100
+                rows.append(row)
+        return pd.DataFrame(rows)
     rows = [
         {"Swept value": r["label"], "Policy": policy, **_cost_summary(r["rollouts"][policy])}
         for r in results for policy in POLICY_ORDER
@@ -530,21 +595,38 @@ def build_summary_df(results: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def fig_baseline_cost(full: dict, *, error: str = "sem", log_y: bool = True) -> go.Figure:
-    """Per-policy bar: total mean cost ±SEM, split into charging/penalty shares."""
-    names = [p for p in POLICY_ORDER if p in full and full[p]]
-    totals, charge, penalty, errs = [], [], [], []
-    for name in names:
-        rollouts = full[name]
-        ccost = np.array([r["charge_cost_traj"].sum()  for r in rollouts])
-        pcost = np.array([r["penalty_cost_traj"].sum() for r in rollouts])
-        costs = ccost + pcost
-        m  = len(costs)
-        sd = float(costs.std(ddof=1)) if m > 1 else 0.0
-        totals.append(float(costs.mean()))
-        charge.append(float(ccost.mean()))
-        penalty.append(float(pcost.mean()))
-        errs.append(sd / np.sqrt(m) if (error == "sem" and m > 0) else sd)
+def fig_baseline_cost(full: dict, *, error: str = "sem", log_y: bool = True,
+                      source: str = "rollout", result: dict | None = None) -> go.Figure:
+    """Per-policy bar: total mean cost split into charging/penalty shares.
+
+    ``source="rollout"`` (default) uses the Monte-Carlo rollout means with ±SEM/Std
+    whiskers; ``source="exact"`` uses the analytical expected costs (no whiskers),
+    in which case the solved ``result`` dict must be supplied.
+    """
+    if source == "exact":
+        if result is None:
+            raise ValueError("fig_baseline_cost(source='exact') requires `result`")
+        from ev_mdt.analysis.sensitivity import compute_all_exact_costs_breakdown
+        bd = result.get("exact_breakdown") or compute_all_exact_costs_breakdown(result)
+        names = [p for p in POLICY_ORDER if p in bd]
+        totals  = [bd[n]["total"]    for n in names]
+        charge  = [bd[n]["charging"] for n in names]
+        penalty = [bd[n]["penalty"]  for n in names]
+        errs = None
+    else:
+        names = [p for p in POLICY_ORDER if p in full and full[p]]
+        totals, charge, penalty, errs = [], [], [], []
+        for name in names:
+            rollouts = full[name]
+            ccost = np.array([r["charge_cost_traj"].sum()  for r in rollouts])
+            pcost = np.array([r["penalty_cost_traj"].sum() for r in rollouts])
+            costs = ccost + pcost
+            m  = len(costs)
+            sd = float(costs.std(ddof=1)) if m > 1 else 0.0
+            totals.append(float(costs.mean()))
+            charge.append(float(ccost.mean()))
+            penalty.append(float(pcost.mean()))
+            errs.append(sd / np.sqrt(m) if (error == "sem" and m > 0) else sd)
 
     totals_arr = np.array(totals) if totals else np.array([1.0])
     errs_arr   = np.array(errs)   if errs   else np.array([0.0])
@@ -555,23 +637,24 @@ def fig_baseline_cost(full: dict, *, error: str = "sem", log_y: bool = True) -> 
         # Shared offsetgroup → one slot per policy category so bars stay full-width
         # (a unique offsetgroup per policy would split each category into len(names) slots).
         _add_stacked_cost_bars(fig, [name], [totals[i]], [charge[i]], [penalty[i]],
-                               POLICY_COLORS[name], name, [errs[i]],
+                               POLICY_COLORS[name], name,
+                               None if errs is None else [errs[i]],
                                log_y=log_y, y0=y0, offsetgroup="cost")
-    yaxis = dict(title="Mean cost (€)" + ("  [log]" if log_y else ""),
+    yaxis = dict(title="Expected cost (€)" + ("  [log]" if log_y else ""),
                  type="log" if log_y else "linear")
     if log_y:
-        top = (totals_arr + _log_err_arms(totals_arr, errs_arr)[0]).max()  # include upper whisker
+        arms = _log_err_arms(totals_arr, errs_arr)[0] if errs is not None else 0.0
+        top = (totals_arr + arms).max()  # include upper whisker
         yaxis["range"] = [np.log10(y0), np.log10(top * 1.1)]
         yaxis["dtick"] = 1          # decade ticks only: 0.1, 1, 10, …
-    # baseline_models figure: no legend and no per-bar policy captions (bars are
-    # identified elsewhere); keeps the figure clean for the thesis layout.
     fig.update_layout(
         template="plotly_white",
         plot_bgcolor="white",
         paper_bgcolor="white",
         yaxis=yaxis,
-        showlegend=False,
         height=460, margin=dict(l=40, r=20, t=20, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
+                    font=dict(size=11), itemsizing="constant"),
     )
     fig.update_xaxes(categoryorder="array", categoryarray=POLICY_ORDER,
                      showticklabels=False, title_text="")

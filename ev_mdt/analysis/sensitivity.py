@@ -111,7 +111,14 @@ def solve(model_label: str, params, pbp_fn, T: int, N_e: int):
     return pi, actions, e_grid, lam_grid
 
 
-def bi_expected_cost(result: dict, beta: float = 1.0) -> float:
+def _mean_initial(J_0, pbp_fn) -> float:
+    """Average J at t=0, χ=0 over the rollout initial-state distribution
+    (e₀ ~ Uniform on the battery grid, λ̂₀ ~ price marginal at t=0).
+    J_0 is the (n_chi, N_e, K) slice returned by evaluate_policy."""
+    return float(np.mean(J_0[0] @ np.asarray(pbp_fn(0))))
+
+
+def bi_expected_cost(result: dict, beta: float = 1.0, breakdown: bool = False):
     """Exact expected cost of the optimal (Backward Induction) policy for a config.
 
     Evaluates the solved policy `pi` (from a solve()/sweep-step/baseline result dict)
@@ -119,6 +126,9 @@ def bi_expected_cost(result: dict, beta: float = 1.0) -> float:
     χ₀=0, e₀ ~ Uniform[e_min,e_max] (battery grid), λ̂₀ ~ price marginal at t=0.
     With beta=1 (default) this is the expected *undiscounted* total cost, directly
     comparable to the Monte-Carlo "Mean cost".
+
+    With ``breakdown=True`` returns ``{"total", "charging", "penalty"}`` instead of
+    just the scalar total.
     """
     model_label = result["model"]
     params, pbp_fn = result["params"], result["pbp_fn"]
@@ -127,11 +137,19 @@ def bi_expected_cost(result: dict, beta: float = 1.0) -> float:
         tm_fn, n_chi = (lambda t: _baseline_tm(t, params)), 2
     else:
         tm_fn, n_chi = (lambda t: _negbin_tm(t, params)), params.k + 1
-    Jpi = _evaluate_policy(
+    out = _evaluate_policy(
         params, transition_matrix_fn=tm_fn, price_bin_probs_fn=pbp_fn, n_chi=n_chi,
         action_fn=lambda t, chi: actions[pi[t, chi]], T=T, N_e=len(e_grid), beta=beta,
+        cost_components=breakdown,
     )
-    return float(np.mean(Jpi[0, 0] @ np.asarray(pbp_fn(0))))
+    if breakdown:
+        Jpi, Jc, Jp, Je, Jm = out
+        return {"total": _mean_initial(Jpi, pbp_fn),
+                "charging": _mean_initial(Jc, pbp_fn),
+                "penalty": _mean_initial(Jp, pbp_fn),
+                "energy_kwh": _mean_initial(Je, pbp_fn),
+                "penalty_min": _mean_initial(Jm, pbp_fn)}
+    return _mean_initial(out, pbp_fn)
 
 
 def _du_e_ceil(params, gamma: float | None = None) -> float:
@@ -203,12 +221,16 @@ def _vectorized_action_grid(name: str, kwargs: dict, e_grid, lam_grid, params,
 
 def policy_expected_cost(result: dict, policy_fn, beta: float = 1.0,
                          progress_desc: str | None = None,
-                         name: str | None = None, **kwargs) -> float:
+                         name: str | None = None, breakdown: bool = False,
+                         **kwargs):
     """Exact expected cost of a scalar benchmark policy for a given configuration.
 
     Equivalent to bi_expected_cost but works for any scalar policy from the registry.
     Uses scalar_policy_to_action_fn to vectorize the policy into the (N_e, K) form
     that evaluate_policy expects.
+
+    With ``breakdown=True`` returns ``{"total", "charging", "penalty"}`` instead of
+    just the scalar total.
     """
     model_label = result["model"]
     params, pbp_fn = result["params"], result["pbp_fn"]
@@ -226,12 +248,19 @@ def policy_expected_cost(result: dict, policy_fn, beta: float = 1.0,
         action_fn = lambda t, chi, _g=grid: _g[t]
     else:
         action_fn = _scalar_policy_to_action_fn(policy_fn, e_grid, lam_grid, params, **kwargs)
-    Jpi = _evaluate_policy(
+    out = _evaluate_policy(
         params, transition_matrix_fn=tm_fn, price_bin_probs_fn=pbp_fn, n_chi=n_chi,
         action_fn=action_fn, T=T, N_e=len(e_grid), beta=beta,
-        progress_desc=progress_desc,
+        progress_desc=progress_desc, cost_components=breakdown,
     )
-    return float(np.mean(Jpi[0, 0] @ np.asarray(pbp_fn(0))))
+    if breakdown:
+        Jpi, Jc, Jp, Je, Jm = out
+        return {"total": _mean_initial(Jpi, pbp_fn),
+                "charging": _mean_initial(Jc, pbp_fn),
+                "penalty": _mean_initial(Jp, pbp_fn),
+                "energy_kwh": _mean_initial(Je, pbp_fn),
+                "penalty_min": _mean_initial(Jm, pbp_fn)}
+    return _mean_initial(out, pbp_fn)
 
 
 def compute_all_exact_costs(result: dict, beta: float = 1.0,
@@ -268,6 +297,39 @@ def compute_all_exact_costs(result: dict, beta: float = 1.0,
     if bar is not None:
         bar.close()
     return costs
+
+
+def compute_all_exact_costs_breakdown(result: dict, beta: float = 1.0,
+                                      desc: str | None = None) -> dict[str, dict]:
+    """Like compute_all_exact_costs but returns the charging/penalty split.
+
+    Returns ``{policy_name: {"total", "charging", "penalty"}}`` for every policy in
+    POLICY_ORDER. Same backward-pass cost as compute_all_exact_costs (one extra
+    pair of accumulator arrays carried along the recursion).
+    """
+    params, pbp_fn = result["params"], result["pbp_fn"]
+    pi, actions, e_grid = result["pi"], result["actions"], result["e_grid"]
+    registry = policy_registry(params, pbp_fn, pi=pi, actions=actions, e_grid=e_grid)
+    bar = None
+    if desc is not None:
+        from tqdm import tqdm
+        bar = tqdm(total=len(registry), desc=desc, unit="policy", position=2, leave=False)
+    out = {}
+    for name, fn, kwargs in registry:
+        if bar is not None:
+            bar.set_postfix_str(name)
+        if name == "Backward Induction":
+            out[name] = bi_expected_cost(result, beta=beta, breakdown=True)
+        else:
+            step_desc = f"      {name}" if desc is not None else None
+            out[name] = policy_expected_cost(result, fn, beta=beta,
+                                             progress_desc=step_desc, name=name,
+                                             breakdown=True, **kwargs)
+        if bar is not None:
+            bar.update(1)
+    if bar is not None:
+        bar.close()
+    return out
 
 
 def make_scenario(params, seed: int, horizon: int,
@@ -337,45 +399,63 @@ def rollout_stats_table(rollouts_by_policy: dict, params):
 def _run_sweep_step(model_label: str, label: str, params, pbp_fn,
                     T: int, N_e: int, N_rollouts: int, seed: int,
                     sampler=None, season: str = "winter", is_weekend: bool = False,
+                    skip_rollouts: bool = False,
                     _log: Callable | None = None, **du_kwargs) -> dict:
-    """Solve + run rollouts for one sweep configuration."""
+    """Solve + run rollouts for one sweep configuration.
+
+    ``skip_rollouts=True`` skips scenario generation and rollout simulation entirely;
+    ``rollouts`` and ``sample_rollout`` are set to empty stubs so callers that key-check
+    these fields don't crash, but any figure/table that actually reads rollout data will
+    be skipped by the caller (see save_figures / save_tables ``cost_source`` logic).
+    """
     if _log: _log(f"  [{label}] solving (T={T//60}h, N_e={N_e})…")
     pi, actions, e_grid, lam_grid = solve(model_label, params, pbp_fn, T, N_e)
-    if _log: _log(f"  [{label}] running {N_rollouts} rollouts…")
-    scenarios = [
-        make_scenario(params, seed + i, T, sampler=sampler, season=season, is_weekend=is_weekend)
-        for i in range(N_rollouts)
-    ]
-    _rf = rollout_fn(model_label)
-    rollouts = run_rollouts(pi, actions, e_grid, params, scenarios, _rf, pbp_fn,
-                            desc=f"    [{label}] rollouts", **du_kwargs)
-    sample_rollout = _rf(
-        backward_induction_policy, scenarios[0], float(scenarios[0]["e0"]), 0, params,
-        pi=pi, actions=actions, e_grid=e_grid,
-    )
-    return {
-        "model":         model_label,
-        "label":         label,
-        "params":        params,
-        "pbp_fn":        pbp_fn,
-        "pi":            pi,
-        "actions":       actions,
-        "e_grid":        e_grid,
-        "lam_grid":      lam_grid,
-        "T":             T,
-        "rollouts":      rollouts,
+    if skip_rollouts:
+        rollouts = {}
+        sample_rollout = None
+    else:
+        if _log: _log(f"  [{label}] running {N_rollouts} rollouts…")
+        scenarios = [
+            make_scenario(params, seed + i, T, sampler=sampler, season=season, is_weekend=is_weekend)
+            for i in range(N_rollouts)
+        ]
+        _rf = rollout_fn(model_label)
+        rollouts = run_rollouts(pi, actions, e_grid, params, scenarios, _rf, pbp_fn,
+                                desc=f"    [{label}] rollouts", **du_kwargs)
+        sample_rollout = _rf(
+            backward_induction_policy, scenarios[0], float(scenarios[0]["e0"]), 0, params,
+            pi=pi, actions=actions, e_grid=e_grid,
+        )
+    result = {
+        "model":          model_label,
+        "label":          label,
+        "params":         params,
+        "pbp_fn":         pbp_fn,
+        "pi":             pi,
+        "actions":        actions,
+        "e_grid":         e_grid,
+        "lam_grid":       lam_grid,
+        "T":              T,
+        "rollouts":       rollouts,
         "sample_rollout": sample_rollout,
     }
+    if skip_rollouts:
+        if _log: _log(f"  [{label}] computing exact costs…")
+        result["exact_breakdown"] = compute_all_exact_costs_breakdown(
+            result, desc=f"    [{label}] exact costs")
+    return result
 
 
 def _gbins_step(label: str, sampler, season: str, is_weekend: bool,
-                N_rollouts: int, N_e: int, seed: int, _log=None, **du_kwargs) -> dict:
+                N_rollouts: int, N_e: int, seed: int, _log=None,
+                skip_rollouts: bool = False, **du_kwargs) -> dict:
     params = build_params(BASELINE_MODEL)
     pbp_fn = _make_gbins_pbp(sampler, params, season, is_weekend)
     return _run_sweep_step(
         BASELINE_MODEL, label, params, pbp_fn, T=24 * 60, N_e=N_e,
         N_rollouts=N_rollouts, seed=seed,
-        sampler=sampler, season=season, is_weekend=is_weekend, _log=_log, **du_kwargs,
+        sampler=sampler, season=season, is_weekend=is_weekend,
+        skip_rollouts=skip_rollouts, _log=_log, **du_kwargs,
     )
 
 
@@ -738,6 +818,7 @@ def run_all_sweeps(
     progress_cb: Callable | None = None,
     _log: Callable | None = None,
     _wandb_run=None,
+    skip_rollouts: bool = False,
 ) -> dict[str, list[dict]]:
     """Run selected (or all) sweeps and return a mapping sweep_name -> results list.
 
@@ -809,21 +890,21 @@ def run_all_sweeps(
                 "GMM":           sampler_gmm,
                 "MDN":           sampler_mdn,
             }
-            all_results[sweep] = sweep_pricing_model(samplers, N_rollouts, N_e, seed, cb, _log)
+            all_results[sweep] = sweep_pricing_model(samplers, N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
         elif sweep == "pricing_season":
-            all_results[sweep] = sweep_pricing_season(sampler_excl, N_rollouts, N_e, seed, cb, _log)
+            all_results[sweep] = sweep_pricing_season(sampler_excl, N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
         elif sweep == "pricing_daytype":
-            all_results[sweep] = sweep_pricing_daytype(sampler_excl, N_rollouts, N_e, seed, cb, _log)
+            all_results[sweep] = sweep_pricing_daytype(sampler_excl, N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
         elif sweep == "pricing_crisis":
-            all_results[sweep] = sweep_pricing_crisis(sampler_excl, sampler_incl, sampler_crisis, N_rollouts, N_e, seed, cb, _log)
+            all_results[sweep] = sweep_pricing_crisis(sampler_excl, sampler_incl, sampler_crisis, N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
         elif sweep == "penalty":
-            all_results[sweep] = sweep_penalty(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log)
+            all_results[sweep] = sweep_penalty(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
         elif sweep == "horizon":
-            all_results[sweep] = sweep_horizon(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log)
+            all_results[sweep] = sweep_horizon(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
         elif sweep == "departure_profile":
-            all_results[sweep] = sweep_departure_profiles(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log)
+            all_results[sweep] = sweep_departure_profiles(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
         elif sweep == "mobility_model":
-            all_results[sweep] = sweep_mobility_models(N_rollouts, N_e, seed, cb, _log)
+            all_results[sweep] = sweep_mobility_models(N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
         else:
             raise ValueError(f"Unknown sweep: {sweep!r}. Valid: {ALL_SWEEP_NAMES}")
 
@@ -859,10 +940,18 @@ def save_figures(
     seed: int = 42,
     N_e: int = 500,
     include_baseline: bool = True,
+    cost_source: str = "rollout",
+    skip_rollouts: bool = False,
 ) -> list[Path]:
     """Render all sensitivity figures to PNG and save them under out_dir.
 
     Also saves the three canonical baseline-model figures if include_baseline=True.
+
+    ``cost_source`` selects the cost figures' data: ``"rollout"`` (Monte-Carlo means
+    ±SEM, default) or ``"exact"`` (analytical expected costs, no whiskers).
+
+    ``skip_rollouts=True`` skips all figures that require rollout data (trajectory
+    plots, rollout-based cost bars). Use together with ``cost_source="exact"``.
 
     Returns a list of paths of all saved files.
     """
@@ -889,9 +978,11 @@ def save_figures(
             "benchmark_policy_heatmaps": fig_benchmark_heatmap_grid(results),
             "charge_border":             fig_charge_boundary_grid(results),
             "charge_border_du":          fig_charge_boundary_grid_du(results),
-            "cost":                      fig_cost_distribution(results),
+            "cost":                      fig_cost_distribution(results, source=cost_source),
         }
         for name, fig in figs.items():
+            if skip_rollouts and name == "cost" and cost_source == "rollout":
+                continue  # no rollout data available
             p = dest / f"{name}.png"
             p.write_bytes(figure_to_png(fig))
             saved.append(p)
@@ -916,13 +1007,21 @@ def save_figures(
             prefix = prefixes[model_label]
             result = baseline_optimal_result(model_label, N_e)
             params, T, pbp_fn = result["params"], result["T"], result["pbp_fn"]
-            scenarios = [make_scenario(params, seed + i, T) for i in range(N_rollouts)]
-            full = run_rollouts_full(result["pi"], result["actions"], result["e_grid"],
-                                     params, scenarios, rollout_fn(model_label), pbp_fn)
+            if not skip_rollouts:
+                scenarios = [make_scenario(params, seed + i, T) for i in range(N_rollouts)]
+                full = run_rollouts_full(result["pi"], result["actions"], result["e_grid"],
+                                         params, scenarios, rollout_fn(model_label), pbp_fn)
+            else:
+                scenarios = full = None
 
-            for name, fig in (("cost", fig_baseline_cost(full)),
+            cost_fig = fig_baseline_cost(
+                full or {}, source=cost_source, result=result,
+            )
+            for name, fig in (("cost", cost_fig),
                               ("optimal_policy", fig_heatmap_grid([result], show_titles=False)),
                               ("optimal_policy_du", fig_heatmap_grid_du([result], show_titles=False))):
+                if skip_rollouts and name == "cost" and cost_source == "rollout":
+                    continue
                 p = bm_dir / f"{prefix}_{name}.png"
                 p.write_bytes(figure_to_png(fig))
                 saved.append(p)
@@ -937,11 +1036,11 @@ def save_figures(
                 p.write_bytes(figure_to_png(fig_nonopt))
                 saved.append(p)
 
-            if model_label == BASELINE_MODEL:
+            if model_label == BASELINE_MODEL and not skip_rollouts:
                 p = bm_dir / "baseline_trajectories.png"
                 p.write_bytes(figure_to_png(fig_baseline_trajectories(full, scenarios, T, params)))
                 saved.append(p)
-            else:
+            elif model_label != BASELINE_MODEL and not skip_rollouts:
                 label, color = negbin_display[model_label]
                 chi_list = [r["chi_traj"] for r in full["Backward Induction"]]
                 negbin_bands.append((label, color, chi_list, True))
@@ -987,6 +1086,8 @@ def save_tables(
     N_e: int = 500,
     include_baseline: bool = True,
     compute_exact: bool = True,
+    cost_source: str = "rollout",
+    skip_rollouts: bool = False,
     _log: Callable | None = None,
 ) -> list[Path]:
     """Write the per-sweep and (optionally) baseline-model summary tables as CSV.
@@ -994,6 +1095,13 @@ def save_tables(
     ``compute_exact=False`` skips the slow analytical exact-cost step for the
     baseline-model table (the ``Exact cost (€)`` column is omitted); the
     rollout-based metrics are unaffected.
+
+    ``cost_source`` selects the per-sweep summary's columns: ``"rollout"`` (default,
+    Monte-Carlo metrics with SEM/Std) or ``"exact"`` (analytical expected costs, the
+    distributional columns omitted).
+
+    ``skip_rollouts=True`` skips the baseline-model rollout loop; only the exact-cost
+    columns are written (implies ``cost_source="exact"`` for the baseline table).
 
     Mirrors save_figures' directory layout under out_dir:
         sensitivity_figures/<sweep>/summary.csv   — one row per (swept value, policy)
@@ -1012,7 +1120,8 @@ def save_tables(
         dest = out_dir / "sensitivity_figures" / folder
         dest.mkdir(parents=True, exist_ok=True)
         p = dest / "summary.csv"
-        df = build_summary_df(results)
+        _src = "exact" if skip_rollouts else cost_source
+        df = build_summary_df(results, source=_src)
         df.to_csv(p, index=False)
         saved.append(p)
         if _log: _log(f"  Saved table: {p}")
@@ -1020,37 +1129,51 @@ def save_tables(
     if include_baseline:
         bm_dir = out_dir / "baseline_models"
         bm_dir.mkdir(parents=True, exist_ok=True)
-        model_results = []
-        for model_label in [BASELINE_MODEL, NEGBIN_FIXED_MODEL, NEGBIN_SAMPLED_MODEL]:
-            label = _BASELINE_TABLE_LABELS[model_label]
-            if _log: _log(f"  [{label}] solving + running {N_rollouts} rollouts…")
-            result = baseline_optimal_result(model_label, N_e)
-            params, T, pbp_fn = result["params"], result["T"], result["pbp_fn"]
-            scenarios = [make_scenario(params, seed + i, T) for i in range(N_rollouts)]
-            rollouts = run_rollouts(
-                result["pi"], result["actions"], result["e_grid"], params,
-                scenarios, rollout_fn(model_label), pbp_fn, desc=f"    [{label}] rollouts")
-            if compute_exact:
-                if _log: _log(f"  [{label}] computing exact costs…")
-                result["exact_costs"] = compute_all_exact_costs(
-                    result, desc=f"    [{label}] exact costs")
-            else:
-                result["exact_costs"] = {}
-            model_results.append({"rollouts": rollouts, "label": label,
-                                  "exact_costs": result["exact_costs"]})
         import pandas as pd
-        rollout_df = pd.concat([build_summary_df([r]) for r in model_results], ignore_index=True)
-        rollout_df = rollout_df.rename(columns={"Swept value": "Model"})
-        if compute_exact:
-            exact_rows = [
-                {"Model": r["label"], "Policy": policy, "Exact cost (€)": cost}
-                for r in model_results
-                for policy, cost in r["exact_costs"].items()
-            ]
-            exact_df = pd.DataFrame(exact_rows)
-            df = exact_df.merge(rollout_df, on=["Model", "Policy"], how="right")
+        if skip_rollouts:
+            # Exact-only path: solve each model, compute exact cost breakdown, no rollouts.
+            exact_rows = []
+            for model_label in [BASELINE_MODEL, NEGBIN_FIXED_MODEL, NEGBIN_SAMPLED_MODEL]:
+                label = _BASELINE_TABLE_LABELS[model_label]
+                if _log: _log(f"  [{label}] solving…")
+                result = baseline_optimal_result(model_label, N_e)
+                if _log: _log(f"  [{label}] computing exact costs…")
+                bd = compute_all_exact_costs_breakdown(result, desc=f"    [{label}] exact costs")
+                for policy, vals in bd.items():
+                    from ev_mdt.plots.sensitivity import _penalty_pct, _exact_summary
+                    exact_rows.append({"Model": label, "Policy": policy, **_exact_summary(vals)})
+            df = pd.DataFrame(exact_rows)
         else:
-            df = rollout_df
+            model_results = []
+            for model_label in [BASELINE_MODEL, NEGBIN_FIXED_MODEL, NEGBIN_SAMPLED_MODEL]:
+                label = _BASELINE_TABLE_LABELS[model_label]
+                if _log: _log(f"  [{label}] solving + running {N_rollouts} rollouts…")
+                result = baseline_optimal_result(model_label, N_e)
+                params, T, pbp_fn = result["params"], result["T"], result["pbp_fn"]
+                scenarios = [make_scenario(params, seed + i, T) for i in range(N_rollouts)]
+                rollouts = run_rollouts(
+                    result["pi"], result["actions"], result["e_grid"], params,
+                    scenarios, rollout_fn(model_label), pbp_fn, desc=f"    [{label}] rollouts")
+                if compute_exact:
+                    if _log: _log(f"  [{label}] computing exact costs…")
+                    result["exact_costs"] = compute_all_exact_costs(
+                        result, desc=f"    [{label}] exact costs")
+                else:
+                    result["exact_costs"] = {}
+                model_results.append({"rollouts": rollouts, "label": label,
+                                      "exact_costs": result["exact_costs"]})
+            rollout_df = pd.concat([build_summary_df([r]) for r in model_results], ignore_index=True)
+            rollout_df = rollout_df.rename(columns={"Swept value": "Model"})
+            if compute_exact:
+                exact_rows = [
+                    {"Model": r["label"], "Policy": policy, "Exact cost (€)": cost}
+                    for r in model_results
+                    for policy, cost in r["exact_costs"].items()
+                ]
+                exact_df = pd.DataFrame(exact_rows)
+                df = exact_df.merge(rollout_df, on=["Model", "Policy"], how="right")
+            else:
+                df = rollout_df
         p = bm_dir / "summary.csv"
         df.to_csv(p, index=False)
         saved.append(p)

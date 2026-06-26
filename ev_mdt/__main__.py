@@ -159,6 +159,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             results = run_all_sweeps(
                 N_rollouts=args.N_rollouts, N_e=args.N_e, seed=args.seed,
                 sweeps=[sw], progress_cb=cb, _log=tqdm.write, _wandb_run=wandb_run,
+                skip_rollouts=args.no_rollouts,
             )
         finally:
             stop.set()
@@ -174,10 +175,13 @@ def cmd_run(args: argparse.Namespace) -> None:
 
         saved = save_figures(results, out_dir=figures_dir,
                              N_rollouts=args.N_rollouts, seed=args.seed, N_e=args.N_e,
-                             include_baseline=(do_baseline and i == 0))
+                             include_baseline=(do_baseline and i == 0),
+                             cost_source=args.cost_source,
+                             skip_rollouts=args.no_rollouts)
         saved += save_tables(results, out_dir=tables_dir,
                              N_rollouts=args.N_rollouts, seed=args.seed, N_e=args.N_e,
-                             include_baseline=False, _log=tqdm.write)
+                             include_baseline=False, cost_source=args.cost_source,
+                             skip_rollouts=args.no_rollouts, _log=tqdm.write)
         for p in saved:
             tqdm.write(f"  Saved: {p}")
 
@@ -188,7 +192,9 @@ def cmd_run(args: argparse.Namespace) -> None:
         tqdm.write("Writing baseline-model tables…")
         for p in save_tables({}, out_dir=tables_dir, N_rollouts=args.N_rollouts,
                              seed=args.seed, N_e=args.N_e, include_baseline=True,
-                             compute_exact=not args.no_exact, _log=tqdm.write):
+                             compute_exact=not args.no_exact,
+                             cost_source=args.cost_source,
+                             skip_rollouts=args.no_rollouts, _log=tqdm.write):
             tqdm.write(f"  Saved: {p}")
 
         # Price-model comparison figures (mean diurnal profile + std), as on the
@@ -454,6 +460,14 @@ def main() -> None:
     p_run.add_argument("--no-exact", action="store_true",
                        help="Skip the slow analytical exact-cost step in the baseline-model "
                             "table (rollout-based metrics are still written)")
+    p_run.add_argument("--cost-source", default="rollout", choices=["rollout", "exact"],
+                       help="Data behind the cost figures + per-sweep summary tables: "
+                            "'rollout' (Monte-Carlo means ±SEM, default) or 'exact' "
+                            "(analytical expected costs, no error bars)")
+    p_run.add_argument("--no-rollouts", action="store_true",
+                       help="Skip all Monte-Carlo rollout simulation (solve only). "
+                            "Use together with --cost-source exact to get exact cost "
+                            "tables/figures without running any rollouts.")
     p_run.add_argument("--sweep", default=None,
                        choices=ALL_SWEEP_NAMES, metavar="SWEEP",
                        help=f"Run a single sweep (no baseline models). Options: {', '.join(ALL_SWEEP_NAMES)}")

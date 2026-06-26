@@ -221,19 +221,24 @@ def _show_results(results: list[dict], sweep_label: str):
     st.caption("Mean total cost per sampled trip — **including the unserved-driving penalty** — "
                "grouped by swept value, one bar per policy. Error bars: **SEM** = uncertainty of "
                "the mean (std/√N); **Std** = spread of individual trips. Lower bar clamped at 0.")
-    cc1, cc2 = st.columns(2)
+    cc1, cc2, cc3 = st.columns(3)
     with cc1:
         cost_axis = st.radio("Cost axis", ["Log", "Linear"], horizontal=True,
                              key=f"sa_cost_axis_{sweep_label}")
     with cc2:
+        cost_src = st.radio("Cost source", ["Rollout", "Exact"], horizontal=True,
+                            key=f"sa_cost_src_{sweep_label}")
+    with cc3:
         err_mode = st.radio("Error bars", ["SEM", "Std"], horizontal=True,
-                            key=f"sa_cost_err_{sweep_label}")
+                            key=f"sa_cost_err_{sweep_label}",
+                            disabled=(cost_src == "Exact"))
     x_label = SWEEP_AXIS_LABEL.get(sweep_label, "Swept value")
+    _src = cost_src.lower()
     _chart(fig_cost_distribution(results, log_y=(cost_axis == "Log"), x_label=x_label,
-                                 error=err_mode.lower()), f"{sweep_label}_cost")
+                                 error=err_mode.lower(), source=_src), f"{sweep_label}_cost")
 
     st.subheader("Summary table")
-    df = build_summary_df(results)
+    df = build_summary_df(results, source=_src)
     st.dataframe(df.style.format(SUMMARY_METRIC_FORMATS),
                  use_container_width=True, hide_index=True)
     st.download_button(

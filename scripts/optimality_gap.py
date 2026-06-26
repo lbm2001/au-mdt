@@ -32,8 +32,10 @@ import pandas as pd
 from tqdm import tqdm
 
 from ev_mdt.analysis.sensitivity import (
-    BASELINE_MODEL, baseline_optimal_result, compute_all_exact_costs,
+    BASELINE_MODEL, baseline_optimal_result, compute_all_exact_costs_breakdown,
 )
+from ev_mdt.plots.sensitivity import _exact_summary, _penalty_pct, fig_baseline_cost, figure_to_png
+from ev_mdt.plots.viz import POLICY_ORDER
 
 BI = "Backward Induction"
 
@@ -43,25 +45,34 @@ def main() -> None:
     ap.add_argument("--N-e", type=int, default=500, help="battery grid resolution")
     ap.add_argument("--out", type=Path, default=ROOT / "optimality_gap.csv",
                     help="output CSV path")
+    ap.add_argument("--fig", type=Path, default=ROOT / "optimality_gap.png",
+                    help="output figure path")
     args = ap.parse_args()
 
     tqdm.write(f"[1/2] Solving baseline model (N_e={args.N_e})…")
     result = baseline_optimal_result(BASELINE_MODEL, args.N_e)
 
     tqdm.write("[2/2] Computing exact cost for every policy (backward-pass evaluation)…")
-    costs = compute_all_exact_costs(result, beta=1.0, desc="exact costs")
+    bd = compute_all_exact_costs_breakdown(result, desc="exact costs")
 
-    j_star = costs[BI]
-    rows = [{
-        "Policy": policy,
-        "Exact cost (€)": cost,
-        "Optimality gap (€)": cost - j_star,
-        "Gap (%)": 100.0 * (cost - j_star) / j_star if j_star else float("nan"),
-    } for policy, cost in costs.items()]
-    df = pd.DataFrame(rows).sort_values("Optimality gap (€)").reset_index(drop=True)
+    j_star = bd[BI]["total"]
+    rows = []
+    for policy in POLICY_ORDER:
+        if policy not in bd:
+            continue
+        vals = bd[policy]
+        row = {"Policy": policy, **_exact_summary(vals)}
+        row["Optimality gap %"] = (vals["total"] - j_star) / j_star * 100 if j_star else float("nan")
+        rows.append(row)
+    df = pd.DataFrame(rows).reset_index(drop=True)
 
     df.to_csv(args.out, index=False)
     tqdm.write(f"Saved: {args.out}")
+
+    result["exact_breakdown"] = bd
+    fig = fig_baseline_cost({}, source="exact", result=result)
+    args.fig.write_bytes(figure_to_png(fig))
+    tqdm.write(f"Saved: {args.fig}")
 
 
 if __name__ == "__main__":

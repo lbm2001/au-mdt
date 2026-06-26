@@ -221,45 +221,12 @@ def cmd_run(args: argparse.Namespace) -> None:
         wandb_run.finish()
 
 
-def cmd_target_sweep(args: argparse.Namespace) -> None:
-    from tqdm import tqdm
-    from ev_mdt.analysis.sensitivity import sweep_target_ceiling
-    from ev_mdt.plots.sensitivity import figure_to_png
-
-    out_dir = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    rows = sweep_target_ceiling(
-        model_label=args.model,
-        N_rollouts=args.N_rollouts,
-        seed=args.seed,
-        step_kwh=args.step,
-    )
-
-    import pandas as pd
-    import numpy as np
-    df = pd.DataFrame(rows)
-    best = df.loc[df["mean_cost"].idxmin()]
-    tqdm.write(f"\nBest ceiling: {best['target_kwh']:.0f} kWh "
-               f"({best['target_frac']:.0%}) — mean cost {best['mean_cost']:.4f} €")
-
-    # Save table
-    csv_path = out_dir / "target_sweep.csv"
-    df.rename(columns={
-        "target_kwh":   "Target ceiling (kWh)",
-        "target_frac":  "Target ceiling (%)",
-        "mean_cost":    "Mean cost (€)",
-        "std_cost":     "Std cost (€)",
-        "mean_penalty": "Mean penalty (min)",
-        "mean_charged": "Mean charged (kWh)",
-    }).to_csv(csv_path, index=False)
-    tqdm.write(f"Saved table → {csv_path}")
-
-    # Save plot
-    try:
-        import plotly.graph_objects as go
-        fig = go.Figure()
-        x = df["target_kwh"]
+def _target_sweep_figure(df, best, exact: bool):
+    import plotly.graph_objects as go
+    x = df["target_kwh"]
+    fig = go.Figure()
+    if not exact:
+        import pandas as pd
         fig.add_trace(go.Scatter(
             x=pd.concat([x, x.iloc[::-1]]),
             y=pd.concat([df["mean_cost"] + df["std_cost"],
@@ -267,79 +234,108 @@ def cmd_target_sweep(args: argparse.Namespace) -> None:
             fill="toself", fillcolor="rgba(68,119,170,0.10)",
             line=dict(color="rgba(0,0,0,0)"), name="Total ±1 std", hoverinfo="skip", yaxis="y1",
         ))
-        fig.add_trace(go.Scatter(
-            x=x, y=df["mean_cost"], mode="lines+markers",
-            line=dict(color="#4477AA", width=2), marker=dict(size=7), name="Total cost", yaxis="y1",
-        ))
-        fig.add_trace(go.Scatter(
-            x=x, y=df["mean_penalty_cost"], mode="lines+markers",
-            line=dict(color="#CC3311", width=2, dash="dash"), marker=dict(size=6),
-            name="Penalty cost", yaxis="y1",
-        ))
-        fig.add_trace(go.Scatter(
-            x=[best["target_kwh"]], y=[best["mean_cost"]],
-            mode="markers", marker=dict(color="#EE6677", size=12, symbol="star"),
-            name=f"Best: {best['target_kwh']:.0f} kWh ({best['target_frac']:.0%})", yaxis="y1",
-        ))
-        fig.add_trace(go.Scatter(
-            x=x, y=df["mean_charge_cost"], mode="lines+markers",
-            line=dict(color="#228833", width=2, dash="dot"), marker=dict(size=6),
-            name="Charging cost (right)", yaxis="y2",
-        ))
-        fig.update_layout(
-            xaxis_title="Target ceiling (kWh)",
-            yaxis=dict(title="Total / penalty cost (€)"),
-            yaxis2=dict(title="Charging cost (€)", overlaying="y", side="right",
-                        showgrid=False),
-            legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
-            template="plotly_white", height=500,
-        )
-        png_path = out_dir / "target_sweep.png"
-        png_path.write_bytes(figure_to_png(fig))
-        tqdm.write(f"Saved plot  → {png_path}")
-    except Exception as e:
-        tqdm.write(f"Could not save plot (kaleido missing?): {e}")
+    fig.add_trace(go.Scatter(
+        x=x, y=df["mean_cost"], mode="lines+markers",
+        line=dict(color="#4477AA", width=2), marker=dict(size=7), name="Total cost", yaxis="y1",
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=df["mean_penalty_cost"], mode="lines+markers",
+        line=dict(color="#CC3311", width=2, dash="dash"), marker=dict(size=6),
+        name="Penalty cost", yaxis="y1",
+    ))
+    fig.add_trace(go.Scatter(
+        x=[best["target_kwh"]], y=[best["mean_cost"]],
+        mode="markers", marker=dict(color="#EE6677", size=12, symbol="star"),
+        name=f"Best: {best['target_kwh']:.1f} kWh ({best['target_frac']:.1%})", yaxis="y1",
+    ))
+    fig.add_trace(go.Scatter(
+        x=x, y=df["mean_charge_cost"], mode="lines+markers",
+        line=dict(color="#228833", width=2, dash="dot"), marker=dict(size=6),
+        name="Charging cost (right)", yaxis="y2",
+    ))
+    fig.update_layout(
+        xaxis_title="Target ceiling (kWh)",
+        yaxis=dict(title=f"Total / penalty cost (€)"),
+        yaxis2=dict(title="Charging cost (€)", overlaying="y", side="right", showgrid=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
+        template="plotly_white", height=500,
+    )
+    return fig
 
 
-def cmd_gamma_sweep(args: argparse.Namespace) -> None:
+def cmd_target_sweep(args: argparse.Namespace) -> None:
     import pandas as pd
     from tqdm import tqdm
-    from plotly.subplots import make_subplots
-    import plotly.graph_objects as go
-    from ev_mdt.analysis.sensitivity import sweep_gamma
     from ev_mdt.plots.sensitivity import figure_to_png
 
     out_dir = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    results = sweep_gamma(
-        N_rollouts=args.N_rollouts,
-        seed=args.seed,
-        use_reserve=not args.no_reserve,
-    )
+    if args.exact:
+        from ev_mdt.analysis.sensitivity import sweep_target_ceiling_exact
+        rows = sweep_target_ceiling_exact(
+            model_label=args.model, step_kwh=args.step,
+            N_e=args.N_e, use_reserve=not args.no_reserve,
+            _log=tqdm.write,
+        )
+        col_map = {
+            "target_kwh":        "Target ceiling (kWh)",
+            "target_frac":       "Target ceiling (%)",
+            "mean_cost":         "Expected cost (€)",
+            "mean_charge_cost":  "Expected charging (€)",
+            "mean_penalty_cost": "Expected penalty (€)",
+            "mean_penalty_min":  "Expected penalty min",
+            "mean_charged":      "Expected energy charged (kWh)",
+        }
+    else:
+        from ev_mdt.analysis.sensitivity import sweep_target_ceiling
+        rows = sweep_target_ceiling(
+            model_label=args.model, N_rollouts=args.N_rollouts,
+            seed=args.seed, step_kwh=args.step,
+        )
+        col_map = {
+            "target_kwh":   "Target ceiling (kWh)",
+            "target_frac":  "Target ceiling (%)",
+            "mean_cost":    "Mean cost (€)",
+            "std_cost":     "Std cost (€)",
+            "mean_penalty": "Mean penalty (min)",
+            "mean_charged": "Mean charged (kWh)",
+        }
 
-    # Save CSV per model
-    for model_name, rows in results.items():
-        slug = model_name.lower().replace(" ", "_").replace("=", "")
-        csv_path = out_dir / f"gamma_sweep_{slug}.csv"
-        pd.DataFrame(rows).to_csv(csv_path, index=False)
-        tqdm.write(f"Saved {csv_path}")
+    df = pd.DataFrame(rows)
+    best = df.loc[df["mean_cost"].idxmin()]
+    tqdm.write(f"\nBest ceiling: {best['target_kwh']:.0f} kWh "
+               f"({best['target_frac']:.0%}) — cost {best['mean_cost']:.4f} €")
 
-    # Build stacked figure: one subplot per model, dual y-axes
+    csv_path = out_dir / "target_sweep.csv"
+    df.rename(columns=col_map).to_csv(csv_path, index=False)
+    tqdm.write(f"Saved table → {csv_path}")
+
+    try:
+        fig = _target_sweep_figure(df, best, exact=args.exact)
+        png_path = out_dir / "target_sweep.png"
+        png_path.write_bytes(figure_to_png(fig))
+        tqdm.write(f"Saved plot  → {png_path}")
+    except Exception as e:
+        tqdm.write(f"Could not save plot: {e}")
+
+
+def _gamma_sweep_figure(results, exact: bool):
+    import pandas as pd
+    from plotly.subplots import make_subplots
+    import plotly.graph_objects as go
+    cost_label = "Expected cost (€)" if exact else "Mean cost (€)"
     model_names = list(results.keys())
     n_models = len(model_names)
     fig = make_subplots(
-        rows=n_models, cols=1,
-        shared_xaxes=True,
-        subplot_titles=model_names,
-        vertical_spacing=0.10,
+        rows=n_models, cols=1, shared_xaxes=True,
+        subplot_titles=model_names, vertical_spacing=0.10,
     )
     colors = {"total": "#4477AA", "charging": "#228833", "penalty": "#CC3311"}
     for row_i, model_name in enumerate(model_names, start=1):
         df   = pd.DataFrame(results[model_name])
         x    = df["gamma"]
         show = row_i == 1
-
         fig.add_trace(go.Scatter(
             x=x, y=df["mean_cost"], mode="lines+markers",
             line=dict(color=colors["total"], width=2), marker=dict(size=6),
@@ -355,20 +351,13 @@ def cmd_gamma_sweep(args: argparse.Namespace) -> None:
             line=dict(color=colors["penalty"], width=2, dash="dash"), marker=dict(size=5),
             name="Penalty cost", legendgroup="penalty", showlegend=show,
         ), row=row_i, col=1)
-
         best = df.loc[df["mean_cost"].idxmin()]
         fig.add_trace(go.Scatter(
             x=[best["gamma"]], y=[best["mean_cost"]],
             mode="markers", marker=dict(color="#EE6677", size=11, symbol="star"),
-            name="Best", legendgroup=f"best_{row_i}",
-            showlegend=show,
+            name="Best γ", legendgroup=f"best_{row_i}", showlegend=show,
         ), row=row_i, col=1)
-
-        fig.update_yaxes(title_text="Cost (€)", row=row_i, col=1)
-
-        tqdm.write(f"{model_name}: best γ={best['gamma']:.1f}  "
-                   f"(target={best['target_kwh']:.1f} kWh, cost={best['mean_cost']:.4f} €)")
-
+        fig.update_yaxes(title_text=cost_label, row=row_i, col=1)
     fig.update_xaxes(title_text="γ", row=n_models, col=1)
     fig.update_layout(
         template="plotly_white",
@@ -376,8 +365,66 @@ def cmd_gamma_sweep(args: argparse.Namespace) -> None:
         height=320 * n_models,
         margin=dict(l=70, r=80, t=60, b=40),
     )
+    return fig
+
+
+def cmd_gamma_sweep(args: argparse.Namespace) -> None:
+    import pandas as pd
+    from tqdm import tqdm
+    from ev_mdt.plots.sensitivity import figure_to_png
+
+    out_dir = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.exact:
+        from ev_mdt.analysis.sensitivity import sweep_gamma_exact
+        import numpy as _np
+        gamma_values = [round(g, 6) for g in _np.arange(args.gamma_step, 1.0 + 1e-9, args.gamma_step)]
+        results = sweep_gamma_exact(
+            use_reserve=not args.no_reserve,
+            gamma_values=gamma_values,
+            N_e=args.N_e,
+            _log=tqdm.write,
+        )
+        col_map = {
+            "gamma":             "γ",
+            "target_kwh":        "Target ceiling (kWh)",
+            "mean_cost":         "Expected cost (€)",
+            "mean_charge_cost":  "Expected charging (€)",
+            "mean_penalty_cost": "Expected penalty (€)",
+            "mean_penalty_min":  "Expected penalty min",
+            "mean_charged":      "Expected energy charged (kWh)",
+        }
+    else:
+        from ev_mdt.analysis.sensitivity import sweep_gamma
+        results = sweep_gamma(
+            N_rollouts=args.N_rollouts,
+            seed=args.seed,
+            use_reserve=not args.no_reserve,
+        )
+        col_map = {
+            "gamma":             "γ",
+            "target_kwh":        "Target ceiling (kWh)",
+            "mean_cost":         "Mean cost (€)",
+            "std_cost":          "Std cost (€)",
+            "mean_charge_cost":  "Mean charging (€)",
+            "mean_penalty_cost": "Mean penalty (€)",
+            "mean_penalty":      "Mean penalty (min)",
+            "mean_charged":      "Mean charged (kWh)",
+        }
+
+    for model_name, rows in results.items():
+        slug = model_name.lower().replace(" ", "_").replace("=", "")
+        df = pd.DataFrame(rows)
+        csv_path = out_dir / f"gamma_sweep_{slug}.csv"
+        df.rename(columns=col_map).to_csv(csv_path, index=False)
+        tqdm.write(f"Saved {csv_path}")
+        best = df.loc[df["mean_cost"].idxmin()]
+        tqdm.write(f"  {model_name}: best γ={best['gamma']:.1f} "
+                   f"target={best['target_kwh']:.1f} kWh  cost={best['mean_cost']:.4f} €")
 
     try:
+        fig = _gamma_sweep_figure(results, exact=args.exact)
         png_path = out_dir / "gamma_sweep.png"
         png_path.write_bytes(figure_to_png(fig))
         tqdm.write(f"Saved plot → {png_path}")
@@ -497,6 +544,12 @@ def main() -> None:
                       help="Output base dir; outputs go under <dir>/<timestamp>/")
     p_ts.add_argument("--no-timestamp", action="store_true",
                       help="Write directly to --out-dir instead of a timestamped subfolder")
+    p_ts.add_argument("--exact",       action="store_true",
+                      help="Use exact backward-pass evaluation instead of Monte-Carlo rollouts")
+    p_ts.add_argument("--N-e",         type=int, default=500, metavar="N",
+                      help="Battery grid resolution (only used with --exact)")
+    p_ts.add_argument("--no-reserve",  action="store_true",
+                      help="Disable battery reserve in Departure Urgency (only with --exact)")
 
     # gamma-sweep
     p_gs = sub.add_parser("gamma-sweep",
@@ -508,6 +561,12 @@ def main() -> None:
                       help="Output base dir; outputs go under <dir>/<timestamp>/")
     p_gs.add_argument("--no-timestamp", action="store_true",
                       help="Write directly to --out-dir instead of a timestamped subfolder")
+    p_gs.add_argument("--exact",       action="store_true",
+                      help="Use exact backward-pass evaluation instead of Monte-Carlo rollouts")
+    p_gs.add_argument("--N-e",         type=int,   default=500, metavar="N",
+                      help="Battery grid resolution (only used with --exact)")
+    p_gs.add_argument("--gamma-step",  type=float, default=0.1, metavar="STEP",
+                      help="γ step size (default 0.1)")
 
     # prices
     p_prices = sub.add_parser("prices", help="Fit price models and simulate diurnal profiles")

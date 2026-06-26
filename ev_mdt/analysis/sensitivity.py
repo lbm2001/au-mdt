@@ -196,10 +196,11 @@ def _vectorized_action_grid(name: str, kwargs: dict, e_grid, lam_grid, params,
         return np.where(e_grid[None, :, None] >= e_max, 0.0, rate)
 
     if name == "Departure Urgency":
-        gamma       = kwargs.get("gamma", None)
-        use_reserve = kwargs.get("use_reserve", True)
+        gamma        = kwargs.get("gamma", None)
+        use_reserve  = kwargs.get("use_reserve", True)
+        ceil_override = kwargs.get("ceil_override", None)
         e_trip = _expected_trip_minutes(params) * params.mu * params.v * params.omega
-        e_ceil = _du_e_ceil(params, gamma)
+        e_ceil = float(ceil_override) if ceil_override is not None else _du_e_ceil(params, gamma)
 
         slots       = np.array([_minutes_to_departure(t, params) for t in range(T)])  # (T,)
         deliverable = u_max * params.eta_c * params.omega * slots                     # (T,)
@@ -758,6 +759,118 @@ def sweep_gamma(
             step_i += 1
             if progress_cb:
                 progress_cb(step_i / total_steps, f"{model_name} γ={gamma:.1f}")
+        inner.close()
+        results[model_name] = rows
+    outer.close()
+    return results
+
+
+def sweep_target_ceiling_exact(
+    model_label: str = BASELINE_MODEL,
+    step_kwh: float = 5.0,
+    N_e: int = 500,
+    use_reserve: bool = True,
+    progress_cb: Callable | None = None,
+    _log: Callable | None = None,
+) -> list[dict]:
+    """Exact version of sweep_target_ceiling: one backward-pass evaluation per ceiling value.
+
+    Returns the same row structure as sweep_target_ceiling but with exact expected
+    values (no std_cost) and an additional mean_penalty_min column.
+    """
+    from tqdm import tqdm
+    from ev_mdt.models.common.policies import next_trip_policy, E_CEIL_BASE
+
+    params = build_params(model_label)
+    pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
+    T = 24 * 60
+
+    if _log: _log(f"Solving {model_label} (N_e={N_e})…")
+    result = baseline_optimal_result(model_label, N_e)
+
+    ceil_values = np.arange(params.e_min + step_kwh, params.e_max + 1e-6, step_kwh)
+    ceil_values = ceil_values[ceil_values <= params.e_max]
+
+    rows = []
+    bar = tqdm(list(ceil_values), desc="Target ceiling (exact)", unit="step", position=0)
+    for i, ceil_kwh in enumerate(bar):
+        bar.set_postfix(ceiling=f"{ceil_kwh:.0f} kWh")
+        bd = policy_expected_cost(
+            result, next_trip_policy, name="Departure Urgency",
+            ceil_override=float(ceil_kwh), use_reserve=use_reserve, breakdown=True,
+        )
+        rows.append({
+            "target_kwh":        float(ceil_kwh),
+            "target_frac":       float(ceil_kwh) / params.e_max,
+            "mean_cost":         bd["total"],
+            "mean_charge_cost":  bd["charging"],
+            "mean_penalty_cost": bd["penalty"],
+            "mean_penalty_min":  bd["penalty_min"],
+            "mean_charged":      bd["energy_kwh"],
+        })
+        if progress_cb: progress_cb((i + 1) / len(ceil_values), f"ceiling {ceil_kwh:.0f} kWh")
+    bar.close()
+    return rows
+
+
+def sweep_gamma_exact(
+    use_reserve: bool = True,
+    gamma_values: list | None = None,
+    N_e: int = 500,
+    progress_cb: Callable | None = None,
+    _log: Callable | None = None,
+) -> dict[str, list[dict]]:
+    """Exact version of sweep_gamma: one backward-pass evaluation per (model, γ).
+
+    Returns {model_name: [row_dict, ...]} with exact expected values (no std_cost).
+    """
+    from tqdm import tqdm
+    from ev_mdt.models.common.policies import next_trip_policy, _du_e_daily, E_CEIL_BASE, _e_daily_ref
+
+    if gamma_values is None:
+        gamma_values = [round(g, 2) for g in np.arange(0.1, 1.01, 0.1)]
+
+    e_daily_ref = _e_daily_ref()
+    model_configs = [
+        (BASELINE_MODEL,       "Baseline",           build_params(BASELINE_MODEL)),
+        (NEGBIN_FIXED_MODEL,   "NegBin fixed k=5",   NegBinParams(k=5)),
+        (NEGBIN_SAMPLED_MODEL, "NegBin Poisson k=5", NegBinParams(lambda_k=5.0,
+                                                      k=NegBinParams.k_max_for_lambda(5.0))),
+    ]
+
+    results: dict[str, list[dict]] = {}
+    total_steps = len(model_configs) * len(gamma_values)
+    step_i = 0
+
+    outer = tqdm(model_configs, desc="Models (exact)", unit="model", position=0)
+    for model_label, model_name, params in outer:
+        outer.set_postfix(model=model_name)
+        if _log: _log(f"  [{model_name}] solving (N_e={N_e})…")
+        result = baseline_optimal_result(model_label, N_e)
+
+        e_daily = _du_e_daily(params)
+        ratio   = e_daily / e_daily_ref if e_daily_ref > 0 else 1.0
+
+        rows: list[dict] = []
+        inner = tqdm(gamma_values, desc=f"  γ sweep ({model_name})", unit="γ",
+                     position=1, leave=False)
+        for gamma in inner:
+            target_kwh = min(params.e_max, E_CEIL_BASE * ratio ** gamma)
+            bd = policy_expected_cost(
+                result, next_trip_policy, name="Departure Urgency",
+                gamma=gamma, use_reserve=use_reserve, breakdown=True,
+            )
+            rows.append({
+                "gamma":             gamma,
+                "target_kwh":        target_kwh,
+                "mean_cost":         bd["total"],
+                "mean_charge_cost":  bd["charging"],
+                "mean_penalty_cost": bd["penalty"],
+                "mean_penalty_min":  bd["penalty_min"],
+                "mean_charged":      bd["energy_kwh"],
+            })
+            step_i += 1
+            if progress_cb: progress_cb(step_i / total_steps, f"{model_name} γ={gamma:.1f}")
         inner.close()
         results[model_name] = rows
     outer.close()

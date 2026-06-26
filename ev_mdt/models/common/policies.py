@@ -10,14 +10,14 @@ from ev_mdt.models.common.model_utils import (
 
 # Empirically-swept baseline-optimal DU ceiling (kWh). Set from `target-sweep` at default
 # Baseline params; carried as a module-level constant so the policy is param-free.
-E_CEIL_BASE: float = 25.0
+E_CEIL_BASE: float = 29.5
 
 # Best ceiling-scaling exponent γ per mobility model, from `gamma-sweep` (N=1000).
 # At Baseline the demand ratio is 1, so γ is irrelevant there (e_ceil ≡ E_CEIL_BASE);
 # γ only shapes the ceiling for the NegBin models via (e_daily / e_daily_ref) ** γ.
 DU_GAMMA_BASELINE:       float = 0.1
-DU_GAMMA_NEGBIN_FIXED:   float = 0.1  # TODO: set from gamma-sweep (NegBin fixed k=5)
-DU_GAMMA_NEGBIN_POISSON: float = 0.4   # TODO: set from gamma-sweep (NegBin Poisson k=5)
+DU_GAMMA_NEGBIN_FIXED:   float = 0.3 
+DU_GAMMA_NEGBIN_POISSON: float = 0.5
 
 
 def du_gamma_for_params(params) -> float:

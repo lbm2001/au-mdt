@@ -352,6 +352,23 @@ def _cost_floor(totals: np.ndarray) -> float:
     return float(pos.min() / 3.0) if pos.size else 1e-3
 
 
+def _log_err_arms(totals, errs):
+    """Log-symmetric error arms for ±err around totals (delta method).
+
+    A symmetric linear ±SEM looks lopsided on a log axis (the lower arm plunges and
+    can cross zero). Converting to a half-width in log10 units, d = (err/total)/ln10,
+    gives caps at total·10^±d — balanced on the log axis and always positive. Returns
+    (array_up, array_minus_down) suitable for a plotly error_y with symmetric=False.
+    """
+    totals = np.asarray(totals, float)
+    errs   = np.asarray(errs,   float)
+    safe   = np.where(totals > 0, totals, 1.0)
+    d  = (errs / safe) / np.log(10.0)
+    up = totals * (10.0 ** d - 1.0)
+    dn = totals * (1.0 - 10.0 ** (-d))
+    return up, dn
+
+
 def _add_stacked_cost_bars(fig, xs, totals, charge, penalty, color, name, errs, *,
                            log_y: bool, y0: float, offsetgroup=None,
                            showlegend: bool = True, row=None, col=None) -> None:
@@ -403,12 +420,17 @@ def _add_stacked_cost_bars(fig, xs, totals, charge, penalty, color, name, errs, 
     # Error bars (±SEM/Std on total): carried by a transparent full-height bar so the
     # whisker is centred at the *total* (Plotly centres error_y at the bar's y-length,
     # which for the based segments above would land mid-bar). Same offsetgroup keeps it
-    # aligned within the policy's grouped slot.
+    # aligned within the policy's grouped slot. On a log axis use log-symmetric arms so
+    # the whisker is balanced and never plunges below zero.
+    if log_y:
+        up, dn = _log_err_arms(totals, errs)
+        err_kw = dict(type="data", symmetric=False, array=up, arrayminus=dn)
+    else:
+        err_kw = dict(type="data", array=np.asarray(errs, float))
     fig.add_trace(go.Bar(
         x=xs, y=totals, offsetgroup=offsetgroup, legendgroup=name,
         marker=dict(color="rgba(0,0,0,0)"), showlegend=False, hoverinfo="skip",
-        error_y=dict(type="data", array=errs, visible=True, thickness=1.2, width=4,
-                     color="#333333"),
+        error_y=dict(visible=True, thickness=1.2, width=4, color="#333333", **err_kw),
     ), **pos)
 
 
@@ -433,6 +455,7 @@ def fig_cost_distribution(results: list[dict], log_y: bool = True,
         series.append((policy, np.array(totals), np.array(charge), np.array(penalty), errs))
 
     all_totals = np.concatenate([s[1] for s in series]) if series else np.array([1.0])
+    all_errs   = np.concatenate([np.asarray(s[4], float) for s in series]) if series else np.array([0.0])
     y0 = _cost_floor(all_totals)
 
     fig = go.Figure()
@@ -444,7 +467,8 @@ def fig_cost_distribution(results: list[dict], log_y: bool = True,
     yaxis = dict(title="Mean cost (€)" + ("  [log]" if log_y else ""),
                  type="log" if log_y else "linear")
     if log_y:
-        yaxis["range"] = [np.log10(y0), np.log10(all_totals.max() * 1.4)]
+        top = (all_totals + _log_err_arms(all_totals, all_errs)[0]).max()  # include upper whisker
+        yaxis["range"] = [np.log10(y0), np.log10(top * 1.1)]
         yaxis["dtick"] = 1          # decade ticks only: 0.1, 1, 10, …
     fig.update_layout(
         template="plotly_white",
@@ -523,6 +547,7 @@ def fig_baseline_cost(full: dict, *, error: str = "sem", log_y: bool = True) -> 
         errs.append(sd / np.sqrt(m) if (error == "sem" and m > 0) else sd)
 
     totals_arr = np.array(totals) if totals else np.array([1.0])
+    errs_arr   = np.array(errs)   if errs   else np.array([0.0])
     y0 = _cost_floor(totals_arr)
 
     fig = go.Figure()
@@ -535,18 +560,21 @@ def fig_baseline_cost(full: dict, *, error: str = "sem", log_y: bool = True) -> 
     yaxis = dict(title="Mean cost (€)" + ("  [log]" if log_y else ""),
                  type="log" if log_y else "linear")
     if log_y:
-        yaxis["range"] = [np.log10(y0), np.log10(totals_arr.max() * 1.4)]
+        top = (totals_arr + _log_err_arms(totals_arr, errs_arr)[0]).max()  # include upper whisker
+        yaxis["range"] = [np.log10(y0), np.log10(top * 1.1)]
         yaxis["dtick"] = 1          # decade ticks only: 0.1, 1, 10, …
+    # baseline_models figure: no legend and no per-bar policy captions (bars are
+    # identified elsewhere); keeps the figure clean for the thesis layout.
     fig.update_layout(
         template="plotly_white",
         plot_bgcolor="white",
         paper_bgcolor="white",
         yaxis=yaxis,
-        xaxis_title="Policy", height=460, margin=dict(l=40, r=20, t=20, b=110),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0,
-                    font=dict(size=11), itemsizing="constant"),
+        showlegend=False,
+        height=460, margin=dict(l=40, r=20, t=20, b=20),
     )
-    fig.update_xaxes(categoryorder="array", categoryarray=POLICY_ORDER)
+    fig.update_xaxes(categoryorder="array", categoryarray=POLICY_ORDER,
+                     showticklabels=False, title_text="")
     return fig
 
 

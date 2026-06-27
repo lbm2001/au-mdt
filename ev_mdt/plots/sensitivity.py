@@ -912,6 +912,12 @@ def fig_baseline_policy_heatmaps(
         du_use_reserve=du_use_reserve,
     )
     policies = [(name, fn, kw) for name, fn, kw in registry if name != "Backward Induction"]
+    du = [(n, f, k) for n, f, k in policies if n == "Departure Urgency"]
+    rest = [(n, f, k) for n, f, k in policies if n != "Departure Urgency"]
+    policies = du + rest
+    bi_entry = next(((name, fn, kw) for name, fn, kw in registry if name == "Backward Induction"), None)
+    if bi_entry is not None and pi is not None and actions is not None:
+        policies.insert(0, bi_entry)
 
     probs  = np.array([pbp_fn(t) for t in range(T)])   # (T, K)
     cumsum = probs.cumsum(axis=1)                        # (T, K)
@@ -921,14 +927,17 @@ def fig_baseline_policy_heatmaps(
     fig = make_subplots(
         rows=nrows, cols=ncols,
         subplot_titles=[name for name, _, _ in policies],
-        horizontal_spacing=0.10,
-        vertical_spacing=0.10,
+        horizontal_spacing=0.06,
+        vertical_spacing=0.05,
     )
     T_hours = T // 60
     for idx, (name, _fn, kw) in enumerate(policies):
         row = idx // ncols + 1
         col = idx %  ncols + 1
-        rates = _baseline_policy_rates(name, kw, e_grid, lam_grid, params, T, probs, cumsum)
+        if name == "Backward Induction":
+            rates = _opt_rates_averaged(pi, actions, params, pbp_fn, T)
+        else:
+            rates = _baseline_policy_rates(name, kw, e_grid, lam_grid, params, T, probs, cumsum)
         rates = np.clip(rates, 0.0, params.u_max)
         z, t_c, b_c = _bin_heatmap(
             rates, e_grid, T, time_bin_min, battery_bin_kwh, params.e_min, params.e_max,

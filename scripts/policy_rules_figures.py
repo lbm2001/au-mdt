@@ -20,6 +20,7 @@ Only the optimal policy (BI) needs a backward-induction solve; DU and BL are
 closed-form in the state. No rollouts and no exact-cost/optimality computation
 are run — we only solve for the BI policy and read the closed-form rules.
 """
+import argparse
 import sys
 from math import ceil
 from pathlib import Path
@@ -28,6 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 from plotly.colors import sample_colorscale
 from plotly.subplots import make_subplots
@@ -42,9 +44,16 @@ from ev_mdt.plots.sensitivity import (
     _opt_rates_averaged, _charge_battery_ceiling,
     _baseline_policy_rates, _bin_heatmap,
     _du_charge_battery_ceiling, _blu_charge_battery_ceiling,
+    fig_cost_distribution, fig_baseline_cost,
 )
 
-OUT = Path(__file__).resolve().parents[1] / "figures_app"
+OUT = Path(__file__).resolve().parents[1] / "figures_appendix"
+TABLES = ROOT / "data" / "tables_final" / "tables"
+# Sweep folders that have a cost summary table (same names as the figure folders).
+SWEEP_FOLDERS = [
+    "pricing_model", "pricing_season", "pricing_daytype", "pricing_crisis",
+    "penalty", "horizon", "departure_profile", "mobility_model",
+]
 N_E = 500
 T_DAY = 24 * 60
 BATTERY_BIN_KWH = 0.5
@@ -185,10 +194,15 @@ def border_grid(results: list[dict], policy: str) -> go.Figure:
     return fig
 
 
-def figure_to_png(fig: go.Figure, width: int = 1400, scale: int = 3) -> bytes:
+def figure_to_png(fig: go.Figure, width: int = 1400, scale: int = 3,
+                  top: int | None = None) -> bytes:
     """Tight high-res PNG: margins shrink (via automargin) to exactly fit the
     axis labels and colorbar, so the plot content fills the frame edge-to-edge
-    with no extra whitespace on the sides."""
+    with no extra whitespace on the sides.
+
+    ``top`` overrides the top margin — needed for the cost figures, whose
+    horizontal legend sits above the plot (automargin does not reserve for it).
+    """
     import copy
     fig = copy.deepcopy(fig)
     fig.update_layout(template="plotly_white", plot_bgcolor="white",
@@ -204,7 +218,8 @@ def figure_to_png(fig: go.Figure, width: int = 1400, scale: int = 3) -> bytes:
     # titles, colorbar); the small base margins are the *minimum* padding.
     fig.update_xaxes(automargin=True, title_standoff=8)
     fig.update_yaxes(automargin=True, title_standoff=8)
-    fig.update_layout(margin=dict(l=8, r=8, t=34 if has_titles else 10, b=8))
+    t = top if top is not None else (34 if has_titles else 10)
+    fig.update_layout(margin=dict(l=8, r=8, t=t, b=8))
     h = int(fig.layout.height or 500)
     return fig.to_image(format="png", width=width, height=h, scale=scale)
 
@@ -216,6 +231,105 @@ def export_folder(folder: str, results: list[dict]) -> None:
         (dest / f"{stem}_heatmap.png").write_bytes(figure_to_png(heatmap_grid(results, code)))
         (dest / f"{stem}_charge_border.png").write_bytes(figure_to_png(border_grid(results, code)))
     print(f"[{folder}] saved {len(POLICIES) * 2} figures → {dest}")
+
+
+# ── Cost figures (re-rendered from saved exact-cost tables, tighter margins) ─────
+
+def _breakdown_from_rows(sub: pd.DataFrame) -> dict:
+    """{policy: {total, charging, penalty}} from summary-table rows (exact source)."""
+    return {
+        row["Policy"]: {
+            "total":    row["Mean cost (€)"],
+            "charging": row["Mean charging (€)"],
+            "penalty":  row["Mean penalty (€)"],
+        }
+        for _, row in sub.iterrows()
+    }
+
+
+def export_sweep_cost(folder: str) -> None:
+    """Re-render a sweep's cost-distribution figure from its summary.csv.
+
+    Feeds the saved exact breakdown straight into the production
+    ``fig_cost_distribution`` factory, so the figure is identical to before —
+    only the (tighter) export margins differ.
+    """
+    df = pd.read_csv(TABLES / "sensitivity_figures" / folder / "summary.csv")
+    labels = list(dict.fromkeys(df["Swept value"]))
+    results = [{"label": str(v), "exact_breakdown": _breakdown_from_rows(df[df["Swept value"] == v])}
+               for v in labels]
+    fig = fig_cost_distribution(results, source="exact")
+    dest = OUT / folder
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "cost.png").write_bytes(figure_to_png(fig, top=52))
+    print(f"[{folder}] saved cost.png → {dest}")
+
+
+def export_baseline_cost() -> None:
+    """Re-render the baseline-model per-policy cost bar from optimality_gap.csv."""
+    df = pd.read_csv(TABLES / "baseline_models" / "optimality_gap.csv")
+    result = {"exact_breakdown": _breakdown_from_rows(df)}
+    fig = fig_baseline_cost({}, source="exact", result=result)
+    dest = OUT / "baseline"
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "cost.png").write_bytes(figure_to_png(fig, top=52))
+    print(f"[baseline] saved cost.png → {dest}")
+
+
+def export_all_costs() -> None:
+    export_baseline_cost()
+    for folder in SWEEP_FOLDERS:
+        export_sweep_cost(folder)
+
+
+# ── Price-model mean profile (std error bands) ──────────────────────────────────
+
+def export_price_profile() -> None:
+    """One-off: mean hourly price profile of all four pricing models over one day,
+    with ±1 SEM as shaded error bands. Same look as the production price figure,
+    re-rendered with the new tight-margin export.
+    """
+    from ev_mdt.pricing.entsoe import load_prices
+    from ev_mdt.analysis.prices import (
+        fit_samplers, simulate_price_paths, PRICE_MODEL_COLORS,
+    )
+    from ev_mdt.plots.viz import rgba as _rgba
+
+    print("Loading price data…", flush=True)
+    df = load_prices()
+    print("Fitting samplers (Gaussian Bins, GMM, MDN)…", flush=True)
+    samplers = fit_samplers(df)
+    print("Simulating price paths…", flush=True)
+    results = simulate_price_paths(samplers)
+
+    hours = np.arange(24)
+    fig = go.Figure()
+    for name, prices in results.items():
+        col = PRICE_MODEL_COLORS.get(name, "#888888")
+        mu  = prices.mean(axis=0)
+        sem = prices.std(axis=0) / np.sqrt(prices.shape[0])
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([hours, hours[::-1]]),
+            y=np.concatenate([mu + sem, (mu - sem)[::-1]]),
+            fill="toself", fillcolor=_rgba(col, 0.12),
+            line=dict(width=0), showlegend=False, hoverinfo="skip",
+            legendgroup=name,
+        ))
+        fig.add_trace(go.Scatter(
+            x=hours, y=mu, mode="lines", line=dict(color=col, width=1.6),
+            name=name, legendgroup=name,
+            hovertemplate=f"<b>{name}</b><br>Hour %{{x:02d}}:00<br>%{{y:.4f}} €/kWh<extra></extra>",
+        ))
+    fig.update_layout(
+        template="plotly_white", plot_bgcolor="white", paper_bgcolor="white",
+        height=480, hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        xaxis=dict(title="Hour of day", dtick=2, range=[0, 23]),
+        yaxis=dict(title="Mean price (€/kWh)"),
+    )
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "price_profile.png").write_bytes(figure_to_png(fig, top=40))
+    print(f"[price_profile] saved → {OUT / 'price_profile.png'}")
 
 
 # ── Sweep panel builders ────────────────────────────────────────────────────────
@@ -298,19 +412,35 @@ def fit_pricing_samplers() -> dict:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--cost-only", action="store_true",
+                    help="Only re-render the cost figures from the saved tables "
+                         "(no backward-induction solves).")
+    ap.add_argument("--price-profile", action="store_true",
+                    help="Only render the price-model mean profile (std bands).")
+    args = ap.parse_args()
+
     OUT.mkdir(parents=True, exist_ok=True)
 
-    export_folder("baseline", baseline_results())
-    export_folder("penalty", penalty_results())
-    export_folder("horizon", horizon_results())
-    export_folder("departure_profile", departure_results())
-    export_folder("mobility_model", mobility_results())
+    if args.price_profile:
+        export_price_profile()
+        print(f"All figures → {OUT}")
+        return
 
-    samplers = fit_pricing_samplers()
-    for folder, results in pricing_results(samplers).items():
-        export_folder(folder, results)
+    if not args.cost_only:
+        export_folder("baseline", baseline_results())
+        export_folder("penalty", penalty_results())
+        export_folder("horizon", horizon_results())
+        export_folder("departure_profile", departure_results())
+        export_folder("mobility_model", mobility_results())
 
-    print(f"All policy-rule figures → {OUT}")
+        samplers = fit_pricing_samplers()
+        for folder, results in pricing_results(samplers).items():
+            export_folder(folder, results)
+
+    export_all_costs()
+
+    print(f"All figures → {OUT}")
 
 
 if __name__ == "__main__":

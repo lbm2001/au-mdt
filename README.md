@@ -21,6 +21,20 @@ export ENTSOE_API_KEY=your_key          # environment variable
 
 ## CLI
 
+Quick reference:
+
+| Command | Purpose |
+|---------|---------|
+| `baseline` | Baseline all-policy heatmaps, charge borders, exact cost bar (+ table) |
+| `sensitivity` | Per-sweep BI/DU/BLU heatmaps + charge borders + exact cost bars (+ tables) |
+| `calibrate-du` | Departure-Urgency `e_base` + `γ` calibration sweeps |
+| `trip-duration` | Trip-duration distribution figure |
+| `model-trajectories` | Mean sampled price + fraction-driving (swap price / mobility model) |
+| `price-models` | Mean/std diurnal price comparison across price models |
+| `fit-mdn` | Fit the MDN price sampler + two training-curve figures |
+| `run --all` | Run every command (full regeneration) |
+| `run --all-paper` | Fast paper figures only (no exact cost, calibration or training) |
+
 All commands are available as `python -m ev_mdt <command>` or `ev_mdt <command>` after install. Each writes its figures (and CSV tables, where applicable) under `<out-dir>/<timestamp>/<command>/`. Pass `--no-timestamp` to write straight into `<out-dir>/<command>/`. The default `--out-dir` is `export`.
 
 | Command | Output |

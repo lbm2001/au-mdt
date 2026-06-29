@@ -7,7 +7,8 @@ import pandas as pd
 
 _DEFAULT_START   = "2015-01-01"  # ENTSO-E DK1 day-ahead history starts here
 _DEFAULT_COUNTRY = "DK_1"        # West Denmark bidding zone (entsoe-py area code)
-# On-disk cache: <repo root>/entsoe-data/<country_code>.parquet
+# On-disk cache: <repo root>/entsoe-data/<country_code>_<startYear>-<endYear>.parquet
+# (the year span reflects the data actually stored, e.g. DK_1_2015-2026.parquet)
 _DEFAULT_CACHE_DIR = Path(__file__).resolve().parents[2] / "entsoe-data"
 
 
@@ -37,8 +38,9 @@ def load_prices(
     Caching
     -------
     If ``cache`` is True (default), the preprocessed DataFrame is stored as
-    ``<cache_dir>/<country_code>.parquet`` (``cache_dir`` defaults to
-    ``<repo root>/entsoe-data``).  On a subsequent call, if that file exists it
+    ``<cache_dir>/<country_code>_<startYear>-<endYear>.parquet`` — the year span
+    reflecting the data actually stored (``cache_dir`` defaults to
+    ``<repo root>/entsoe-data``).  On a subsequent call, any matching cache file
     is loaded directly and the API is not contacted at all — so no API key is
     required once the cache is populated.  Delete the file to force a refresh.
 
@@ -54,15 +56,17 @@ def load_prices(
     month           : month (1–12)
     season          : 'spring' | 'summer' | 'autumn' | 'winter'
     """
-    cache_path = Path(cache_dir or _DEFAULT_CACHE_DIR) / f"{country_code}.parquet"
-    if cache and cache_path.exists():
-        if _log is not None:
-            _log(f"Cache: loading {country_code} prices from {cache_path}…")
-        df = pd.read_parquet(cache_path)
-        if _log is not None:
-            y0, y1 = df["timestamp"].dt.year.min(), df["timestamp"].dt.year.max()
-            _log(f"Cache: loaded {len(df):,} samples ({y0}–{y1})")
-        return df
+    cache_root = Path(cache_dir or _DEFAULT_CACHE_DIR)
+    if cache:
+        existing = _find_cache(cache_root, country_code)
+        if existing is not None:
+            if _log is not None:
+                _log(f"Cache: loading {country_code} prices from {existing}…")
+            df = pd.read_parquet(existing)
+            if _log is not None:
+                y0, y1 = df["timestamp"].dt.year.min(), df["timestamp"].dt.year.max()
+                _log(f"Cache: loaded {len(df):,} samples ({y0}–{y1})")
+            return df
 
     key = _resolve_api_key(api_key)
     if not key:
@@ -87,12 +91,33 @@ def load_prices(
         _log(f"API: loaded {len(df):,} samples ({y0}–{y1})")
 
     if cache:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        cache_path = _dated_cache_path(cache_root, country_code, df)
         df.to_parquet(cache_path, index=False)
         if _log is not None:
             _log(f"Cache: saved {len(df):,} samples → {cache_path}")
 
     return df
+
+
+def _dated_cache_path(cache_dir: Path, country_code: str, df: pd.DataFrame) -> Path:
+    """``<cache_dir>/<country_code>_<startYear>-<endYear>.parquet`` for the data in ``df``."""
+    y0 = int(df["timestamp"].dt.year.min())
+    y1 = int(df["timestamp"].dt.year.max())
+    return cache_dir / f"{country_code}_{y0}-{y1}.parquet"
+
+
+def _find_cache(cache_dir: Path, country_code: str) -> Path | None:
+    """Return an existing on-disk price cache for the country, or None.
+
+    Matches the dated form ``<country_code>_<y0>-<y1>.parquet`` (widest end-year
+    wins) and the legacy un-dated ``<country_code>.parquet``.
+    """
+    dated = sorted(cache_dir.glob(f"{country_code}_*.parquet"))
+    if dated:
+        return dated[-1]
+    legacy = cache_dir / f"{country_code}.parquet"
+    return legacy if legacy.exists() else None
 
 
 def _resolve_api_key(explicit: str | None) -> str | None:

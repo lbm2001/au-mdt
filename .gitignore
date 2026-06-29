@@ -45,8 +45,6 @@ wandb/
 
 *figures*/
 
-# Cached ENTSO-E price data
-entsoe-data/
 
 # Exported figures and tables
 *export*/

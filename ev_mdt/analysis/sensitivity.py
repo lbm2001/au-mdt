@@ -1,32 +1,23 @@
-"""Sensitivity analysis sweep logic for the EV charging MDP.
+"""Sensitivity analysis and figure orchestration for the EV charging MDP.
 
-All computation lives here; no Streamlit dependency.  The app page and the CLI
-both call these functions and pass the returned results to ev_mdt.plots.sensitivity.
+All computation lives here; no Streamlit dependency. The CLI and the app page both
+call these functions and pass the returned figures to the renderer / disk.
+
+Costs are computed **analytically (exact)** by evaluating the solved policy with
+``ev_mdt.models.common.backward_induction.evaluate_policy`` — there is no
+Monte-Carlo cost estimation. Monte-Carlo *rollouts* are still used, but only to
+visualise mean price/mobility trajectories (``model_trajectory_figure``) and trip
+durations.
 
 Sweep functions
 ---------------
-Each sweep_* function returns a list of "step result" dicts, one per swept value.
-A step result is a plain dict and contains:
+Each ``sweep_*`` function returns a list of "panel" dicts, one per swept value.
+A panel is a solved-config dict containing:
 
-    model         str  — mobility model label (BASELINE_MODEL / NEGBIN_*)
-    label         str  — human-readable swept value (e.g. "1000 €/h")
-    params        params object
-    pbp_fn        callable t -> (K,) price bin probs
-    pi            ndarray (T, n_chi, N_e, K)
-    actions       ndarray
-    e_grid        ndarray
-    lam_grid      ndarray
-    T             int   — horizon in minutes
-    rollouts      dict  — {policy_name: [metrics_dict, ...]}
-    sample_rollout dict — single trajectory of the BI policy (first scenario)
-
-Standalone end-to-end usage
-----------------------------
-    from ev_mdt.analysis.sensitivity import run_all_sweeps, save_figures
-    results = run_all_sweeps(N_rollouts=200, N_e=200, seed=42)
-    save_figures(results, out_dir="figures/")
+    model, label, params, pbp_fn, pi, actions, e_grid, lam_grid, T
+    exact_breakdown  — {policy: {total, charging, penalty, energy_kwh, penalty_min}}
+                       (only when ``compute_exact=True``)
 """
-from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -49,11 +40,9 @@ from ev_mdt.models.common.model_utils import (
     minutes_to_departure as _minutes_to_departure,
 )
 from ev_mdt.models.common.policies import (
-    backward_induction_policy, policy_registry, du_gamma_for_params,
+    policy_registry, du_gamma_for_params,
     _du_e_daily, _e_daily_ref, E_CEIL_BASE,
 )
-from ev_mdt.models.common.rollout_utils import rollout_metrics, run_policies
-from ev_mdt.plots.viz import POLICY_ORDER
 
 
 # ── Sweep constants (single source of truth) ───────────────────────────────────
@@ -80,6 +69,13 @@ ALL_SWEEP_NAMES = [
     "mobility_model",
 ]
 
+# Mobility-model label → trajectory display name (matches plots.viz.MODEL_COLORS).
+_MODEL_DISPLAY = {
+    BASELINE_MODEL:       "Baseline",
+    NEGBIN_FIXED_MODEL:   "Negative Binomial (fixed k)",
+    NEGBIN_SAMPLED_MODEL: "Negative Binomial (Poisson k)",
+}
+
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
@@ -94,7 +90,7 @@ def build_params(model_label: str, **overrides):
 
 
 def rollout_fn(model_label: str):
-    """Return the model-specific simulate_policy_rollout."""
+    """Return the model-specific simulate_policy_rollout (used for trajectory figures)."""
     return _baseline_rollout if model_label == BASELINE_MODEL else _negbin_rollout
 
 
@@ -118,14 +114,15 @@ def _mean_initial(J_0, pbp_fn) -> float:
     return float(np.mean(J_0[0] @ np.asarray(pbp_fn(0))))
 
 
+# ── Exact (analytical) expected cost ───────────────────────────────────────────
+
 def bi_expected_cost(result: dict, beta: float = 1.0, breakdown: bool = False):
     """Exact expected cost of the optimal (Backward Induction) policy for a config.
 
     Evaluates the solved policy `pi` (from a solve()/sweep-step/baseline result dict)
     analytically and averages over the rollout initial-state distribution:
     χ₀=0, e₀ ~ Uniform[e_min,e_max] (battery grid), λ̂₀ ~ price marginal at t=0.
-    With beta=1 (default) this is the expected *undiscounted* total cost, directly
-    comparable to the Monte-Carlo "Mean cost".
+    With beta=1 (default) this is the expected *undiscounted* total cost.
 
     With ``breakdown=True`` returns ``{"total", "charging", "penalty"}`` instead of
     just the scalar total.
@@ -268,7 +265,7 @@ def compute_all_exact_costs(result: dict, beta: float = 1.0,
                             desc: str | None = None) -> dict[str, float]:
     """Exact expected cost for every policy in the registry for a solved configuration.
 
-    Returns {policy_name: cost} for all policies in POLICY_ORDER.
+    Returns {policy_name: cost} for all policies in the registry.
     The BI policy uses the fast vectorised index lookup; all others use
     scalar_policy_to_action_fn (one backward pass per policy).
 
@@ -304,8 +301,8 @@ def compute_all_exact_costs_breakdown(result: dict, beta: float = 1.0,
                                       desc: str | None = None) -> dict[str, dict]:
     """Like compute_all_exact_costs but returns the charging/penalty split.
 
-    Returns ``{policy_name: {"total", "charging", "penalty"}}`` for every policy in
-    POLICY_ORDER. Same backward-pass cost as compute_all_exact_costs (one extra
+    Returns ``{policy_name: {"total", "charging", "penalty", ...}}`` for every policy
+    in the registry. Same backward-pass cost as compute_all_exact_costs (one extra
     pair of accumulator arrays carried along the recursion).
     """
     params, pbp_fn = result["params"], result["pbp_fn"]
@@ -333,6 +330,8 @@ def compute_all_exact_costs_breakdown(result: dict, beta: float = 1.0,
     return out
 
 
+# ── Rollout scenarios (for trajectory / trip-duration figures only) ─────────────
+
 def make_scenario(params, seed: int, horizon: int,
                   sampler=None, season: str = "winter", is_weekend: bool = False) -> dict:
     """Generate one rollout scenario with separate sub-seeds for mobility and prices."""
@@ -357,107 +356,23 @@ def make_scenario(params, seed: int, horizon: int,
             "phase_draws": phase_draws, "e0": e0}
 
 
-def run_rollouts(pi, actions, e_grid, params, scenarios: list, _rollout_fn, pbp_fn,
-                 desc: str | None = None, **du_kwargs) -> dict:
-    """Run all policies on each scenario. Returns {policy_name: [metrics_dict, ...]}.
-
-    If ``desc`` is given, shows a per-rollout progress bar (x/N) under the sweep bars.
-    """
-    raw = run_rollouts_full(pi, actions, e_grid, params, scenarios, _rollout_fn, pbp_fn,
-                            desc=desc, **du_kwargs)
-    return {name: [rollout_metrics(r, params) for r in rolls] for name, rolls in raw.items()}
-
-
-def run_rollouts_full(pi, actions, e_grid, params, scenarios, _rollout_fn, pbp_fn,
-                      desc: str | None = None, **du_kwargs) -> dict:
-    """Like run_rollouts but keeps each raw rollout dict (u_traj/chi_traj/cost_traj)."""
-    registry = policy_registry(params, pbp_fn, pi=pi, actions=actions, e_grid=e_grid,
-                               **du_kwargs)
-    e0s = [float(sc["e0"]) for sc in scenarios]
-    bar = progress = None
-    if desc is not None:
-        from tqdm import tqdm
-        bar = tqdm(total=len(scenarios), desc=desc, unit="rollout", position=2, leave=False)
-        progress = lambda: bar.update(1)
-    out = run_policies(registry, scenarios, e0s, 0, params, _rollout_fn, progress=progress)
-    if bar is not None:
-        bar.close()
-    return out
-
-
-def rollout_stats_table(rollouts_by_policy: dict, params):
-    """Per-policy summary DataFrame (indexed by policy) from raw rollout dicts.
-
-    The Policy-Rollout page's stats table; columns match build_summary_df's metrics.
-    """
-    import pandas as pd
-    from ev_mdt.plots.sensitivity import _cost_summary
-    rows = {policy: _cost_summary([rollout_metrics(r, params) for r in rolls])
-            for policy, rolls in rollouts_by_policy.items()}
-    return pd.DataFrame(rows).T
-
+# ── Sweep step (solve + exact cost) ────────────────────────────────────────────
 
 def _run_sweep_step(model_label: str, label: str, params, pbp_fn,
-                    T: int, N_e: int, N_rollouts: int, seed: int,
-                    sampler=None, season: str = "winter", is_weekend: bool = False,
-                    skip_rollouts: bool = False,
-                    _log: Callable | None = None, **du_kwargs) -> dict:
-    """Solve + run rollouts for one sweep configuration.
-
-    ``skip_rollouts=True`` skips scenario generation and rollout simulation entirely;
-    ``rollouts`` and ``sample_rollout`` are set to empty stubs so callers that key-check
-    these fields don't crash, but any figure/table that actually reads rollout data will
-    be skipped by the caller (see save_figures / save_tables ``cost_source`` logic).
-    """
-    if _log: _log(f"  [{label}] solving (T={T//60}h, N_e={N_e})…")
+                    T: int, N_e: int, *, compute_exact: bool = True,
+                    _log: Callable | None = None) -> dict:
+    """Solve one sweep configuration; optionally compute the exact per-policy cost."""
+    if _log: _log(f"  [{label}] solving (T={T // 60}h, N_e={N_e})…")
     pi, actions, e_grid, lam_grid = solve(model_label, params, pbp_fn, T, N_e)
-    if skip_rollouts:
-        rollouts = {}
-        sample_rollout = None
-    else:
-        if _log: _log(f"  [{label}] running {N_rollouts} rollouts…")
-        scenarios = [
-            make_scenario(params, seed + i, T, sampler=sampler, season=season, is_weekend=is_weekend)
-            for i in range(N_rollouts)
-        ]
-        _rf = rollout_fn(model_label)
-        rollouts = run_rollouts(pi, actions, e_grid, params, scenarios, _rf, pbp_fn,
-                                desc=f"    [{label}] rollouts", **du_kwargs)
-        sample_rollout = _rf(
-            backward_induction_policy, scenarios[0], float(scenarios[0]["e0"]), 0, params,
-            pi=pi, actions=actions, e_grid=e_grid,
-        )
     result = {
-        "model":          model_label,
-        "label":          label,
-        "params":         params,
-        "pbp_fn":         pbp_fn,
-        "pi":             pi,
-        "actions":        actions,
-        "e_grid":         e_grid,
-        "lam_grid":       lam_grid,
-        "T":              T,
-        "rollouts":       rollouts,
-        "sample_rollout": sample_rollout,
+        "model":    model_label, "label": label, "params": params, "pbp_fn": pbp_fn,
+        "pi":       pi, "actions": actions, "e_grid": e_grid, "lam_grid": lam_grid, "T": T,
     }
-    if skip_rollouts:
+    if compute_exact:
         if _log: _log(f"  [{label}] computing exact costs…")
         result["exact_breakdown"] = compute_all_exact_costs_breakdown(
             result, desc=f"    [{label}] exact costs")
     return result
-
-
-def _gbins_step(label: str, sampler, season: str, is_weekend: bool,
-                N_rollouts: int, N_e: int, seed: int, _log=None,
-                skip_rollouts: bool = False, **du_kwargs) -> dict:
-    params = build_params(BASELINE_MODEL)
-    pbp_fn = _make_gbins_pbp(sampler, params, season, is_weekend)
-    return _run_sweep_step(
-        BASELINE_MODEL, label, params, pbp_fn, T=24 * 60, N_e=N_e,
-        N_rollouts=N_rollouts, seed=seed,
-        sampler=sampler, season=season, is_weekend=is_weekend,
-        skip_rollouts=skip_rollouts, _log=_log, **du_kwargs,
-    )
 
 
 def _make_gbins_pbp(sampler, params, season, is_weekend):
@@ -465,38 +380,45 @@ def _make_gbins_pbp(sampler, params, season, is_weekend):
     return make_price_bin_probs_fn(sampler, params, season, is_weekend)
 
 
+def _gbins_step(label: str, sampler, season: str, is_weekend: bool, N_e: int, *,
+                compute_exact: bool = True, _log=None) -> dict:
+    params = build_params(BASELINE_MODEL)
+    pbp_fn = _make_gbins_pbp(sampler, params, season, is_weekend)
+    return _run_sweep_step(BASELINE_MODEL, label, params, pbp_fn, T=24 * 60, N_e=N_e,
+                           compute_exact=compute_exact, _log=_log)
+
+
 # ── Public sweep functions ─────────────────────────────────────────────────────
 
-def sweep_pricing_season(sampler, N_rollouts: int, N_e: int, seed: int,
-                          progress_cb: Callable | None = None,
-                          _log: Callable | None = None, **du_kwargs) -> list[dict]:
+def sweep_pricing_season(sampler, N_e: int, progress_cb: Callable | None = None,
+                          _log: Callable | None = None, *, compute_exact: bool = True) -> list[dict]:
     """Gaussian Bins (crisis-excluded): vary season, held at weekday."""
     seasons = ["winter", "spring", "summer", "autumn"]
     results = []
     for i, s in enumerate(seasons):
         if progress_cb: progress_cb(i / len(seasons), f"Solving {s}…")
-        results.append(_gbins_step(s.capitalize(), sampler, s, False, N_rollouts, N_e, seed, _log, **du_kwargs))
+        results.append(_gbins_step(s.capitalize(), sampler, s, False, N_e,
+                                   compute_exact=compute_exact, _log=_log))
     if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
-def sweep_pricing_daytype(sampler, N_rollouts: int, N_e: int, seed: int,
-                           progress_cb: Callable | None = None,
-                           _log: Callable | None = None, **du_kwargs) -> list[dict]:
+def sweep_pricing_daytype(sampler, N_e: int, progress_cb: Callable | None = None,
+                           _log: Callable | None = None, *, compute_exact: bool = True) -> list[dict]:
     """Gaussian Bins (crisis-excluded): vary weekday/weekend, held at spring."""
     combos = [("Weekday", False), ("Weekend", True)]
     results = []
     for i, (label, we) in enumerate(combos):
         if progress_cb: progress_cb(i / len(combos), f"Solving {label}…")
-        results.append(_gbins_step(label, sampler, "spring", we, N_rollouts, N_e, seed, _log, **du_kwargs))
+        results.append(_gbins_step(label, sampler, "spring", we, N_e,
+                                   compute_exact=compute_exact, _log=_log))
     if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
-def sweep_pricing_crisis(sampler_excl, sampler_incl, sampler_crisis,
-                          N_rollouts: int, N_e: int, seed: int,
+def sweep_pricing_crisis(sampler_excl, sampler_incl, sampler_crisis, N_e: int,
                           progress_cb: Callable | None = None,
-                          _log: Callable | None = None, **du_kwargs) -> list[dict]:
+                          _log: Callable | None = None, *, compute_exact: bool = True) -> list[dict]:
     """Gaussian Bins: vary crisis inclusion, held at spring + weekday."""
     items = [("Excluding crisis", sampler_excl),
              ("Including crisis", sampler_incl),
@@ -504,27 +426,27 @@ def sweep_pricing_crisis(sampler_excl, sampler_incl, sampler_crisis,
     results = []
     for i, (label, sampler) in enumerate(items):
         if progress_cb: progress_cb(i / len(items), f"Solving {label}…")
-        results.append(_gbins_step(label, sampler, "spring", False, N_rollouts, N_e, seed, _log, **du_kwargs))
+        results.append(_gbins_step(label, sampler, "spring", False, N_e,
+                                   compute_exact=compute_exact, _log=_log))
     if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
-def sweep_pricing_model(samplers: dict, N_rollouts: int, N_e: int, seed: int,
-                         progress_cb: Callable | None = None,
-                         _log: Callable | None = None, **du_kwargs) -> list[dict]:
+def sweep_pricing_model(samplers: dict, N_e: int, progress_cb: Callable | None = None,
+                         _log: Callable | None = None, *, compute_exact: bool = True) -> list[dict]:
     """Vary the price model (Gaussian Bins / GMM / MDN), held at spring · weekday · crisis-excluded."""
     items = list(samplers.items())
     results = []
     for i, (label, sampler) in enumerate(items):
         if progress_cb: progress_cb(i / len(items), f"Solving {label}…")
-        results.append(_gbins_step(label, sampler, "spring", False, N_rollouts, N_e, seed, _log, **du_kwargs))
+        results.append(_gbins_step(label, sampler, "spring", False, N_e,
+                                   compute_exact=compute_exact, _log=_log))
     if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
-def sweep_penalty(model_label: str, N_rollouts: int, N_e: int, seed: int,
-                   progress_cb: Callable | None = None,
-                   _log: Callable | None = None, **du_kwargs) -> list[dict]:
+def sweep_penalty(model_label: str, N_e: int, progress_cb: Callable | None = None,
+                   _log: Callable | None = None, *, compute_exact: bool = True) -> list[dict]:
     """Sweep φ ∈ PHI_VALUES. Uses Gaussian parametric pricing."""
     results = []
     for i, phi in enumerate(PHI_VALUES):
@@ -533,15 +455,14 @@ def sweep_penalty(model_label: str, N_rollouts: int, N_e: int, seed: int,
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         results.append(_run_sweep_step(
             model_label, f"{phi} €/h", params, pbp_fn, T=24 * 60, N_e=N_e,
-            N_rollouts=N_rollouts, seed=seed, _log=_log, **du_kwargs,
+            compute_exact=compute_exact, _log=_log,
         ))
     if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
-def sweep_horizon(model_label: str, N_rollouts: int, N_e: int, seed: int,
-                   progress_cb: Callable | None = None,
-                   _log: Callable | None = None, **du_kwargs) -> list[dict]:
+def sweep_horizon(model_label: str, N_e: int, progress_cb: Callable | None = None,
+                   _log: Callable | None = None, *, compute_exact: bool = True) -> list[dict]:
     """Compare T ∈ {24h, 48h, 168h}. Uses Gaussian parametric pricing."""
     results = []
     for i, T_h in enumerate(HORIZON_HOURS):
@@ -551,15 +472,14 @@ def sweep_horizon(model_label: str, N_rollouts: int, N_e: int, seed: int,
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         results.append(_run_sweep_step(
             model_label, f"{T_h} h", params, pbp_fn, T=T, N_e=N_e,
-            N_rollouts=N_rollouts, seed=seed, _log=_log, **du_kwargs,
+            compute_exact=compute_exact, _log=_log,
         ))
     if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
-def sweep_departure_profiles(model_label: str, N_rollouts: int, N_e: int, seed: int,
-                               progress_cb: Callable | None = None,
-                               _log: Callable | None = None, **du_kwargs) -> list[dict]:
+def sweep_departure_profiles(model_label: str, N_e: int, progress_cb: Callable | None = None,
+                               _log: Callable | None = None, *, compute_exact: bool = True) -> list[dict]:
     """Compare departure profiles (p_PD_* overrides) over a 24 h horizon."""
     results = []
     profiles = list(DEPARTURE_PROFILES.items())
@@ -569,15 +489,14 @@ def sweep_departure_profiles(model_label: str, N_rollouts: int, N_e: int, seed: 
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         results.append(_run_sweep_step(
             model_label, label, params, pbp_fn, T=24 * 60, N_e=N_e,
-            N_rollouts=N_rollouts, seed=seed, _log=_log, **du_kwargs,
+            compute_exact=compute_exact, _log=_log,
         ))
     if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
-def sweep_mobility_models(N_rollouts: int, N_e: int, seed: int,
-                           progress_cb: Callable | None = None,
-                           _log: Callable | None = None, **du_kwargs) -> list[dict]:
+def sweep_mobility_models(N_e: int, progress_cb: Callable | None = None,
+                           _log: Callable | None = None, *, compute_exact: bool = True) -> list[dict]:
     """Compare NegBin mobility models: {fixed-k, Poisson-k} × {k=5, k=10} (4 configs)."""
     configs = [
         (NEGBIN_FIXED_MODEL,   "NegBin fixed k=5",    NegBinParams(k=5)),
@@ -591,179 +510,23 @@ def sweep_mobility_models(N_rollouts: int, N_e: int, seed: int,
         pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
         results.append(_run_sweep_step(
             model, label, params, pbp_fn, T=24 * 60, N_e=N_e,
-            N_rollouts=N_rollouts, seed=seed, _log=_log, **du_kwargs,
+            compute_exact=compute_exact, _log=_log,
         ))
     if progress_cb: progress_cb(1.0, "Done.")
     return results
 
 
-def sweep_target_ceiling(
-    model_label: str = BASELINE_MODEL,
-    N_rollouts: int = 500,
-    seed: int = 42,
-    step_kwh: float = 5.0,
-    progress_cb: Callable | None = None,
-    _log: Callable | None = None,
-) -> list[dict]:
-    """Sweep the Departure Urgency target ceiling from e_min+step to e_max.
-
-    Returns a list of dicts with keys:
-        target_kwh, target_frac, mean_cost, std_cost, mean_penalty, mean_charged, reserve_frac
-    """
-    from ev_mdt.models.common.policies import next_trip_policy
-    from ev_mdt.models.common.rollout_utils import generate_rollout_scenario, rollout_metrics
-
-    params    = build_params(model_label)
-    pbp_fn    = lambda t, p=params: _gaussian_pbp(t, p)
-    _rf       = rollout_fn(model_label)
-    T         = 24 * 60
-
-    ceil_values = np.arange(params.e_min + step_kwh, params.e_max + 1e-6, step_kwh)
-    ceil_values = ceil_values[ceil_values <= params.e_max]
-
-    rng       = np.random.default_rng(seed)
-    scenarios = [
-        generate_rollout_scenario(params, int(rng.integers(0, 1_000_000)), horizon=T)
-        for _ in range(N_rollouts)
-    ]
-    e0s = [float(rng.uniform(params.e_min, params.e_max)) for _ in range(N_rollouts)]
-
-    from tqdm import tqdm
-
-    outer = tqdm(list(ceil_values), desc="Target ceiling", unit="step", position=0)
-    rows  = []
-    for ceil_kwh in outer:
-        outer.set_postfix(ceiling=f"{ceil_kwh:.0f} kWh")
-        costs, penalties, charged, charge_costs, penalty_costs = [], [], [], [], []
-
-        inner = tqdm(list(zip(scenarios, e0s)), desc="  rollouts", unit="rollout",
-                     position=1, leave=False)
-        for sc, e0 in inner:
-            result = _rf(
-                next_trip_policy, sc, float(e0), 0, params,
-                price_bin_probs_fn=pbp_fn,
-                _ceil_override=float(ceil_kwh),
-            )
-            m = rollout_metrics(result, params)
-            costs.append(m["Total cost (€)"])
-            penalties.append(m["Penalty minutes"])
-            charged.append(m["Energy charged (kWh)"])
-            charge_costs.append(m["Charging cost (€)"])
-            penalty_costs.append(m["Penalty cost (€)"])
-        inner.close()
-
-        rows.append({
-            "target_kwh":        float(ceil_kwh),
-            "target_frac":       float(ceil_kwh) / params.e_max,
-            "mean_cost":         float(np.mean(costs)),
-            "std_cost":          float(np.std(costs)),
-            "mean_penalty":      float(np.mean(penalties)),
-            "mean_charged":      float(np.mean(charged)),
-            "mean_charge_cost":  float(np.mean(charge_costs)),
-            "mean_penalty_cost": float(np.mean(penalty_costs)),
-        })
-        i = len(rows)
-        if progress_cb: progress_cb(i / len(ceil_values), f"ceiling {ceil_kwh:.0f} kWh")
-
-    outer.close()
-    return rows
+def baseline_optimal_result(model_label: str = BASELINE_MODEL, N_e: int = 500) -> dict:
+    """Solve one canonical baseline model (Gaussian parametric pricing) for export/display."""
+    T = 24 * 60
+    params = build_params(model_label)
+    pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
+    pi, actions, e_grid, lam_grid = solve(model_label, params, pbp_fn, T, N_e)
+    return {"model": model_label, "label": model_label, "params": params, "pbp_fn": pbp_fn,
+            "pi": pi, "actions": actions, "e_grid": e_grid, "lam_grid": lam_grid, "T": T}
 
 
-def sweep_gamma(
-    N_rollouts: int = 500,
-    seed: int = 42,
-    use_reserve: bool = True,
-    gamma_values: list | None = None,
-    progress_cb: Callable | None = None,
-    _log: Callable | None = None,
-) -> dict[str, list[dict]]:
-    """Sweep γ ∈ gamma_values for each of the three mobility models.
-
-    For each (model, γ) the policy computes:
-        e_ceil = min(e_max, E_CEIL_BASE × (e_daily / e_daily_ref) ^ γ)
-    where E_CEIL_BASE = 25.0 kWh (from target-sweep at Baseline) and e_daily_ref
-    is the Baseline daily energy demand.
-
-    Returns {model_name: [row_dict, ...]} with keys:
-        gamma, target_kwh, mean_cost, std_cost,
-        mean_charge_cost, mean_penalty_cost, mean_penalty, mean_charged
-    """
-    from tqdm import tqdm
-    from ev_mdt.models.common.policies import next_trip_policy, _du_e_daily, E_CEIL_BASE, _e_daily_ref
-    from ev_mdt.models.common.rollout_utils import rollout_metrics, generate_rollout_scenario
-
-    if gamma_values is None:
-        gamma_values = [round(g, 2) for g in np.arange(0.1, 1.01, 0.1)]
-
-    e_daily_ref = _e_daily_ref()
-
-    model_configs = [
-        (BASELINE_MODEL,       "Baseline",            build_params(BASELINE_MODEL)),
-        (NEGBIN_FIXED_MODEL,   "NegBin fixed k=5",    NegBinParams(k=5)),
-        (NEGBIN_SAMPLED_MODEL, "NegBin Poisson k=5",  NegBinParams(lambda_k=5.0,
-                                                       k=NegBinParams.k_max_for_lambda(5.0))),
-    ]
-
-    total_steps = len(model_configs) * len(gamma_values)
-    step_i = 0
-    results: dict[str, list[dict]] = {}
-
-    outer = tqdm(model_configs, desc="Models", unit="model", position=0)
-    for model_label, model_name, params in outer:
-        outer.set_postfix(model=model_name)
-        _rf    = rollout_fn(model_label)
-        pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
-
-        # Pre-generate scenarios once per model
-        rng       = np.random.default_rng(seed)
-        scenarios = [
-            generate_rollout_scenario(params, int(rng.integers(0, 1_000_000)), horizon=24*60)
-            for _ in range(N_rollouts)
-        ]
-        e0s = [float(rng.uniform(params.e_min, params.e_max)) for _ in range(N_rollouts)]
-
-        e_daily = _du_e_daily(params)
-        ratio   = e_daily / e_daily_ref if e_daily_ref > 0 else 1.0
-
-        rows: list[dict] = []
-        inner = tqdm(gamma_values, desc=f"  γ sweep ({model_name})", unit="γ",
-                     position=1, leave=False)
-        for gamma in inner:
-            target_kwh = min(params.e_max, E_CEIL_BASE * ratio ** gamma)
-
-            costs, charge_costs, penalty_costs, penalties, charged = [], [], [], [], []
-            for sc, e0 in zip(scenarios, e0s):
-                result = _rf(
-                    next_trip_policy, sc, float(e0), 0, params,
-                    price_bin_probs_fn=pbp_fn,
-                    gamma=gamma,
-                    use_reserve=use_reserve,
-                )
-                m = rollout_metrics(result, params)
-                costs.append(m["Total cost (€)"])
-                charge_costs.append(m["Charging cost (€)"])
-                penalty_costs.append(m["Penalty cost (€)"])
-                penalties.append(m["Penalty minutes"])
-                charged.append(m["Energy charged (kWh)"])
-
-            rows.append({
-                "gamma":             gamma,
-                "target_kwh":        target_kwh,
-                "mean_cost":         float(np.mean(costs)),
-                "std_cost":          float(np.std(costs)),
-                "mean_charge_cost":  float(np.mean(charge_costs)),
-                "mean_penalty_cost": float(np.mean(penalty_costs)),
-                "mean_penalty":      float(np.mean(penalties)),
-                "mean_charged":      float(np.mean(charged)),
-            })
-            step_i += 1
-            if progress_cb:
-                progress_cb(step_i / total_steps, f"{model_name} γ={gamma:.1f}")
-        inner.close()
-        results[model_name] = rows
-    outer.close()
-    return results
-
+# ── Departure-Urgency calibration sweeps (exact) ───────────────────────────────
 
 def sweep_target_ceiling_exact(
     model_label: str = BASELINE_MODEL,
@@ -773,18 +536,16 @@ def sweep_target_ceiling_exact(
     progress_cb: Callable | None = None,
     _log: Callable | None = None,
 ) -> list[dict]:
-    """Exact version of sweep_target_ceiling: one backward-pass evaluation per ceiling value.
+    """Exact sweep of the Departure Urgency target ceiling (e_base) from e_min+step to e_max.
 
-    Returns the same row structure as sweep_target_ceiling but with exact expected
-    values (no std_cost) and an additional mean_penalty_min column.
+    One backward-pass evaluation per ceiling value. Returns a list of dicts with keys:
+        target_kwh, target_frac, mean_cost, mean_charge_cost, mean_penalty_cost,
+        mean_penalty_min, mean_charged
     """
     from tqdm import tqdm
-    from ev_mdt.models.common.policies import next_trip_policy, E_CEIL_BASE
+    from ev_mdt.models.common.policies import next_trip_policy
 
     params = build_params(model_label)
-    pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
-    T = 24 * 60
-
     if _log: _log(f"Solving {model_label} (N_e={N_e})…")
     result = baseline_optimal_result(model_label, N_e)
 
@@ -820,12 +581,12 @@ def sweep_gamma_exact(
     progress_cb: Callable | None = None,
     _log: Callable | None = None,
 ) -> dict[str, list[dict]]:
-    """Exact version of sweep_gamma: one backward-pass evaluation per (model, γ).
+    """Exact sweep of the ceiling scaling exponent γ across three mobility models.
 
     Returns {model_name: [row_dict, ...]} with exact expected values (no std_cost).
     """
     from tqdm import tqdm
-    from ev_mdt.models.common.policies import next_trip_policy, _du_e_daily, E_CEIL_BASE, _e_daily_ref
+    from ev_mdt.models.common.policies import next_trip_policy
 
     if gamma_values is None:
         gamma_values = [round(g, 2) for g in np.arange(0.1, 1.01, 0.1)]
@@ -877,32 +638,7 @@ def sweep_gamma_exact(
     return results
 
 
-def baseline_optimal_result(model_label: str = BASELINE_MODEL, N_e: int = 500) -> dict:
-    """Solve one canonical baseline model (Gaussian parametric pricing) for export/display."""
-    T = 24 * 60
-    params = build_params(model_label)
-    pbp_fn = lambda t, p=params: _gaussian_pbp(t, p)
-    pi, actions, e_grid, lam_grid = solve(model_label, params, pbp_fn, T, N_e)
-    return {"model": model_label, "label": model_label, "params": params, "pbp_fn": pbp_fn,
-            "pi": pi, "actions": actions, "e_grid": e_grid, "lam_grid": lam_grid, "T": T}
-
-
-def baseline_model_figures(result: dict, N_rollouts: int, seed: int) -> dict:
-    """The three per-model figures: cost bar, optimal-policy heatmap, mean trajectory."""
-    from ev_mdt.plots.sensitivity import fig_heatmap_grid, fig_baseline_cost, fig_baseline_trajectories
-    model, params, T, pbp_fn = result["model"], result["params"], result["T"], result["pbp_fn"]
-    scenarios = [make_scenario(params, seed + i, T) for i in range(N_rollouts)]
-    _rf = rollout_fn(model)
-    full = run_rollouts_full(result["pi"], result["actions"], result["e_grid"],
-                              params, scenarios, _rf, pbp_fn)
-    return {
-        "baseline_cost":           fig_baseline_cost(full),
-        "baseline_optimal_policy": fig_heatmap_grid([result], show_titles=False),
-        "baseline_trajectories":   fig_baseline_trajectories(full, scenarios, T, params),
-    }
-
-
-# ── End-to-end orchestration (for CLI / scripts) ───────────────────────────────
+# ── Price-sampler fitting ──────────────────────────────────────────────────────
 
 def load_fitted_samplers(exclude_crisis: bool = True) -> dict:
     """Load ENTSO-E data and fit Gaussian-bins, GMM, and MDN samplers.
@@ -923,26 +659,24 @@ def load_fitted_samplers(exclude_crisis: bool = True) -> dict:
     return samplers
 
 
+# ── Multi-sweep orchestration ──────────────────────────────────────────────────
+
 def run_all_sweeps(
-    N_rollouts: int = 500,
     N_e: int = 500,
-    seed: int = 42,
     sweeps: list[str] | None = None,
     progress_cb: Callable | None = None,
     _log: Callable | None = None,
-    _wandb_run=None,
-    skip_rollouts: bool = False,
+    *,
+    compute_exact: bool = True,
 ) -> dict[str, list[dict]]:
-    """Run selected (or all) sweeps and return a mapping sweep_name -> results list.
+    """Run selected (or all) sweeps and return a mapping sweep_name -> panel list.
 
     Parameters
     ----------
-    sweeps : list of sweep names to run (see ALL_SWEEP_NAMES); None runs all.
-    progress_cb : optional callable(fraction: float, message: str) for top-level progress.
-
-    Returns
-    -------
-    dict mapping each requested sweep name to its result list.
+    sweeps        : list of sweep names to run (see ALL_SWEEP_NAMES); None runs all.
+    progress_cb   : optional callable(fraction: float, message: str) for top-level progress.
+    compute_exact : compute the exact per-policy cost breakdown for each panel
+                    (needed for the cost figures; closed-form heatmaps/borders do not need it).
     """
     from ev_mdt.pricing.entsoe import load_prices
     from ev_mdt.pricing.samplers import GaussianBinnedSampler
@@ -953,12 +687,7 @@ def run_all_sweeps(
     needs_pricing = any(s.startswith("pricing") for s in sweeps)
 
     def _fit_progress(label: str) -> Callable | None:
-        """Route a sampler's _progress(fraction, msg) into the live heartbeat line.
-
-        Updates in place (no new line per epoch/bin); only active when a
-        progress_cb is present, since the coarse _log markers already cover the
-        no-callback case.
-        """
+        """Route a sampler's _progress(fraction, msg) into the live heartbeat line."""
         if progress_cb is None:
             return None
         return lambda _frac, msg: progress_cb(0.0, f"{label}: {msg}")
@@ -996,28 +725,27 @@ def run_all_sweeps(
             if _log: _log("Fitting GMM sampler…")
             sampler_gmm = GMMSampler().fit(df_excl, _progress=_fit_progress("GMM"))
             if _log: _log("Fitting MDN sampler (neural net — this can take a while)…")
-            sampler_mdn = MDNSampler().fit(df_excl, _progress=_fit_progress("MDN"),
-                                           _wandb_run=_wandb_run)
+            sampler_mdn = MDNSampler().fit(df_excl, _progress=_fit_progress("MDN"))
             samplers = {
                 "Gaussian Bins": sampler_excl,
                 "GMM":           sampler_gmm,
                 "MDN":           sampler_mdn,
             }
-            all_results[sweep] = sweep_pricing_model(samplers, N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
+            all_results[sweep] = sweep_pricing_model(samplers, N_e, cb, _log, compute_exact=compute_exact)
         elif sweep == "pricing_season":
-            all_results[sweep] = sweep_pricing_season(sampler_excl, N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
+            all_results[sweep] = sweep_pricing_season(sampler_excl, N_e, cb, _log, compute_exact=compute_exact)
         elif sweep == "pricing_daytype":
-            all_results[sweep] = sweep_pricing_daytype(sampler_excl, N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
+            all_results[sweep] = sweep_pricing_daytype(sampler_excl, N_e, cb, _log, compute_exact=compute_exact)
         elif sweep == "pricing_crisis":
-            all_results[sweep] = sweep_pricing_crisis(sampler_excl, sampler_incl, sampler_crisis, N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
+            all_results[sweep] = sweep_pricing_crisis(sampler_excl, sampler_incl, sampler_crisis, N_e, cb, _log, compute_exact=compute_exact)
         elif sweep == "penalty":
-            all_results[sweep] = sweep_penalty(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
+            all_results[sweep] = sweep_penalty(BASELINE_MODEL, N_e, cb, _log, compute_exact=compute_exact)
         elif sweep == "horizon":
-            all_results[sweep] = sweep_horizon(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
+            all_results[sweep] = sweep_horizon(BASELINE_MODEL, N_e, cb, _log, compute_exact=compute_exact)
         elif sweep == "departure_profile":
-            all_results[sweep] = sweep_departure_profiles(BASELINE_MODEL, N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
+            all_results[sweep] = sweep_departure_profiles(BASELINE_MODEL, N_e, cb, _log, compute_exact=compute_exact)
         elif sweep == "mobility_model":
-            all_results[sweep] = sweep_mobility_models(N_rollouts, N_e, seed, cb, _log, skip_rollouts=skip_rollouts)
+            all_results[sweep] = sweep_mobility_models(N_e, cb, _log, compute_exact=compute_exact)
         else:
             raise ValueError(f"Unknown sweep: {sweep!r}. Valid: {ALL_SWEEP_NAMES}")
 
@@ -1026,303 +754,162 @@ def run_all_sweeps(
     return all_results
 
 
-_SWEEP_FOLDER = {
-    "pricing_model":     "pricing_model",
-    "pricing_season":    "pricing_season",
-    "pricing_daytype":   "pricing_daytype",
-    "pricing_crisis":    "pricing_crisis",
-    "penalty":           "penalty",
-    "horizon":           "horizon",
-    "departure_profile": "departure_profile",
-    "mobility_model":    "mobility_model",
-}
-
-# Heatmap-grid columns per sweep (single source of truth; app + CLI + figure export).
-HEATMAP_NCOLS = {
-    "penalty": 3,
-    "pricing_season": 2,
-    "mobility_model": 2,
-    "pricing_crisis": 3,
-}
+# Output sub-folder per sweep (single source of truth; CLI + app figure export).
+_SWEEP_FOLDER = {name: name for name in ALL_SWEEP_NAMES}
 
 
-def save_figures(
-    all_results: dict[str, list[dict]],
-    out_dir: str | Path = "figures/",
-    N_rollouts: int = 200,
-    seed: int = 42,
-    N_e: int = 500,
-    include_baseline: bool = True,
-    cost_source: str = "rollout",
-    skip_rollouts: bool = False,
-) -> list[Path]:
-    """Render all sensitivity figures to PNG and save them under out_dir.
+# ── Figure orchestrators (consumed by the CLI and the app) ─────────────────────
 
-    Also saves the three canonical baseline-model figures if include_baseline=True.
+def baseline_figures(N_e: int = 500, *, compute_cost: bool = True,
+                     model_label: str = BASELINE_MODEL, _log: Callable | None = None):
+    """All-policy baseline figures for one model: (result, {name: Figure}).
 
-    ``cost_source`` selects the cost figures' data: ``"rollout"`` (Monte-Carlo means
-    ±SEM, default) or ``"exact"`` (analytical expected costs, no whiskers).
-
-    ``skip_rollouts=True`` skips all figures that require rollout data (trajectory
-    plots, rollout-based cost bars). Use together with ``cost_source="exact"``.
-
-    Returns a list of paths of all saved files.
+    Figures: ``policy_heatmaps`` and ``charge_borders`` (all policies in one figure
+    each), plus ``cost`` (exact expected-cost bar) when ``compute_cost``.
     """
     from ev_mdt.plots.sensitivity import (
-        fig_heatmap_grid, fig_charge_boundary_grid, fig_cost_distribution, figure_to_png,
-        fig_baseline_cost, fig_baseline_trajectories, fig_rollout_trajectories,
-        fig_benchmark_heatmap_grid, fig_baseline_policy_heatmaps,
-        fig_heatmap_grid_du, fig_charge_boundary_grid_du,
+        fig_all_policy_heatmaps, fig_all_policy_charge_borders, fig_baseline_cost,
     )
-    from ev_mdt.plots.trip_duration import compute_trip_durations, trip_duration_figure
-
-    out_dir = Path(out_dir)
-    saved: list[Path] = []
-
-    for sweep_name, results in all_results.items():
-        folder = _SWEEP_FOLDER.get(sweep_name, sweep_name)
-        dest = out_dir / "sensitivity_figures" / folder
-        dest.mkdir(parents=True, exist_ok=True)
-
-        ncols = HEATMAP_NCOLS.get(sweep_name, 1)
-        figs = {
-            "policy_heatmaps":           fig_heatmap_grid(results, ncols=ncols),
-            "policy_heatmaps_du":        fig_heatmap_grid_du(results, ncols=ncols),
-            "benchmark_policy_heatmaps": fig_benchmark_heatmap_grid(results),
-            "charge_border":             fig_charge_boundary_grid(results),
-            "charge_border_du":          fig_charge_boundary_grid_du(results),
-            "cost":                      fig_cost_distribution(results, source=cost_source),
-        }
-        for name, fig in figs.items():
-            if skip_rollouts and name == "cost" and cost_source == "rollout":
-                continue  # no rollout data available
-            p = dest / f"{name}.png"
-            p.write_bytes(figure_to_png(fig))
-            saved.append(p)
-
-    if include_baseline:
-        bm_dir = out_dir / "baseline_models"
-        bm_dir.mkdir(parents=True, exist_ok=True)
-        prefixes = {
-            BASELINE_MODEL:       "baseline",
-            NEGBIN_FIXED_MODEL:   "negbin",
-            NEGBIN_SAMPLED_MODEL: "negbin_poisson",
-        }
-        # NegBin variants share one combined trajectory figure (mobility overlaid).
-        negbin_display = {
-            NEGBIN_FIXED_MODEL:   ("Negative Binomial (fixed k)",   "#EE6677"),
-            NEGBIN_SAMPLED_MODEL: ("Negative Binomial (Poisson k)", "#228833"),
-        }
-        negbin_bands: list = []
-        negbin_scenarios = negbin_T = None
-
-        for model_label in [BASELINE_MODEL, NEGBIN_FIXED_MODEL, NEGBIN_SAMPLED_MODEL]:
-            prefix = prefixes[model_label]
-            result = baseline_optimal_result(model_label, N_e)
-            params, T, pbp_fn = result["params"], result["T"], result["pbp_fn"]
-            if not skip_rollouts:
-                scenarios = [make_scenario(params, seed + i, T) for i in range(N_rollouts)]
-                full = run_rollouts_full(result["pi"], result["actions"], result["e_grid"],
-                                         params, scenarios, rollout_fn(model_label), pbp_fn)
-            else:
-                scenarios = full = None
-
-            cost_fig = fig_baseline_cost(
-                full or {}, source=cost_source, result=result,
-            )
-            for name, fig in (("cost", cost_fig),
-                              ("optimal_policy", fig_heatmap_grid([result], show_titles=False)),
-                              ("optimal_policy_du", fig_heatmap_grid_du([result], show_titles=False))):
-                if skip_rollouts and name == "cost" and cost_source == "rollout":
-                    continue
-                p = bm_dir / f"{prefix}_{name}.png"
-                p.write_bytes(figure_to_png(fig))
-                saved.append(p)
-
-            if model_label == BASELINE_MODEL:
-                fig_nonopt = fig_baseline_policy_heatmaps(
-                    result["params"], result["e_grid"], result["lam_grid"],
-                    result["T"], result["pbp_fn"],
-                    pi=result["pi"], actions=result["actions"],
-                )
-                p = bm_dir / "non_optimal_policy_heatmaps.png"
-                p.write_bytes(figure_to_png(fig_nonopt))
-                saved.append(p)
-
-            if model_label == BASELINE_MODEL and not skip_rollouts:
-                p = bm_dir / "baseline_trajectories.png"
-                p.write_bytes(figure_to_png(fig_baseline_trajectories(full, scenarios, T, params)))
-                saved.append(p)
-            elif model_label != BASELINE_MODEL and not skip_rollouts:
-                label, color = negbin_display[model_label]
-                chi_list = [r["chi_traj"] for r in full["Backward Induction"]]
-                negbin_bands.append((label, color, chi_list, True))
-                negbin_scenarios, negbin_T = scenarios, T
-
-        # Single combined NegBin trajectory figure (both variants on one plot).
-        if negbin_bands:
-            fig = fig_rollout_trajectories(negbin_scenarios, negbin_T, negbin_bands)
-            # Export-only: full-width horizontal legend on top (frees the side
-            # space the app's side-legend takes) with a slightly larger font.
-            # Extra top margin so it clears the first subplot title.
-            fig.update_layout(
-                margin=dict(l=40, r=30, t=90, b=40),
-                legend=dict(orientation="h", yanchor="bottom", y=1.10,
-                            xanchor="left", x=0, font=dict(size=18)),
-            )
-            p = bm_dir / "negbin_trajectories.png"
-            p.write_bytes(figure_to_png(fig))
-            saved.append(p)
-
-        # Trip duration figure
-        durs = compute_trip_durations()
-        p = bm_dir / "trip_duration_by_model.png"
-        p.write_bytes(figure_to_png(trip_duration_figure(durs)))
-        saved.append(p)
-
-    return saved
+    if _log: _log(f"Solving {model_label} (N_e={N_e})…")
+    result = baseline_optimal_result(model_label, N_e)
+    figs = {
+        "policy_heatmaps": fig_all_policy_heatmaps(result),
+        "charge_borders":  fig_all_policy_charge_borders(result),
+    }
+    if compute_cost:
+        if _log: _log("Computing exact costs for all policies…")
+        result["exact_breakdown"] = compute_all_exact_costs_breakdown(result, desc="  exact costs")
+        figs["cost"] = fig_baseline_cost(result)
+    return result, figs
 
 
-# Display names for the baseline/NegBin models in the combined summary table.
-_BASELINE_TABLE_LABELS = {
-    BASELINE_MODEL:       "Baseline",
-    NEGBIN_FIXED_MODEL:   "NegBin (fixed k)",
-    NEGBIN_SAMPLED_MODEL: "NegBin (sampled k)",
-}
+def sensitivity_figures(dims: list[str] | None = None, N_e: int = 500,
+                        progress_cb: Callable | None = None, _log: Callable | None = None,
+                        *, compute_cost: bool = True) -> dict[str, dict]:
+    """Per-sweep paper figures.
 
-
-def save_tables(
-    all_results: dict[str, list[dict]],
-    out_dir: str | Path = "export/tables",
-    N_rollouts: int = 500,
-    seed: int = 42,
-    N_e: int = 500,
-    include_baseline: bool = True,
-    compute_exact: bool = True,
-    cost_source: str = "rollout",
-    skip_rollouts: bool = False,
-    _log: Callable | None = None,
-) -> list[Path]:
-    """Write the per-sweep and (optionally) baseline-model summary tables as CSV.
-
-    ``compute_exact=False`` skips the slow analytical exact-cost step for the
-    baseline-model table (the ``Exact cost (€)`` column is omitted); the
-    rollout-based metrics are unaffected.
-
-    ``cost_source`` selects the per-sweep summary's columns: ``"rollout"`` (default,
-    Monte-Carlo metrics with SEM/Std) or ``"exact"`` (analytical expected costs, the
-    distributional columns omitted).
-
-    ``skip_rollouts=True`` skips the baseline-model rollout loop; only the exact-cost
-    columns are written (implies ``cost_source="exact"`` for the baseline table).
-
-    Mirrors save_figures' directory layout under out_dir:
-        sensitivity_figures/<sweep>/summary.csv   — one row per (swept value, policy)
-        baseline_models/summary.csv               — combined Baseline + NegBin models
-
-    Each table carries the shared 6-metric set (see build_summary_df). Returns saved paths.
+    Returns ``{dim: {"panels": [...], "figures": {name: Figure}}}``. For each sweep
+    dimension the figures are per-policy heatmaps and charge borders (one figure each
+    for Backward Induction / Departure Urgency / Battery Level Urgency, with one
+    subplot panel per swept value) plus an exact expected-cost bar (``compute_cost``).
     """
-    from ev_mdt.plots.sensitivity import build_summary_df
-
-    out_dir = Path(out_dir)
-    saved: list[Path] = []
-
-    import pandas as pd
-    for sweep_name, results in all_results.items():
-        folder = _SWEEP_FOLDER.get(sweep_name, sweep_name)
-        dest = out_dir / "sensitivity_figures" / folder
-        dest.mkdir(parents=True, exist_ok=True)
-        p = dest / "summary.csv"
-        _src = "exact" if skip_rollouts else cost_source
-        df = build_summary_df(results, source=_src)
-        df.to_csv(p, index=False)
-        saved.append(p)
-        if _log: _log(f"  Saved table: {p}")
-
-    if include_baseline:
-        bm_dir = out_dir / "baseline_models"
-        bm_dir.mkdir(parents=True, exist_ok=True)
-        import pandas as pd
-        if skip_rollouts:
-            # Exact-only path: solve each model, compute exact cost breakdown, no rollouts.
-            exact_rows = []
-            for model_label in [BASELINE_MODEL, NEGBIN_FIXED_MODEL, NEGBIN_SAMPLED_MODEL]:
-                label = _BASELINE_TABLE_LABELS[model_label]
-                if _log: _log(f"  [{label}] solving…")
-                result = baseline_optimal_result(model_label, N_e)
-                if _log: _log(f"  [{label}] computing exact costs…")
-                bd = compute_all_exact_costs_breakdown(result, desc=f"    [{label}] exact costs")
-                for policy, vals in bd.items():
-                    from ev_mdt.plots.sensitivity import _penalty_pct, _exact_summary
-                    exact_rows.append({"Model": label, "Policy": policy, **_exact_summary(vals)})
-            df = pd.DataFrame(exact_rows)
-        else:
-            model_results = []
-            for model_label in [BASELINE_MODEL, NEGBIN_FIXED_MODEL, NEGBIN_SAMPLED_MODEL]:
-                label = _BASELINE_TABLE_LABELS[model_label]
-                if _log: _log(f"  [{label}] solving + running {N_rollouts} rollouts…")
-                result = baseline_optimal_result(model_label, N_e)
-                params, T, pbp_fn = result["params"], result["T"], result["pbp_fn"]
-                scenarios = [make_scenario(params, seed + i, T) for i in range(N_rollouts)]
-                rollouts = run_rollouts(
-                    result["pi"], result["actions"], result["e_grid"], params,
-                    scenarios, rollout_fn(model_label), pbp_fn, desc=f"    [{label}] rollouts")
-                if compute_exact:
-                    if _log: _log(f"  [{label}] computing exact costs…")
-                    result["exact_costs"] = compute_all_exact_costs(
-                        result, desc=f"    [{label}] exact costs")
-                else:
-                    result["exact_costs"] = {}
-                model_results.append({"rollouts": rollouts, "label": label,
-                                      "exact_costs": result["exact_costs"]})
-            rollout_df = pd.concat([build_summary_df([r]) for r in model_results], ignore_index=True)
-            rollout_df = rollout_df.rename(columns={"Swept value": "Model"})
-            if compute_exact:
-                exact_rows = [
-                    {"Model": r["label"], "Policy": policy, "Exact cost (€)": cost}
-                    for r in model_results
-                    for policy, cost in r["exact_costs"].items()
-                ]
-                exact_df = pd.DataFrame(exact_rows)
-                df = exact_df.merge(rollout_df, on=["Model", "Policy"], how="right")
-            else:
-                df = rollout_df
-        p = bm_dir / "summary.csv"
-        df.to_csv(p, index=False)
-        saved.append(p)
-        if _log: _log(f"  Saved table: {p}")
-
-    return saved
+    from ev_mdt.plots.sensitivity import (
+        fig_policy_heatmap_grid, fig_policy_charge_border_grid, fig_cost_distribution,
+        PAPER_POLICIES, BI_POLICY, DU_POLICY, BLU_POLICY,
+    )
+    if dims is None:
+        dims = list(ALL_SWEEP_NAMES)
+    results = run_all_sweeps(N_e=N_e, sweeps=dims, progress_cb=progress_cb, _log=_log,
+                             compute_exact=compute_cost)
+    stem = {BI_POLICY: "bi", DU_POLICY: "du", BLU_POLICY: "blu"}
+    out: dict[str, dict] = {}
+    for dim, panels in results.items():
+        figs = {}
+        for policy in PAPER_POLICIES:
+            figs[f"{stem[policy]}_heatmap"]       = fig_policy_heatmap_grid(panels, policy)
+            figs[f"{stem[policy]}_charge_border"] = fig_policy_charge_border_grid(panels, policy)
+        if compute_cost:
+            figs["cost"] = fig_cost_distribution(panels)
+        out[dim] = {"panels": panels, "figures": figs}
+    return out
 
 
-def exact_bi_cost_table(N_e: int = 500, seed: int = 42, _log: Callable | None = None):
-    """Analytical (exact) expected cost of the BI policy for every scenario.
+def calibrate_du_figures(N_e: int = 500, gamma_step: float = 0.1, step_kwh: float = 5.0,
+                         use_reserve: bool = True, _log: Callable | None = None) -> dict:
+    """Departure-Urgency calibration: the e_base (target-ceiling) and γ sweeps (exact).
 
-    One row for the Baseline config plus one per sensitivity-sweep configuration
-    (all 34). No Monte-Carlo: each config is solved and its optimal policy is
-    evaluated exactly (β=1, undiscounted). Returns a DataFrame
-    [Sweep, Configuration, Exact BI cost (€)].
-
-    Note: this still fits the price samplers (incl. MDN) for the pricing configs,
-    but runs only a single throwaway rollout per config to reuse the sweep
-    pipeline — the reported cost is purely analytical (from the value function).
+    Returns ``{"target": (rows, Figure), "gamma": (results, Figure)}``.
     """
-    import pandas as pd
+    from ev_mdt.plots.calibration import fig_target_sweep, fig_gamma_sweep
 
-    rows = [{
-        "Sweep":             "baseline",
-        "Configuration":     "Baseline",
-        "Exact BI cost (€)": bi_expected_cost(baseline_optimal_result(BASELINE_MODEL, N_e)),
-    }]
-    if _log: _log("Baseline: exact BI cost computed.")
+    target_rows = sweep_target_ceiling_exact(step_kwh=step_kwh, N_e=N_e,
+                                             use_reserve=use_reserve, _log=_log)
+    gamma_values = [round(g, 6) for g in np.arange(gamma_step, 1.0 + 1e-9, gamma_step)]
+    gamma_results = sweep_gamma_exact(use_reserve=use_reserve, gamma_values=gamma_values,
+                                      N_e=N_e, _log=_log)
+    return {
+        "target": (target_rows, fig_target_sweep(target_rows)),
+        "gamma":  (gamma_results, fig_gamma_sweep(gamma_results)),
+    }
 
-    results = run_all_sweeps(N_rollouts=1, N_e=N_e, seed=seed, _log=_log)
-    for sweep_name, steps in results.items():
-        for step in steps:
-            rows.append({
-                "Sweep":             sweep_name,
-                "Configuration":     step["label"],
-                "Exact BI cost (€)": bi_expected_cost(step),
-            })
 
-    return pd.DataFrame(rows)
+def model_trajectory_figure(mobility_model: str = BASELINE_MODEL,
+                            price_model: str = "Gaussian (parametric)",
+                            n: int = 1000, seed: int = 42, T: int = 24 * 60,
+                            season: str = "winter", is_weekend: bool = False,
+                            _log: Callable | None = None):
+    """Mean sampled price + mean fraction-driving over the horizon (two subplots).
+
+    Defaults to Gaussian-parametric pricing and Baseline mobility; pass another
+    ``mobility_model`` (MODEL_LABELS) or ``price_model`` (a fitted-sampler name from
+    ``load_fitted_samplers``) to swap either.
+    """
+    from ev_mdt.models.common.policies import always_minimum_policy
+    from ev_mdt.plots.sensitivity import fig_rollout_trajectories
+    from ev_mdt.plots.viz import MODEL_COLORS
+
+    params  = build_params(mobility_model)
+    sampler = None
+    if price_model and price_model != "Gaussian (parametric)":
+        samplers = load_fitted_samplers()
+        if price_model not in samplers:
+            raise ValueError(f"Unknown price model {price_model!r}; choose from "
+                             f"{['Gaussian (parametric)'] + list(samplers)}")
+        sampler = samplers[price_model]
+
+    if _log: _log(f"Generating {n} scenarios (price={price_model}, mobility={mobility_model})…")
+    scenarios = [make_scenario(params, seed + i, T, sampler=sampler,
+                               season=season, is_weekend=is_weekend) for i in range(n)]
+    _rf = rollout_fn(mobility_model)
+    if _log: _log("Rolling out mobility…")
+    chi_list = [_rf(always_minimum_policy, sc, float(sc["e0"]), 0, params)["chi_traj"]
+                for sc in scenarios]
+    label = _MODEL_DISPLAY.get(mobility_model, mobility_model)
+    color = MODEL_COLORS.get(label, "orange")
+    return fig_rollout_trajectories(scenarios, T, [(label, color, chi_list, True)])
+
+
+def price_model_figures(n_days: int = 1000, season: str | None = None, daytype: str = "all",
+                        seed: int = 42, exclude_crisis: bool = True,
+                        progress_cb: Callable | None = None, _log: Callable | None = None):
+    """Fit the price samplers, simulate price rollouts, and build the comparison figures.
+
+    Returns ``(paths, {"mean_profile": Figure, "std_profile": Figure})``.
+    """
+    from ev_mdt.pricing.entsoe import load_prices
+    from ev_mdt.analysis.prices import fit_samplers, simulate_price_paths, price_figures
+
+    df = load_prices(_log=_log)
+    if exclude_crisis:
+        df = df[~df["timestamp"].dt.year.isin(CRISIS_YEARS)]
+    samplers = fit_samplers(df, progress_cb=progress_cb)
+    paths = simulate_price_paths(samplers, n_days=n_days, season=season,
+                                 daytype=daytype, seed=seed)
+    fig_mean, fig_std = price_figures(paths)
+    return paths, {"mean_profile": fig_mean, "std_profile": fig_std}
+
+
+def fit_mdn(n_components: int = 3, hidden_dims: list[int] | None = None,
+            epochs: int = 200, batch_size: int = 1024, lr: float = 1e-3,
+            exclude_crisis: bool = True, _log: Callable | None = None,
+            _progress: Callable | None = None):
+    """Fit the MDN price sampler and build the two training-curve figures.
+
+    Returns ``(sampler, history, {"mdn_nll": Figure, "mdn_components": Figure})``.
+    """
+    from ev_mdt.pricing.entsoe import load_prices
+    from ev_mdt.pricing.samplers import MDNSampler
+    from ev_mdt.plots.mdn import fig_mdn_nll, fig_mdn_components
+
+    df = load_prices(_log=_log)
+    if exclude_crisis:
+        df = df[~df["timestamp"].dt.year.isin(CRISIS_YEARS)]
+    sampler = MDNSampler(n_components=n_components, hidden_dims=hidden_dims,
+                         epochs=epochs, batch_size=batch_size, lr=lr)
+    history: list[dict] = []
+    sampler.fit(df, _progress=_progress, _history=history)
+    figs = {
+        "mdn_nll":        fig_mdn_nll(history),
+        "mdn_components": fig_mdn_components(history, n_components),
+    }
+    return sampler, history, figs

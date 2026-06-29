@@ -121,23 +121,7 @@ with col2:
         price_night = price_morning = price_midday = price_evening = price_late = _DEFAULTS["price_night"]
         sigma_lambda = _DEFAULTS["sigma_lambda"]
 
-        if price_source == "MDN":
-            st.divider()
-            use_wandb = st.checkbox("Log MDN training to W&B", key="use_wandb")
-            if use_wandb:
-                _wc1, _wc2 = st.columns(2)
-                with _wc1:
-                    wandb_project = st.text_input("W&B project", value="au-mdt", key="wandb_project")
-                with _wc2:
-                    wandb_run_name = st.text_input("Run name", placeholder="auto", value="", key="wandb_run_name")
-            else:
-                wandb_project = wandb_run_name = None
-        else:
-            use_wandb = False
-            wandb_project = wandb_run_name = None
     else:
-        use_wandb = False
-        wandb_project = wandb_run_name = None
         price_is_weekend = price_season = None
         lambda_max = _DEFAULTS["lambda_max"]
         st.markdown("*Mean prices (€/kWh)*")
@@ -330,33 +314,8 @@ if run_btn:
                     _prog.progress(min(fraction, 1.0))
                     _detail.caption(message)
 
-                _wandb_run = None
-                if use_wandb and price_source == "MDN":
-                    try:
-                        import wandb
-                        _wandb_run = wandb.init(
-                            project=wandb_project,
-                            name=wandb_run_name or None,
-                            config={
-                                "n_components": 3,
-                                "epochs": 200,
-                                "batch_size": 1024,
-                                "lr": 1e-3,
-                                "n_samples": len(_df),
-                            },
-                            reinit="create_new",
-                        )
-                    except ImportError:
-                        st.warning("wandb is not installed — run `uv add wandb` to enable logging.")
-
                 _sampler = _sampler_classes[price_source]()
-                if _wandb_run is not None:
-                    st.session_state[_cache_key] = _sampler.fit(
-                        _df, _progress=_fit_progress, _wandb_run=_wandb_run,
-                    )
-                    _wandb_run.finish()
-                else:
-                    st.session_state[_cache_key] = _sampler.fit(_df, _progress=_fit_progress)
+                st.session_state[_cache_key] = _sampler.fit(_df, _progress=_fit_progress)
                 _fit_status.update(label=f"{price_source} model ready.", state="complete", expanded=False)
 
         from ev_mdt.params import SharedParams as _SP

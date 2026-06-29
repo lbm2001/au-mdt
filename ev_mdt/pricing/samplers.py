@@ -213,7 +213,9 @@ class MDNSampler(AbstractSampler):
         self.lr           = lr
         self._net         = None
 
-    def fit(self, df: pd.DataFrame, _progress=None, _wandb_run=None) -> "MDNSampler":
+    def fit(self, df: pd.DataFrame, _progress=None, _history=None) -> "MDNSampler":
+        """Fit the MDN. Pass a list as ``_history`` to record per-epoch training
+        metrics (loss, original-space NLL, mean mixture weights) for plotting."""
         import torch
         import torch.nn as nn
 
@@ -271,17 +273,18 @@ class MDNSampler(AbstractSampler):
                 n_batches += 1
             epoch_loss /= n_batches
             scheduler.step(epoch_loss)
-            if _wandb_run is not None:
+            if _history is not None:
                 with torch.no_grad():
                     pi_all, _, _ = self._net(X_t[:2048])
                     mean_weights = pi_all.mean(dim=0)
-                log_dict = {
+                row = {
+                    "step": epoch + 1,
                     "loss": epoch_loss,
                     "loss_original_space": epoch_loss + np.log(self._price_std),
                 }
                 for k, w in enumerate(mean_weights.tolist()):
-                    log_dict[f"pi_{k}"] = w
-                _wandb_run.log(log_dict, step=epoch + 1)
+                    row[f"pi_{k}"] = w
+                _history.append(row)
             if _progress is not None and (epoch % 5 == 0 or epoch == self.epochs - 1):
                 _progress((epoch + 1) / self.epochs,
                           f"Epoch {epoch + 1}/{self.epochs}  loss {epoch_loss:.4f}")

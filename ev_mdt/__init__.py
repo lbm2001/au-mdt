@@ -2,11 +2,11 @@
 
 High-level API
 --------------
-    from ev_mdt import solve, rollout, sweep
+    from ev_mdt import solve, sweep, baseline_figures, sensitivity_figures
 
     result = solve(model="Baseline")          # solve with default params
-    rollout_out = rollout(result, n=200)      # simulate 200 rollouts
-    sweep_results = sweep("penalty")          # run one sensitivity sweep
+    sweep_results = sweep(sweeps=["penalty"]) # run one sensitivity sweep (exact)
+    _, figs = baseline_figures()              # baseline paper figures
 """
 from ev_mdt.params import (
     BaselineParams,
@@ -21,13 +21,15 @@ from ev_mdt.params import (
 )
 from ev_mdt.analysis.sensitivity import (
     solve as _solve_fn,
-    rollout_fn,
     build_params,
-    make_scenario,
-    run_rollouts,
     run_all_sweeps as sweep,
-    save_figures,
     ALL_SWEEP_NAMES,
+    baseline_figures,
+    sensitivity_figures,
+    calibrate_du_figures,
+    model_trajectory_figure,
+    price_model_figures,
+    fit_mdn,
 )
 from ev_mdt.models.common.model_utils import price_bin_probs
 
@@ -50,8 +52,6 @@ def solve(
     T_hours_override: override horizon in hours (default T_hours=24)
     **param_overrides: passed verbatim to build_params (e.g. phi=10.0, beta=0.98)
     """
-    from ev_mdt.analysis.sensitivity import _run_sweep_step
-
     _N_e = N_e_override if N_e_override is not None else N_e
     _T   = (T_hours_override if T_hours_override is not None else T_hours) * 60
     params = build_params(model, **param_overrides)
@@ -68,28 +68,3 @@ def solve(
         "lam_grid":  lam_grid,
         "T":         _T,
     }
-
-
-def rollout(result: dict, n: int = 200, seed: int = 42) -> dict:
-    """Simulate all policies on n scenarios for the given solve result.
-
-    Parameters
-    ----------
-    result : dict returned by solve() or any sweep step result
-    n      : number of randomly seeded scenarios
-    seed   : base seed (scenario i uses seed+i)
-
-    Returns
-    -------
-    dict with key "rollouts" → {policy_name: [metrics, ...]}
-    plus "scenarios" → list of scenario dicts
-    """
-    params  = result["params"]
-    T       = result["T"]
-    model   = result["model"]
-    pbp_fn  = result["pbp_fn"]
-    scenarios = [make_scenario(params, seed + i, T) for i in range(n)]
-    _rf = rollout_fn(model)
-    rollouts = run_rollouts(result["pi"], result["actions"], result["e_grid"],
-                             params, scenarios, _rf, pbp_fn)
-    return {**result, "rollouts": rollouts, "scenarios": scenarios}

@@ -13,14 +13,24 @@ from ev_mdt.models.negbin.rollout import _next_state as _ns_nb
 from ev_mdt.plots.viz import MODEL_COLORS
 
 
-def compute_trip_durations(n_scen: int = 10000, horizon: int = 1440, seed: int = 0) -> dict:
-    """Driving-spell lengths (minutes) per mobility model, from simulated mobility only."""
+def compute_trip_durations(n_scen: int = 10000, horizon: int = 1440, seed: int = 0,
+                           models: list[str] | None = None) -> dict:
+    """Driving-spell lengths (minutes) per mobility model, from simulated mobility only.
+
+    ``models`` selects a subset of the model display names (default: all three).
+    """
     _kmax = NegBinParams.k_max_for_lambda
     specs = {
         "Baseline":                       (BaselineParams(),                          _ns_base),
         "Negative Binomial (fixed k)":   (NegBinParams(),                            _ns_nb),
         "Negative Binomial (Poisson k)": (NegBinParams(lambda_k=5.0, k=_kmax(5.0)), _ns_nb),
     }
+    if models is not None:
+        unknown = set(models) - set(specs)
+        if unknown:
+            raise ValueError(f"Unknown trip-duration models {sorted(unknown)}; "
+                             f"choose from {list(specs)}")
+        specs = {name: specs[name] for name in models}
     out = {}
     for name, (p, next_state) in specs.items():
         durs = []

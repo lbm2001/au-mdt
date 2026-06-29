@@ -10,15 +10,13 @@ from ev_mdt.params import BASELINE_MODEL, NEGBIN_SAMPLED_MODEL
 from ev_mdt.models.common.model_utils import price_bin_probs
 from ev_mdt.models.common.policies import policy_registry
 from ev_mdt.models.common.rollout_utils import generate_rollout_scenario, run_policies
-from ev_mdt.analysis.sensitivity import rollout_fn, rollout_stats_table
-from ev_mdt.plots.sensitivity import (
-    fig_baseline_cost, fig_rollout_trajectories, SUMMARY_METRIC_FORMATS,
-)
+from ev_mdt.analysis.sensitivity import rollout_fn
+from ev_mdt.plots.sensitivity import fig_rollout_trajectories
 from ev_mdt.plots.viz import MODEL_COLORS
 from ev_mdt.plots.trip_duration import compute_trip_durations, trip_duration_figure
 
-st.set_page_config(page_title="Policy Rollout — EV Charging MDP", layout="wide")
-st.title("Policy Rollout")
+st.set_page_config(page_title="Model Rollout Trajectories — EV Charging MDP", layout="wide")
+st.title("Model Rollout Trajectories")
 
 # ── Guard ─────────────────────────────────────────────────────────────────────
 
@@ -106,46 +104,6 @@ if st.session_state.get("_nd_key") != _nd_key:
 nd_rollouts  = st.session_state["_nd_rollouts"]
 nd_scenarios = st.session_state["_nd_scenarios"]
 nd_mob_other = st.session_state["_nd_mob_other"]
-
-stats_df = rollout_stats_table(nd_rollouts, params)
-st.dataframe(stats_df.style.format(SUMMARY_METRIC_FORMATS), use_container_width=True)
-
-_TABLES_DIR = Path(__file__).parent.parent.parent / "export" / "tables"
-_tc1, _tc2 = st.columns(2)
-with _tc1:
-    st.download_button("Download CSV", stats_df.to_csv().encode(),
-                       "policy_rollout.csv", "text/csv")
-with _tc2:
-    if st.button("💾 Export → export/tables/policy_rollout.csv"):
-        _TABLES_DIR.mkdir(parents=True, exist_ok=True)
-        _out = _TABLES_DIR / "policy_rollout.csv"
-        stats_df.to_csv(_out)
-        st.success(f"Saved `{_out.relative_to(Path(__file__).parent.parent.parent)}`")
-
-# ── Mean cost ─────────────────────────────────────────────────────────────────
-
-st.subheader("Mean cost")
-st.caption("Mean total cost per scenario — **including the unserved-driving penalty** — "
-           "one bar per policy. SEM = uncertainty of the mean (std/√N); Std = spread across "
-           "scenarios. Lower bar clamped at 0.")
-cc1, cc2, cc3 = st.columns(3)
-with cc1:
-    nd_cost_axis = st.radio("Cost axis", ["Log", "Linear"], horizontal=True, key="nd_cost_axis")
-with cc2:
-    nd_src = st.radio("Cost source", ["Rollout", "Exact"], horizontal=True, key="nd_cost_src")
-with cc3:
-    nd_err = st.radio("Error bars", ["SEM", "Std"], horizontal=True, key="nd_cost_err",
-                      disabled=(nd_src == "Exact"))
-if nd_src == "Exact":
-    _lam_grid = np.array([(j + 0.5) * params.lambda_max / params.K for j in range(params.K)])
-    _exact_result = dict(model=_solved_model, params=params, pbp_fn=_pbp_fn,
-                         pi=pi, actions=actions, e_grid=e_grid, lam_grid=_lam_grid, T=T)
-    _cost_fig = fig_baseline_cost(nd_rollouts, log_y=(nd_cost_axis == "Log"),
-                                  source="exact", result=_exact_result)
-else:
-    _cost_fig = fig_baseline_cost(nd_rollouts, error=nd_err.lower(),
-                                  log_y=(nd_cost_axis == "Log"))
-st.plotly_chart(_cost_fig, use_container_width=True)
 
 # ── Mean trajectories ─────────────────────────────────────────────────────────
 

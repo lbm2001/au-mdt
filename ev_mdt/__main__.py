@@ -1,24 +1,30 @@
 """CLI entry point for ev_mdt.
 
-Usage
------
-    python -m ev_mdt solve [--model BASELINE] [--N-e 500] [--hours 24] [--phi 1.0] ...
-    python -m ev_mdt rollout --n 200 --seed 42 [same solve flags]
-    python -m ev_mdt run --all [--N-rollouts 500] [--N-e 500] [--seed 42] [--out-dir export]
-    python -m ev_mdt run --sweep penalty        # single sweep, no baseline models
-    python -m ev_mdt prices [--n-days 1000] [--season all] [--daytype all]
-                            [--seed 42] [--out-dir figures/]
+Every command writes figures (and, where applicable, CSV tables) under
+``<out-dir>/<timestamp>/<command>/`` (pass ``--no-timestamp`` to write straight
+into ``<out-dir>/<command>/``). All figure and computation logic lives in the
+``ev_mdt`` package — this module only parses arguments, calls the package, and
+writes the returned figures/tables to disk.
 
-`run --all` writes figures to <out-dir>/<timestamp>/figures_app/ and summary tables to
-<out-dir>/<timestamp>/tables/. Pass --no-timestamp to write straight into <out-dir>.
+Commands
+--------
+    baseline             Baseline all-policy heatmaps, charge borders, exact cost bar (+ table)
+    sensitivity          Per-sweep BI/DU/BLU heatmaps + charge borders + exact cost bars (+ tables)
+    calibrate-du         Departure-Urgency e_base (target-ceiling) and γ calibration sweeps
+    trip-duration        Trip-duration distribution figure
+    model-trajectories   Mean sampled price + fraction-driving (swap price / mobility model)
+    price-models         Mean/std diurnal price comparison across price models
+    fit-mdn              Fit the MDN price sampler + its two training-curve figures
+    run --all            Run every command (full regeneration)
+    run --all-paper      Fast paper figures only (heatmaps/borders/trajectories/prices; no exact cost)
 """
 import argparse
 import sys
+from pathlib import Path
 
 
-def _timestamped_dir(base, *, enabled: bool = True):
+def _timestamped_dir(base, *, enabled: bool = True) -> Path:
     """Append a ``YYYY-MM-DD_HHMMSS`` run folder to ``base`` (unless disabled)."""
-    from pathlib import Path
     base = Path(base)
     if not enabled:
         return base
@@ -26,578 +32,338 @@ def _timestamped_dir(base, *, enabled: bool = True):
     return base / datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
 
-def _add_solve_args(parser: argparse.ArgumentParser) -> None:
-    from ev_mdt.params import MODEL_LABELS
-    parser.add_argument("--model", default="Baseline", choices=MODEL_LABELS,
-                        help="Mobility model")
-    parser.add_argument("--N-e",    type=int,   default=500,  metavar="N",  help="Battery grid points")
-    parser.add_argument("--hours",  type=int,   default=24,   metavar="H",  help="Horizon in hours")
-    parser.add_argument("--phi",    type=float, default=None, metavar="Φ",  help="Penalty (€/h)")
-    parser.add_argument("--beta",   type=float, default=None, metavar="β",  help="Discount factor")
+def _save_fig(fig, path: Path, *, top: int | None = None, _log=print) -> Path:
+    from ev_mdt.plots.sensitivity import figure_to_png
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(figure_to_png(fig, top=top))
+    _log(f"  Saved {path}")
+    return path
 
 
-def cmd_solve(args: argparse.Namespace) -> None:
-    from ev_mdt import solve
-    overrides = {}
-    if args.phi  is not None: overrides["phi"]  = args.phi
-    if args.beta is not None: overrides["beta"] = args.beta
-    print(f"Solving {args.model} model (T={args.hours}h, N_e={args.N_e}) …", flush=True)
-    result = solve(model=args.model, N_e_override=args.N_e,
-                   T_hours_override=args.hours, **overrides)
-    print(f"Done. Policy shape: {result['pi'].shape}, actions: {result['actions'].shape}")
+def _save_table(df, path: Path, _log=print) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+    _log(f"  Saved {path}")
+    return path
 
 
-def cmd_rollout(args: argparse.Namespace) -> None:
-    from ev_mdt import solve, rollout
+# Cost bars carry a horizontal legend above the plot → reserve top margin on export.
+_COST_TOP = 52
+
+
+# ── Per-command export workers (also reused by `run`) ──────────────────────────
+
+def _export_baseline(out_base: Path, *, N_e: int, compute_cost: bool, _log=print) -> None:
+    from ev_mdt.analysis.sensitivity import baseline_figures
     from ev_mdt.plots.sensitivity import build_summary_df
-    overrides = {}
-    if args.phi  is not None: overrides["phi"]  = args.phi
-    if args.beta is not None: overrides["beta"] = args.beta
-    print(f"Solving + running {args.n} rollouts for {args.model} model …", flush=True)
-    result  = solve(model=args.model, N_e_override=args.N_e,
-                    T_hours_override=args.hours, **overrides)
-    full    = rollout(result, n=args.n, seed=args.seed)
-    df      = build_summary_df([{**full, "label": args.model}])
-    print(df.to_string(index=False))
+    dest = out_base / "baseline"
+    result, figs = baseline_figures(N_e=N_e, compute_cost=compute_cost, _log=_log)
+    for name, fig in figs.items():
+        _save_fig(fig, dest / f"{name}.png", top=_COST_TOP if name == "cost" else None, _log=_log)
+    if compute_cost and "exact_breakdown" in result:
+        _save_table(build_summary_df([result]), dest / "summary.csv", _log)
 
 
-def cmd_run(args: argparse.Namespace) -> None:
-    """Run sweeps (and, with --all, the baseline/NegBin models) → export figures + tables."""
-    import itertools
-    import threading
-    import time
+def _export_sensitivity(out_base: Path, *, dims, N_e: int, compute_cost: bool, _log=print) -> None:
+    from ev_mdt.analysis.sensitivity import sensitivity_figures
+    from ev_mdt.plots.sensitivity import build_summary_df
+    out = sensitivity_figures(dims=dims, N_e=N_e, compute_cost=compute_cost, _log=_log)
+    for dim, payload in out.items():
+        dest = out_base / "sensitivity" / dim
+        for name, fig in payload["figures"].items():
+            _save_fig(fig, dest / f"{name}.png", top=_COST_TOP if name == "cost" else None, _log=_log)
+        if compute_cost:
+            _save_table(build_summary_df(payload["panels"]), dest / "summary.csv", _log)
+
+
+def _export_calibrate_du(out_base: Path, *, N_e: int, gamma_step: float, step_kwh: float,
+                         use_reserve: bool, _log=print) -> None:
+    import pandas as pd
+    from ev_mdt.analysis.sensitivity import calibrate_du_figures
+    dest = out_base / "calibrate_du"
+    res = calibrate_du_figures(N_e=N_e, gamma_step=gamma_step, step_kwh=step_kwh,
+                               use_reserve=use_reserve, _log=_log)
+    target_rows, target_fig = res["target"]
+    gamma_results, gamma_fig = res["gamma"]
+    _save_fig(target_fig, dest / "target_sweep.png", _log=_log)
+    _save_table(pd.DataFrame(target_rows), dest / "target_sweep.csv", _log)
+    _save_fig(gamma_fig, dest / "gamma_sweep.png", _log=_log)
+    for model_name, rows in gamma_results.items():
+        slug = model_name.lower().replace(" ", "_").replace("=", "")
+        _save_table(pd.DataFrame(rows), dest / f"gamma_sweep_{slug}.csv", _log)
+
+
+# CLI short keys → trip-duration / mobility-model display names.
+_MOBILITY_KEYS = {
+    "baseline":       "Baseline",
+    "negbin_fixed":   "Negative Binomial (fixed k)",
+    "negbin_poisson": "Negative Binomial (Poisson k)",
+}
+_MOBILITY_MODEL_LABEL = {
+    "baseline":       "Baseline",
+    "negbin_fixed":   "Negative Binomial trips (fixed k)",
+    "negbin_poisson": "Negative Binomial trips (sampled k)",
+}
+
+
+def _export_trip_duration(out_base: Path, *, models=None, _log=print) -> None:
+    from ev_mdt.plots.trip_duration import compute_trip_durations, trip_duration_figure
+    _log("Sampling trip durations…")
+    durs = compute_trip_durations(models=models)
+    _save_fig(trip_duration_figure(durs), out_base / "trip_duration" / "trip_duration_by_model.png", _log=_log)
+
+
+def _export_model_trajectories(out_base: Path, *, mobility_model: str, price_model: str,
+                               n: int, seed: int, _log=print) -> None:
+    from ev_mdt.analysis.sensitivity import model_trajectory_figure
+    fig = model_trajectory_figure(mobility_model=mobility_model, price_model=price_model,
+                                  n=n, seed=seed, _log=_log)
+    _save_fig(fig, out_base / "model_trajectories" / "model_trajectories.png", _log=_log)
+
+
+def _export_price_models(out_base: Path, *, n_days: int, season, daytype: str, seed: int,
+                         _log=print) -> None:
+    from ev_mdt.analysis.sensitivity import price_model_figures
+    _, figs = price_model_figures(n_days=n_days, season=season, daytype=daytype, seed=seed, _log=_log)
+    for name, fig in figs.items():
+        _save_fig(fig, out_base / "price_models" / f"{name}.png", _log=_log)
+
+
+def _export_fit_mdn(out_base: Path, *, n_components: int, hidden, epochs: int,
+                    batch_size: int, lr: float) -> None:
     from tqdm import tqdm
-    from ev_mdt.analysis.sensitivity import (
-        run_all_sweeps, save_figures, save_tables, ALL_SWEEP_NAMES,
-    )
+    from ev_mdt.analysis.sensitivity import fit_mdn
+    bar = tqdm(total=100, desc="Training MDN", unit="%", bar_format="{l_bar}{bar}| {n:.0f}%  {postfix}")
 
-    base_dir    = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
-    figures_dir = base_dir / "figures_app"
-    tables_dir  = base_dir / "tables"
+    def _progress(frac: float, msg: str) -> None:
+        bar.n = int(frac * 100)
+        bar.set_postfix_str(msg[:50])
+        bar.refresh()
 
-    # ── Exact-cost mode: analytical expected BI cost per scenario (no rollouts) ─
-    if args.exact_cost:
-        from ev_mdt.analysis.sensitivity import exact_bi_cost_table
-        print("Computing exact (analytical) BI cost per scenario…", flush=True)
-        df = exact_bi_cost_table(N_e=args.N_e, seed=args.seed, _log=tqdm.write)
-        tables_dir.mkdir(parents=True, exist_ok=True)
-        out = tables_dir / "exact_bi_cost.csv"
-        df.to_csv(out, index=False)
-        print(df.to_string(index=False))
-        print(f"\nSaved: {out}")
-        return
+    _, _history, figs = fit_mdn(n_components=n_components, hidden_dims=hidden, epochs=epochs,
+                                batch_size=batch_size, lr=lr, _log=tqdm.write, _progress=_progress)
+    bar.n = 100; bar.refresh(); bar.close()
+    for name, fig in figs.items():
+        _save_fig(fig, out_base / "fit_mdn" / f"{name}.png", _log=tqdm.write)
 
-    # ── Baseline-only mode: just the baseline/NegBin model figures ─────────────
-    if args.baseline_only:
-        print("Rendering baseline-model figures only…", flush=True)
-        saved = save_figures({}, out_dir=figures_dir, N_rollouts=args.N_rollouts,
-                             seed=args.seed, N_e=args.N_e, include_baseline=True)
-        for p in saved:
-            print(f"  Saved: {p}")
-        print(f"\nDone. Figures → {figures_dir}/baseline_models/")
-        return
+
+# ── Command handlers ───────────────────────────────────────────────────────────
+
+def cmd_baseline(args) -> None:
+    from tqdm import tqdm
+    out_base = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
+    _export_baseline(out_base, N_e=args.N_e, compute_cost=not args.no_cost, _log=tqdm.write)
+    print(f"\nDone → {out_base}/baseline/")
+
+
+def cmd_sensitivity(args) -> None:
+    from tqdm import tqdm
+    from ev_mdt.analysis.sensitivity import ALL_SWEEP_NAMES
+    dims = list(ALL_SWEEP_NAMES) if args.all else args.dims
+    if not dims:
+        print("Nothing to do: pass --all or --dims <a,b,…>.", file=sys.stderr)
+        sys.exit(1)
+    out_base = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
+    _export_sensitivity(out_base, dims=dims, N_e=args.N_e, compute_cost=not args.no_cost, _log=tqdm.write)
+    print(f"\nDone → {out_base}/sensitivity/")
+
+
+def cmd_calibrate_du(args) -> None:
+    from tqdm import tqdm
+    out_base = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
+    _export_calibrate_du(out_base, N_e=args.N_e, gamma_step=args.gamma_step, step_kwh=args.step,
+                         use_reserve=not args.no_reserve, _log=tqdm.write)
+    print(f"\nDone → {out_base}/calibrate_du/")
+
+
+def cmd_trip_duration(args) -> None:
+    from tqdm import tqdm
+    models = [_MOBILITY_KEYS[k] for k in args.models] if args.models else None
+    out_base = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
+    _export_trip_duration(out_base, models=models, _log=tqdm.write)
+    print(f"\nDone → {out_base}/trip_duration/")
+
+
+def cmd_model_trajectories(args) -> None:
+    from tqdm import tqdm
+    out_base = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
+    _export_model_trajectories(out_base, mobility_model=_MOBILITY_MODEL_LABEL[args.mobility_model],
+                               price_model=args.price_model, n=args.n, seed=args.seed, _log=tqdm.write)
+    print(f"\nDone → {out_base}/model_trajectories/")
+
+
+def cmd_price_models(args) -> None:
+    from tqdm import tqdm
+    season = None if args.season == "all" else args.season
+    out_base = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
+    _export_price_models(out_base, n_days=args.n_days, season=season, daytype=args.daytype,
+                         seed=args.seed, _log=tqdm.write)
+    print(f"\nDone → {out_base}/price_models/")
+
+
+def cmd_fit_mdn(args) -> None:
+    out_base = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
+    _export_fit_mdn(out_base, n_components=args.n_components, hidden=args.hidden, epochs=args.epochs,
+                    batch_size=args.batch_size, lr=args.lr)
+    print(f"\nDone → {out_base}/fit_mdn/")
+
+
+def cmd_run(args) -> None:
+    """Aggregate export. ``--all`` runs every command; ``--all-paper`` runs the fast
+    paper-figure subset (heatmaps/borders/trajectories/prices, no exact cost bars,
+    no calibration/training)."""
+    from tqdm import tqdm
+    if not (args.all or args.all_paper):
+        print("Nothing to do: pass --all or --all-paper.", file=sys.stderr)
+        sys.exit(1)
+    compute_cost = bool(args.all)
+    out_base = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
+    log = tqdm.write
+
+    log("[1] Baseline figures…")
+    _export_baseline(out_base, N_e=args.N_e, compute_cost=compute_cost, _log=log)
+    log("[2] Sensitivity figures (all sweeps)…")
+    from ev_mdt.analysis.sensitivity import ALL_SWEEP_NAMES
+    _export_sensitivity(out_base, dims=list(ALL_SWEEP_NAMES), N_e=args.N_e,
+                        compute_cost=compute_cost, _log=log)
+    log("[3] Trip-duration figure…")
+    _export_trip_duration(out_base, _log=log)
+    log("[4] Model rollout trajectories…")
+    _export_model_trajectories(out_base, mobility_model=_MOBILITY_MODEL_LABEL["baseline"],
+                               price_model="Gaussian (parametric)", n=args.n, seed=args.seed, _log=log)
+    log("[5] Price-model comparison…")
+    _export_price_models(out_base, n_days=args.n_days, season=None, daytype="all", seed=args.seed, _log=log)
 
     if args.all:
-        sweeps = list(ALL_SWEEP_NAMES)
-    elif args.sweep:
-        sweeps = [args.sweep]
-    else:
-        print("Nothing to do: pass --all, --baseline-only, or --sweep <name>.", file=sys.stderr)
-        sys.exit(1)
+        log("[6] Departure-Urgency calibration…")
+        _export_calibrate_du(out_base, N_e=args.N_e, gamma_step=0.1, step_kwh=5.0,
+                             use_reserve=True, _log=log)
+        log("[7] Fit MDN + training curves…")
+        _export_fit_mdn(out_base, n_components=3, hidden=None, epochs=200, batch_size=1024, lr=1e-3)
 
-    do_baseline = args.all
-
-    # ── W&B setup ─────────────────────────────────────────────────────────────
-    wandb_run = None
-    if args.wandb:
-        try:
-            import wandb
-            wandb_run = wandb.init(
-                project=args.wandb_project,
-                name=args.wandb_run or None,
-                config={
-                    "sweeps":     sweeps,
-                    "N_rollouts": args.N_rollouts,
-                    "N_e":        args.N_e,
-                    "seed":       args.seed,
-                },
-            )
-            tqdm.write(f"W&B run: {wandb_run.url}")
-        except ImportError:
-            tqdm.write("wandb not installed — run `uv add wandb`. Continuing without logging.")
-            wandb_run = None
-
-    outer = tqdm(sweeps, desc="Sweeps", unit="sweep", position=0)
-    for i, sw in enumerate(outer):
-        outer.set_description(f"Sweep: {sw}")
-        inner = tqdm(total=100, desc="  progress", unit="%", position=1,
-                     leave=False, bar_format="{l_bar}{bar}| {n:.0f}%  {postfix}")
-
-        # Shared state updated by progress_cb; the heartbeat thread renders it so
-        # the bar keeps animating (spinner + elapsed) even while solve() blocks.
-        hb = {"msg": "starting…", "since": time.monotonic()}
-
-        def cb(f: float, msg: str, _bar: tqdm = inner) -> None:
-            _bar.n = int(f * 100)
-            hb["msg"] = msg[:50]
-            hb["since"] = time.monotonic()
-
-        stop = threading.Event()
-
-        def heartbeat(_bar: tqdm = inner) -> None:
-            spinner = itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-            while not stop.wait(0.25):
-                elapsed = time.monotonic() - hb["since"]
-                _bar.set_postfix_str(f"{next(spinner)} {hb['msg']} ({elapsed:4.0f}s)")
-                _bar.refresh()
-
-        hb_thread = threading.Thread(target=heartbeat, daemon=True)
-        hb_thread.start()
-        try:
-            # W&B logs only the MDN fitting curve (during the pricing_model sweep);
-            # no sweep metrics or figures are uploaded.
-            results = run_all_sweeps(
-                N_rollouts=args.N_rollouts, N_e=args.N_e, seed=args.seed,
-                sweeps=[sw], progress_cb=cb, _log=tqdm.write, _wandb_run=wandb_run,
-                skip_rollouts=args.no_rollouts,
-            )
-        finally:
-            stop.set()
-            hb_thread.join()
-        inner.close()
-
-        # The MDN is fit (and logged) during the pricing_model sweep — finish W&B
-        # right after so the run contains only the MDN curve and nothing else.
-        if wandb_run is not None and sw == "pricing_model":
-            wandb_run.finish()
-            wandb_run = None
-            tqdm.write("W&B: MDN fitting logged — run finished.")
-
-        saved = save_figures(results, out_dir=figures_dir,
-                             N_rollouts=args.N_rollouts, seed=args.seed, N_e=args.N_e,
-                             include_baseline=(do_baseline and i == 0),
-                             cost_source=args.cost_source,
-                             skip_rollouts=args.no_rollouts)
-        saved += save_tables(results, out_dir=tables_dir,
-                             N_rollouts=args.N_rollouts, seed=args.seed, N_e=args.N_e,
-                             include_baseline=False, cost_source=args.cost_source,
-                             skip_rollouts=args.no_rollouts, _log=tqdm.write)
-        for p in saved:
-            tqdm.write(f"  Saved: {p}")
-
-    outer.close()
-
-    # Baseline/NegBin model tables (figures already emitted with the first sweep).
-    if do_baseline:
-        tqdm.write("Writing baseline-model tables…")
-        for p in save_tables({}, out_dir=tables_dir, N_rollouts=args.N_rollouts,
-                             seed=args.seed, N_e=args.N_e, include_baseline=True,
-                             compute_exact=not args.no_exact,
-                             cost_source=args.cost_source,
-                             skip_rollouts=args.no_rollouts, _log=tqdm.write):
-            tqdm.write(f"  Saved: {p}")
-
-        # Price-model comparison figures (mean diurnal profile + std), as on the
-        # Price Explorer page.
-        tqdm.write("Fitting price models + rendering comparison…")
-        from ev_mdt.pricing.entsoe import load_prices
-        from ev_mdt.analysis.prices import fit_samplers, simulate_price_paths, price_figures
-        from ev_mdt.plots.sensitivity import figure_to_png
-        _df = load_prices(_log=tqdm.write)
-        _samplers = fit_samplers(_df)
-        _px = simulate_price_paths(_samplers, n_days=1000, seed=args.seed)
-        _fig_mean, _fig_std = price_figures(_px)
-        px_dir = figures_dir / "price_explorer"
-        px_dir.mkdir(parents=True, exist_ok=True)
-        for _nm, _fig in (("mean_profile", _fig_mean), ("std_profile", _fig_std)):
-            _p = px_dir / f"{_nm}.png"
-            _p.write_bytes(figure_to_png(_fig))
-            tqdm.write(f"  Saved: {_p}")
-
-    print("\nRun complete.")
-    print(f"  Figures → {figures_dir}/")
-    print(f"  Tables  → {tables_dir}/")
-    if wandb_run is not None:
-        wandb_run.finish()
+    print(f"\nRun complete → {out_base}/")
 
 
-def _target_sweep_figure(df, best, exact: bool):
-    import plotly.graph_objects as go
-    x = df["target_kwh"]
-    fig = go.Figure()
-    if not exact:
-        import pandas as pd
-        fig.add_trace(go.Scatter(
-            x=pd.concat([x, x.iloc[::-1]]),
-            y=pd.concat([df["mean_cost"] + df["std_cost"],
-                         (df["mean_cost"] - df["std_cost"]).iloc[::-1]]),
-            fill="toself", fillcolor="rgba(68,119,170,0.10)",
-            line=dict(color="rgba(0,0,0,0)"), name="Total ±1 std", hoverinfo="skip", yaxis="y1",
-        ))
-    fig.add_trace(go.Scatter(
-        x=x, y=df["mean_cost"], mode="lines+markers",
-        line=dict(color="#4477AA", width=2), marker=dict(size=7), name="Total cost", yaxis="y1",
-    ))
-    fig.add_trace(go.Scatter(
-        x=x, y=df["mean_penalty_cost"], mode="lines+markers",
-        line=dict(color="#CC3311", width=2, dash="dash"), marker=dict(size=6),
-        name="Penalty cost", yaxis="y1",
-    ))
-    fig.add_trace(go.Scatter(
-        x=[best["target_kwh"]], y=[best["mean_cost"]],
-        mode="markers", marker=dict(color="#EE6677", size=12, symbol="star"),
-        name=f"Best: {best['target_kwh']:.1f} kWh ({best['target_frac']:.1%})", yaxis="y1",
-    ))
-    fig.add_trace(go.Scatter(
-        x=x, y=df["mean_charge_cost"], mode="lines+markers",
-        line=dict(color="#228833", width=2, dash="dot"), marker=dict(size=6),
-        name="Charging cost (right)", yaxis="y2",
-    ))
-    fig.update_layout(
-        xaxis_title="Target ceiling (kWh)",
-        yaxis=dict(title=f"Total / penalty cost (€)"),
-        yaxis2=dict(title="Charging cost (€)", overlaying="y", side="right", showgrid=False),
-        legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0),
-        template="plotly_white", height=500,
-    )
-    return fig
+# ── Argument parsing ────────────────────────────────────────────────────────────
+
+def _add_out_args(p: argparse.ArgumentParser, default: str = "export") -> None:
+    p.add_argument("--out-dir", default=default,
+                   help="Export base dir; outputs go under <dir>/<timestamp>/<command>/")
+    p.add_argument("--no-timestamp", action="store_true",
+                   help="Write directly to --out-dir instead of a timestamped subfolder")
 
 
-def cmd_target_sweep(args: argparse.Namespace) -> None:
-    import pandas as pd
-    from tqdm import tqdm
-    from ev_mdt.plots.sensitivity import figure_to_png
-
-    out_dir = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.exact:
-        from ev_mdt.analysis.sensitivity import sweep_target_ceiling_exact
-        rows = sweep_target_ceiling_exact(
-            model_label=args.model, step_kwh=args.step,
-            N_e=args.N_e, use_reserve=not args.no_reserve,
-            _log=tqdm.write,
-        )
-        col_map = {
-            "target_kwh":        "Target ceiling (kWh)",
-            "target_frac":       "Target ceiling (%)",
-            "mean_cost":         "Expected cost (€)",
-            "mean_charge_cost":  "Expected charging (€)",
-            "mean_penalty_cost": "Expected penalty (€)",
-            "mean_penalty_min":  "Expected penalty min",
-            "mean_charged":      "Expected energy charged (kWh)",
-        }
-    else:
-        from ev_mdt.analysis.sensitivity import sweep_target_ceiling
-        rows = sweep_target_ceiling(
-            model_label=args.model, N_rollouts=args.N_rollouts,
-            seed=args.seed, step_kwh=args.step,
-        )
-        col_map = {
-            "target_kwh":   "Target ceiling (kWh)",
-            "target_frac":  "Target ceiling (%)",
-            "mean_cost":    "Mean cost (€)",
-            "std_cost":     "Std cost (€)",
-            "mean_penalty": "Mean penalty (min)",
-            "mean_charged": "Mean charged (kWh)",
-        }
-
-    df = pd.DataFrame(rows)
-    best = df.loc[df["mean_cost"].idxmin()]
-    tqdm.write(f"\nBest ceiling: {best['target_kwh']:.0f} kWh "
-               f"({best['target_frac']:.0%}) — cost {best['mean_cost']:.4f} €")
-
-    csv_path = out_dir / "target_sweep.csv"
-    df.rename(columns=col_map).to_csv(csv_path, index=False)
-    tqdm.write(f"Saved table → {csv_path}")
-
-    try:
-        fig = _target_sweep_figure(df, best, exact=args.exact)
-        png_path = out_dir / "target_sweep.png"
-        png_path.write_bytes(figure_to_png(fig))
-        tqdm.write(f"Saved plot  → {png_path}")
-    except Exception as e:
-        tqdm.write(f"Could not save plot: {e}")
-
-
-def _gamma_sweep_figure(results, exact: bool):
-    import pandas as pd
-    from plotly.subplots import make_subplots
-    import plotly.graph_objects as go
-    cost_label = "Expected cost (€)" if exact else "Mean cost (€)"
-    model_names = list(results.keys())
-    n_models = len(model_names)
-    fig = make_subplots(
-        rows=n_models, cols=1, shared_xaxes=True,
-        subplot_titles=model_names, vertical_spacing=0.10,
-    )
-    colors = {"total": "#4477AA", "charging": "#228833", "penalty": "#CC3311"}
-    for row_i, model_name in enumerate(model_names, start=1):
-        df   = pd.DataFrame(results[model_name])
-        x    = df["gamma"]
-        show = row_i == 1
-        fig.add_trace(go.Scatter(
-            x=x, y=df["mean_cost"], mode="lines+markers",
-            line=dict(color=colors["total"], width=2), marker=dict(size=6),
-            name="Total cost", legendgroup="total", showlegend=show,
-        ), row=row_i, col=1)
-        fig.add_trace(go.Scatter(
-            x=x, y=df["mean_charge_cost"], mode="lines+markers",
-            line=dict(color=colors["charging"], width=2, dash="dot"), marker=dict(size=5),
-            name="Charging cost", legendgroup="charging", showlegend=show,
-        ), row=row_i, col=1)
-        fig.add_trace(go.Scatter(
-            x=x, y=df["mean_penalty_cost"], mode="lines+markers",
-            line=dict(color=colors["penalty"], width=2, dash="dash"), marker=dict(size=5),
-            name="Penalty cost", legendgroup="penalty", showlegend=show,
-        ), row=row_i, col=1)
-        best = df.loc[df["mean_cost"].idxmin()]
-        fig.add_trace(go.Scatter(
-            x=[best["gamma"]], y=[best["mean_cost"]],
-            mode="markers", marker=dict(color="#EE6677", size=11, symbol="star"),
-            name="Best γ", legendgroup=f"best_{row_i}", showlegend=show,
-        ), row=row_i, col=1)
-        fig.update_yaxes(title_text=cost_label, row=row_i, col=1)
-    fig.update_xaxes(title_text="γ", row=n_models, col=1)
-    fig.update_layout(
-        template="plotly_white",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-        height=320 * n_models,
-        margin=dict(l=70, r=80, t=60, b=40),
-    )
-    return fig
-
-
-def cmd_gamma_sweep(args: argparse.Namespace) -> None:
-    import pandas as pd
-    from tqdm import tqdm
-    from ev_mdt.plots.sensitivity import figure_to_png
-
-    out_dir = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.exact:
-        from ev_mdt.analysis.sensitivity import sweep_gamma_exact
-        import numpy as _np
-        gamma_values = [round(g, 6) for g in _np.arange(args.gamma_step, 1.0 + 1e-9, args.gamma_step)]
-        results = sweep_gamma_exact(
-            use_reserve=not args.no_reserve,
-            gamma_values=gamma_values,
-            N_e=args.N_e,
-            _log=tqdm.write,
-        )
-        col_map = {
-            "gamma":             "γ",
-            "target_kwh":        "Target ceiling (kWh)",
-            "mean_cost":         "Expected cost (€)",
-            "mean_charge_cost":  "Expected charging (€)",
-            "mean_penalty_cost": "Expected penalty (€)",
-            "mean_penalty_min":  "Expected penalty min",
-            "mean_charged":      "Expected energy charged (kWh)",
-        }
-    else:
-        from ev_mdt.analysis.sensitivity import sweep_gamma
-        results = sweep_gamma(
-            N_rollouts=args.N_rollouts,
-            seed=args.seed,
-            use_reserve=not args.no_reserve,
-        )
-        col_map = {
-            "gamma":             "γ",
-            "target_kwh":        "Target ceiling (kWh)",
-            "mean_cost":         "Mean cost (€)",
-            "std_cost":          "Std cost (€)",
-            "mean_charge_cost":  "Mean charging (€)",
-            "mean_penalty_cost": "Mean penalty (€)",
-            "mean_penalty":      "Mean penalty (min)",
-            "mean_charged":      "Mean charged (kWh)",
-        }
-
-    for model_name, rows in results.items():
-        slug = model_name.lower().replace(" ", "_").replace("=", "")
-        df = pd.DataFrame(rows)
-        csv_path = out_dir / f"gamma_sweep_{slug}.csv"
-        df.rename(columns=col_map).to_csv(csv_path, index=False)
-        tqdm.write(f"Saved {csv_path}")
-        best = df.loc[df["mean_cost"].idxmin()]
-        tqdm.write(f"  {model_name}: best γ={best['gamma']:.1f} "
-                   f"target={best['target_kwh']:.1f} kWh  cost={best['mean_cost']:.4f} €")
-
-    try:
-        fig = _gamma_sweep_figure(results, exact=args.exact)
-        png_path = out_dir / "gamma_sweep.png"
-        png_path.write_bytes(figure_to_png(fig))
-        tqdm.write(f"Saved plot → {png_path}")
-    except Exception as e:
-        tqdm.write(f"Could not save plot: {e}")
-
-
-def cmd_prices(args: argparse.Namespace) -> None:
-    from tqdm import tqdm
-    from ev_mdt.pricing.entsoe import load_prices
-    from ev_mdt.analysis.prices import fit_samplers, simulate_price_paths, price_figures
-
-    print("Loading ENTSO-E price data…", flush=True)
-    df = load_prices(_log=tqdm.write)
-    tqdm.write(f"Loaded {len(df):,} measurements "
-               f"({df['timestamp'].dt.year.min()}–{df['timestamp'].dt.year.max()})\n")
-
-    fit_bar = tqdm(total=100, desc="Fitting samplers", unit="%",
-                   bar_format="{l_bar}{bar}| {n:.0f}%  {postfix}")
-
-    def fit_progress(model: str, frac: float, msg: str) -> None:
-        fit_bar.n = int(frac * 100)
-        fit_bar.set_postfix_str(f"{model}: {msg[:40]}")
-        fit_bar.refresh()
-
-    samplers = fit_samplers(df, progress_cb=fit_progress)
-    fit_bar.n = 100
-    fit_bar.refresh()
-    fit_bar.close()
-
-    season  = None if args.season == "all" else args.season
-    daytype = args.daytype
-
-    print(f"\nSimulating {args.n_days} days "
-          f"(season={args.season}, daytype={daytype}, seed={args.seed})…", flush=True)
-    results = simulate_price_paths(samplers, n_days=args.n_days,
-                                   season=season, daytype=daytype, seed=args.seed)
-    for name, prices in results.items():
-        print(f"  {name:<30}  mean = {prices.mean():.4f} €/kWh")
-
-    out_dir = _timestamped_dir(args.out_dir, enabled=not args.no_timestamp) / "price_explorer"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        from ev_mdt.plots.sensitivity import figure_to_png
-        save_bar = tqdm(["mean_profile", "std_profile"], desc="Saving figures", unit="fig")
-        fig_mean, fig_std = price_figures(results)
-        for name, fig in zip(save_bar, [fig_mean, fig_std]):
-            save_bar.set_postfix_str(name)
-            (out_dir / f"{name}.png").write_bytes(figure_to_png(fig))
-        save_bar.close()
-        print(f"Saved figures to {out_dir}/")
-    except Exception as e:
-        print(f"\nCould not save figures (kaleido missing?): {e}")
+def _dims_type(value: str) -> list[str]:
+    from ev_mdt.analysis.sensitivity import ALL_SWEEP_NAMES
+    dims = [d.strip() for d in value.split(",") if d.strip()]
+    bad = [d for d in dims if d not in ALL_SWEEP_NAMES]
+    if bad:
+        raise argparse.ArgumentTypeError(
+            f"unknown sweep(s) {bad}; choose from {', '.join(ALL_SWEEP_NAMES)}")
+    return dims
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="ev_mdt",
-                                     description="EV Charging MDP CLI")
+    from ev_mdt.analysis.sensitivity import ALL_SWEEP_NAMES
+
+    parser = argparse.ArgumentParser(prog="ev_mdt", description="EV Charging MDP CLI")
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    # solve
-    p_solve = sub.add_parser("solve", help="Run backward induction and print policy stats")
-    _add_solve_args(p_solve)
+    # baseline
+    p = sub.add_parser("baseline", help="Baseline all-policy heatmaps, charge borders, exact cost bar")
+    p.add_argument("--N-e", type=int, default=500, metavar="N", help="Battery grid points")
+    p.add_argument("--no-cost", action="store_true",
+                   help="Skip the (slow) exact expected-cost bar + table")
+    _add_out_args(p)
 
-    # rollout
-    p_rollout = sub.add_parser("rollout", help="Run backward induction then simulate rollouts")
-    _add_solve_args(p_rollout)
-    p_rollout.add_argument("--n",    type=int, default=200, help="Number of rollout scenarios")
-    p_rollout.add_argument("--seed", type=int, default=42,  help="Base random seed")
+    # sensitivity
+    p = sub.add_parser("sensitivity",
+                       help="Per-sweep BI/DU/BLU heatmaps + charge borders + exact cost bars")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--all", action="store_true", help="Run every sweep dimension")
+    g.add_argument("--dims", type=_dims_type, default=None, metavar="A,B,…",
+                   help=f"Comma-separated sweep dimensions: {', '.join(ALL_SWEEP_NAMES)}")
+    p.add_argument("--N-e", type=int, default=500, metavar="N", help="Battery grid points")
+    p.add_argument("--no-cost", action="store_true",
+                   help="Skip the (slow) exact expected-cost bars + tables (heatmaps/borders only)")
+    _add_out_args(p)
 
-    # run (sweeps + baseline/NegBin models → figures + tables)
-    from ev_mdt.analysis.sensitivity import ALL_SWEEP_NAMES
-    p_run = sub.add_parser("run", help="Run sweeps + model rollouts, export figures and tables")
-    p_run.add_argument("--all", action="store_true",
-                       help="Run every sweep plus the baseline/NegBin models (full export)")
-    p_run.add_argument("--baseline-only", action="store_true",
-                       help="Only render the baseline/NegBin model figures (no sweeps)")
-    p_run.add_argument("--exact-cost", action="store_true",
-                       help="Analytical exact expected BI cost per scenario (no rollouts) → tables/exact_bi_cost.csv")
-    p_run.add_argument("--no-exact", action="store_true",
-                       help="Skip the slow analytical exact-cost step in the baseline-model "
-                            "table (rollout-based metrics are still written)")
-    p_run.add_argument("--cost-source", default="rollout", choices=["rollout", "exact"],
-                       help="Data behind the cost figures + per-sweep summary tables: "
-                            "'rollout' (Monte-Carlo means ±SEM, default) or 'exact' "
-                            "(analytical expected costs, no error bars)")
-    p_run.add_argument("--no-rollouts", action="store_true",
-                       help="Skip all Monte-Carlo rollout simulation (solve only). "
-                            "Use together with --cost-source exact to get exact cost "
-                            "tables/figures without running any rollouts.")
-    p_run.add_argument("--sweep", default=None,
-                       choices=ALL_SWEEP_NAMES, metavar="SWEEP",
-                       help=f"Run a single sweep (no baseline models). Options: {', '.join(ALL_SWEEP_NAMES)}")
-    p_run.add_argument("--N-rollouts",    type=int, default=500, metavar="N",
-                       help="Rollouts per swept value")
-    p_run.add_argument("--N-e",           type=int, default=500, metavar="N",
-                       help="Battery grid points")
-    p_run.add_argument("--seed",          type=int, default=42,  help="Base random seed")
-    p_run.add_argument("--out-dir",       default="export",
-                       help="Export base dir; outputs go under <dir>/<timestamp>/{figures_app,tables}")
-    p_run.add_argument("--no-timestamp",  action="store_true",
-                       help="Write directly to --out-dir instead of a timestamped subfolder")
-    p_run.add_argument("--wandb",         action="store_true",   help="Log results and figures to Weights & Biases")
-    p_run.add_argument("--wandb-project", default="au-mdt",      help="W&B project name")
-    p_run.add_argument("--wandb-run",     default="",            help="W&B run name (auto if omitted)")
+    # calibrate-du
+    p = sub.add_parser("calibrate-du", help="Departure-Urgency e_base + γ calibration sweeps (exact)")
+    p.add_argument("--N-e", type=int, default=500, metavar="N", help="Battery grid points")
+    p.add_argument("--step", type=float, default=5.0, metavar="kWh",
+                   help="Target-ceiling (e_base) step size in kWh")
+    p.add_argument("--gamma-step", type=float, default=0.1, metavar="STEP", help="γ step size")
+    p.add_argument("--no-reserve", action="store_true", help="Disable the DU reserve floor")
+    _add_out_args(p)
 
-    # target-sweep
-    from ev_mdt.params import MODEL_LABELS
-    p_ts = sub.add_parser("target-sweep",
-                           help="Sweep Departure Urgency target ceiling and export cost plot + CSV")
-    p_ts.add_argument("--model",       default="Baseline", choices=MODEL_LABELS)
-    p_ts.add_argument("--N-rollouts",  type=int,   default=500,   metavar="N")
-    p_ts.add_argument("--seed",        type=int,   default=42)
-    p_ts.add_argument("--step",        type=float, default=5.0,   metavar="kWh",
-                      help="Target ceiling step size in kWh")
-    p_ts.add_argument("--out-dir",     default="export/target_sweep",
-                      help="Output base dir; outputs go under <dir>/<timestamp>/")
-    p_ts.add_argument("--no-timestamp", action="store_true",
-                      help="Write directly to --out-dir instead of a timestamped subfolder")
-    p_ts.add_argument("--exact",       action="store_true",
-                      help="Use exact backward-pass evaluation instead of Monte-Carlo rollouts")
-    p_ts.add_argument("--N-e",         type=int, default=500, metavar="N",
-                      help="Battery grid resolution (only used with --exact)")
-    p_ts.add_argument("--no-reserve",  action="store_true",
-                      help="Disable battery reserve in Departure Urgency (only with --exact)")
+    # trip-duration
+    p = sub.add_parser("trip-duration", help="Trip-duration distribution figure")
+    p.add_argument("--models", nargs="+", choices=list(_MOBILITY_KEYS), default=None,
+                   help="Mobility models to include (default: all three)")
+    _add_out_args(p)
 
-    # gamma-sweep
-    p_gs = sub.add_parser("gamma-sweep",
-                           help="Sweep ceiling scaling exponent γ across three mobility models")
-    p_gs.add_argument("--N-rollouts",  type=int,   default=500,   metavar="N")
-    p_gs.add_argument("--seed",        type=int,   default=42)
-    p_gs.add_argument("--no-reserve",  action="store_true")
-    p_gs.add_argument("--out-dir",     default="export/gamma_sweep",
-                      help="Output base dir; outputs go under <dir>/<timestamp>/")
-    p_gs.add_argument("--no-timestamp", action="store_true",
-                      help="Write directly to --out-dir instead of a timestamped subfolder")
-    p_gs.add_argument("--exact",       action="store_true",
-                      help="Use exact backward-pass evaluation instead of Monte-Carlo rollouts")
-    p_gs.add_argument("--N-e",         type=int,   default=500, metavar="N",
-                      help="Battery grid resolution (only used with --exact)")
-    p_gs.add_argument("--gamma-step",  type=float, default=0.1, metavar="STEP",
-                      help="γ step size (default 0.1)")
+    # model-trajectories
+    p = sub.add_parser("model-trajectories",
+                       help="Mean sampled price + fraction-driving (swap price / mobility model)")
+    p.add_argument("--mobility-model", choices=list(_MOBILITY_MODEL_LABEL), default="baseline",
+                   help="Mobility model (default: baseline)")
+    p.add_argument("--price-model",
+                   choices=["Gaussian (parametric)", "Gaussian Bins", "GMM", "MDN"],
+                   default="Gaussian (parametric)", help="Price model (default: Gaussian parametric)")
+    p.add_argument("--n", type=int, default=1000, help="Number of sampled scenarios")
+    p.add_argument("--seed", type=int, default=42, help="Base random seed")
+    _add_out_args(p)
 
-    # prices
-    p_prices = sub.add_parser("prices", help="Fit price models and simulate diurnal profiles")
-    p_prices.add_argument("--n-days",  type=int,   default=1000, help="Simulated days")
-    p_prices.add_argument("--season",  default="all",
-                          choices=["all", "spring", "summer", "autumn", "winter"])
-    p_prices.add_argument("--daytype", default="all",
-                          choices=["all", "weekday", "weekend"])
-    p_prices.add_argument("--seed",    type=int,   default=42,   help="Random seed")
-    p_prices.add_argument("--out-dir", default="figures/",
-                          help="Output base dir; outputs go under <dir>/<timestamp>/price_explorer/")
-    p_prices.add_argument("--no-timestamp", action="store_true",
-                          help="Write directly to --out-dir instead of a timestamped subfolder")
+    # price-models
+    p = sub.add_parser("price-models", help="Mean/std diurnal price comparison across price models")
+    p.add_argument("--n-days", type=int, default=1000, help="Simulated days")
+    p.add_argument("--season", default="all",
+                   choices=["all", "spring", "summer", "autumn", "winter"])
+    p.add_argument("--daytype", default="all", choices=["all", "weekday", "weekend"])
+    p.add_argument("--seed", type=int, default=42, help="Random seed")
+    _add_out_args(p)
+
+    # fit-mdn
+    p = sub.add_parser("fit-mdn", help="Fit the MDN price sampler + two training-curve figures")
+    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--n-components", type=int, default=3)
+    p.add_argument("--hidden", type=int, nargs="+", default=None, metavar="DIM",
+                   help="Hidden layer sizes, e.g. --hidden 128 128 (default: model default)")
+    p.add_argument("--batch-size", type=int, default=1024)
+    p.add_argument("--lr", type=float, default=1e-3)
+    _add_out_args(p)
+
+    # run (aggregator)
+    p = sub.add_parser("run", help="Run every command (--all) or the fast paper subset (--all-paper)")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--all", action="store_true", help="Run all seven commands (full regeneration)")
+    g.add_argument("--all-paper", action="store_true",
+                   help="Fast paper figures only: heatmaps/borders/trajectories/prices (no exact cost bars, "
+                        "no calibration/training)")
+    p.add_argument("--N-e", type=int, default=500, metavar="N", help="Battery grid points")
+    p.add_argument("--n", type=int, default=1000, help="Trajectory scenarios")
+    p.add_argument("--n-days", type=int, default=1000, help="Price-model simulated days")
+    p.add_argument("--seed", type=int, default=42, help="Random seed")
+    _add_out_args(p)
 
     args = parser.parse_args()
 
-    if args.command == "solve":
-        cmd_solve(args)
-    elif args.command == "rollout":
-        cmd_rollout(args)
-    elif args.command == "run":
-        cmd_run(args)
-    elif args.command == "gamma-sweep":
-        cmd_gamma_sweep(args)
-    elif args.command == "target-sweep":
-        cmd_target_sweep(args)
-    elif args.command == "prices":
-        cmd_prices(args)
-    else:
+    handlers = {
+        "baseline": cmd_baseline,
+        "sensitivity": cmd_sensitivity,
+        "calibrate-du": cmd_calibrate_du,
+        "trip-duration": cmd_trip_duration,
+        "model-trajectories": cmd_model_trajectories,
+        "price-models": cmd_price_models,
+        "fit-mdn": cmd_fit_mdn,
+        "run": cmd_run,
+    }
+    handler = handlers.get(args.command)
+    if handler is None:
         parser.print_help()
         sys.exit(1)
+    handler(args)
 
 
 if __name__ == "__main__":
